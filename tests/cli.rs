@@ -234,3 +234,25 @@ fn bedit_sends_project_and_multiple_native_paths_to_current_window() {
         assert_eq!(&packet[..bytes], expected);
     }
 }
+
+#[test]
+fn bedit_standalone_skips_an_inherited_control_socket() {
+    use std::os::unix::net::UnixDatagram;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("control.sock");
+    let receiver = UnixDatagram::bind(&socket).unwrap();
+    receiver.set_nonblocking(true).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_bedit"))
+        .current_dir(dir.path())
+        .env("BEYRIX_CONTROL_SOCKET", &socket)
+        .env("WAYLAND_DISPLAY", dir.path().join("missing-wayland"))
+        .env_remove("WAYLAND_SOCKET")
+        .args(["--standalone", "."])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("connect to Wayland"));
+    assert_eq!(
+        receiver.recv(&mut [0; 64]).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}

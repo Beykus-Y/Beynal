@@ -3,14 +3,15 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use crate::{
-    editor::{Command, Document, EditorView, Effect, Metrics},
-    project::Project,
+    editor::{Command, Direction, Document, EditorView, Effect, Metrics},
+    project::{Entry, Project},
 };
 use std::{
     collections::{HashSet, VecDeque},
     fs, io,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
+        Arc,
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
@@ -121,21 +122,146 @@ struct Confirmation {
 }
 
 #[derive(Default)]
+struct Field {
+    text: String,
+    caret: usize,
+    anchor: Option<usize>,
+}
+
+impl Field {
+    fn selection(&self) -> Option<std::ops::Range<usize>> {
+        let anchor = self.anchor?;
+        (anchor != self.caret).then(|| anchor.min(self.caret)..anchor.max(self.caret))
+    }
+
+    fn select_all(&mut self) {
+        self.caret = self.text.len();
+        self.anchor = Some(0);
+    }
+
+    fn previous(&self) -> usize {
+        self.text[..self.caret]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(byte, _)| byte)
+    }
+
+    fn next(&self) -> usize {
+        self.text[self.caret..]
+            .chars()
+            .next()
+            .map_or(self.caret, |ch| self.caret + ch.len_utf8())
+    }
+
+    fn move_by(&mut self, direction: Direction, extend: bool, by_word: bool) {
+        let boundary = if extend { None } else { self.selection() };
+        let next = match direction {
+            Direction::Home => 0,
+            Direction::End => self.text.len(),
+            Direction::Left if boundary.is_some() => boundary.unwrap().start,
+            Direction::Right if boundary.is_some() => boundary.unwrap().end,
+            Direction::Left if by_word => self.text[..self.caret]
+                .char_indices()
+                .rev()
+                .skip_while(|(_, ch)| ch.is_whitespace())
+                .find(|(_, ch)| ch.is_whitespace())
+                .map_or(0, |(byte, ch)| byte + ch.len_utf8()),
+            Direction::Right if by_word => self.text[self.caret..]
+                .char_indices()
+                .skip_while(|(_, ch)| ch.is_whitespace())
+                .find(|(_, ch)| ch.is_whitespace())
+                .map_or(self.text.len(), |(byte, _)| self.caret + byte),
+            Direction::Left => self.previous(),
+            Direction::Right => self.next(),
+            _ => return,
+        };
+        self.anchor = extend.then_some(self.anchor.unwrap_or(self.caret));
+        self.caret = next;
+    }
+
+    fn replace(&mut self, range: std::ops::Range<usize>, text: &str) {
+        self.caret = range.start + text.len();
+        self.anchor = None;
+        self.text.replace_range(range, text);
+    }
+
+    fn insert(&mut self, text: &str) {
+        let range = self.selection().unwrap_or(self.caret..self.caret);
+        let mut available = 1024 - (self.text.len() - range.len());
+        let mut clean = String::new();
+        for ch in text.chars().filter(|ch| !ch.is_control()) {
+            let bytes = ch.len_utf8();
+            if bytes > available {
+                break;
+            }
+            clean.push(ch);
+            available -= bytes;
+        }
+        if !clean.is_empty() {
+            self.replace(range, &clean);
+        }
+    }
+
+    fn delete(&mut self, backwards: bool) {
+        let range = self.selection().unwrap_or_else(|| {
+            if backwards {
+                self.previous()..self.caret
+            } else {
+                self.caret..self.next()
+            }
+        });
+        self.replace(range, "");
+    }
+
+    fn visual_start(&self, width: usize, active: bool) -> usize {
+        if !active {
+            return 0;
+        }
+        // Leave at least part of the field visible to the right of the caret
+        // when a long value scrolls horizontally.
+        let before = width.saturating_sub(1);
+        self.text[..self.caret]
+            .char_indices()
+            .rev()
+            .scan(0usize, |used, (byte, ch)| {
+                *used += ch.width().unwrap_or(0);
+                (*used <= before).then_some(byte)
+            })
+            .last()
+            .unwrap_or(self.caret)
+    }
+
+    fn place_at(&mut self, start: usize, mut column: usize, drawn_caret: bool) {
+        let start = self.text.floor_char_boundary(start.min(self.caret));
+        if drawn_caret && column > self.text[start..self.caret].width() {
+            column -= 1;
+        }
+        let mut used = 0;
+        self.caret = self.text[start..]
+            .char_indices()
+            .find_map(|(byte, ch)| {
+                used += ch.width().unwrap_or(0);
+                (used > column).then_some(start + byte)
+            })
+            .unwrap_or(self.text.len());
+        self.anchor = None;
+    }
+}
+
+#[derive(Default)]
 enum Panel {
     #[default]
     None,
     Quick {
-        query: String,
+        query: Field,
         selected: usize,
         results: Vec<(PathBuf, String)>,
-        all: bool,
     },
     Search {
-        query: String,
-        replacement: String,
+        query: Field,
+        replacement: Field,
         replace: bool,
         field: bool,
-        all: bool,
     },
 }
 
@@ -150,7 +276,12 @@ enum Hit {
     TabsForward,
     Entry(PathBuf, bool),
     Result(PathBuf),
-    Field(bool),
+    Field {
+        replacement: bool,
+        origin: usize,
+        start: usize,
+        caret: bool,
+    },
     Find,
     Replace,
     ReplaceAll,
@@ -193,7 +324,7 @@ pub struct BEdit {
     explorer: bool,
     expanded: HashSet<PathBuf>,
     explorer_scroll: usize,
-    explorer_total: usize,
+    explorer_tree: Option<Vec<(usize, Arc<Entry>)>>,
     panel: Panel,
     confirmation: Option<Confirmation>,
     notice: Option<(String, bool)>,
@@ -223,7 +354,7 @@ impl BEdit {
             explorer: true,
             expanded: HashSet::new(),
             explorer_scroll: 0,
-            explorer_total: 0,
+            explorer_tree: None,
             panel: Panel::None,
             confirmation: None,
             notice: None,
@@ -343,7 +474,7 @@ impl BEdit {
             self.project = Project::new(root);
             self.expanded.clear();
             self.explorer_scroll = 0;
-            self.explorer_total = 0;
+            self.explorer_tree = None;
             self.hits.clear();
             self.update_quick_results();
         }
@@ -366,6 +497,7 @@ impl BEdit {
     pub fn poll(&mut self) -> bool {
         let mut changed = match self.project.poll() {
             Some(Ok(())) => {
+                self.explorer_tree = None;
                 self.update_quick_results();
                 true
             }
@@ -500,7 +632,7 @@ impl BEdit {
                 return Effect::Changed;
             }
             Command::ConfirmSave => {
-                if self.document_mut().unwrap().save_for_close().is_err() {
+                if !self.save_active(true) {
                     // Keep all buffers and abandon the close transaction.
                     return Effect::Changed;
                 }
@@ -540,20 +672,23 @@ impl BEdit {
             }
             Action::ToggleExplorer => self.explorer = !self.explorer,
             Action::QuickOpen => self.set_panel(Panel::Quick {
-                query: String::new(),
+                query: Field::default(),
                 selected: 0,
                 results: Vec::new(),
-                all: false,
             }),
             Action::Find | Action::Replace if self.active.is_some() => {
                 let query = self
                     .selection_text()
                     .filter(|text| !text.contains('\n') && text.len() <= 1024)
                     .unwrap_or_default();
+                let mut query = Field {
+                    text: query,
+                    ..Default::default()
+                };
+                query.select_all();
                 self.set_panel(Panel::Search {
-                    all: !query.is_empty(),
                     query,
-                    replacement: String::new(),
+                    replacement: Field::default(),
                     replace: action == Action::Replace,
                     field: false,
                 });
@@ -570,6 +705,10 @@ impl BEdit {
             return self.confirm(command);
         }
         self.notice = None;
+        if command == Command::Save {
+            self.save_active(false);
+            return Effect::Changed;
+        }
         if !matches!(self.panel, Panel::None) {
             return self.handle_panel(command);
         }
@@ -578,6 +717,26 @@ impl BEdit {
         }
         self.document_mut()
             .map_or(Effect::None, |doc| doc.handle(command))
+    }
+
+    fn save_active(&mut self, closing: bool) -> bool {
+        let Some(doc) = self.document_mut() else {
+            return false;
+        };
+        let result = if closing {
+            doc.save_for_close()
+        } else {
+            doc.save()
+        };
+        if result.is_err() {
+            return false;
+        }
+        let path = doc.target().to_path_buf();
+        if self.project.add_saved_file(&path) {
+            self.explorer_tree = None;
+            self.update_quick_results();
+        }
+        true
     }
 
     pub fn panel_enter(&mut self, shift: bool, control: bool) -> Option<Effect> {
@@ -605,7 +764,7 @@ impl BEdit {
                 replace,
                 ..
             } => {
-                let (query, replacement) = (query.clone(), replacement.clone());
+                let (query, replacement) = (query.text.clone(), replacement.text.clone());
                 let replace_match = *replace && *field;
                 let replace_all = *replace && control;
                 if let Some(doc) = self.document_mut() {
@@ -623,6 +782,7 @@ impl BEdit {
     }
 
     fn handle_panel(&mut self, command: Command) -> Effect {
+        self.hits.clear();
         match command {
             Command::Escape => self.set_panel(Panel::None),
             Command::Enter => self.run_panel(false, false),
@@ -630,12 +790,10 @@ impl BEdit {
                 if let Panel::Search {
                     field,
                     replace: true,
-                    all,
                     ..
                 } = &mut self.panel
                 {
                     *field = !*field;
-                    *all = false;
                     self.focus = unique_id();
                 }
             }
@@ -660,67 +818,64 @@ impl BEdit {
                     };
                 }
             }
+            Command::Move {
+                direction,
+                extend,
+                by_word,
+                ..
+            } => {
+                if let Some(field) = self.field_mut() {
+                    field.move_by(direction, extend, by_word);
+                }
+            }
             Command::Insert(text) => self.insert_field(&text),
             Command::Backspace | Command::Delete => {
-                if let Some((value, all)) = self.field_mut() {
-                    if *all {
-                        value.clear();
-                        *all = false;
-                    } else if command == Command::Backspace {
-                        value.pop();
-                    }
+                if let Some(field) = self.field_mut() {
+                    field.delete(command == Command::Backspace);
+                    self.update_quick_results();
                 }
-                self.update_quick_results();
             }
             Command::SelectAll => {
-                if let Some((_, all)) = self.field_mut() {
-                    *all = true;
+                if let Some(field) = self.field_mut() {
+                    field.select_all();
                 }
             }
             Command::Copy | Command::Cut => {
-                if let Some((value, true)) = self.field_mut() {
+                if let Some(field) = self.field_mut()
+                    && let Some(range) = field.selection()
+                {
+                    let text = field.text[range.clone()].to_owned();
                     if command == Command::Copy {
-                        return Effect::Copy(value.clone());
+                        return Effect::Copy(text);
                     }
-                    let text = std::mem::take(value);
+                    field.replace(range, "");
                     self.update_quick_results();
                     return Effect::Cut(text);
                 }
             }
             Command::PasteRequest => return Effect::PasteRequest,
-            Command::Save => {
-                if let Some(doc) = self.document_mut() {
-                    let _ = doc.save();
-                }
-            }
             _ => return Effect::None,
         }
         Effect::Changed
     }
 
-    fn field_mut(&mut self) -> Option<(&mut String, &mut bool)> {
+    fn field_mut(&mut self) -> Option<&mut Field> {
         match &mut self.panel {
-            Panel::Quick { query, all, .. } => Some((query, all)),
+            Panel::Quick { query, .. } => Some(query),
             Panel::Search {
                 query,
                 replacement,
                 field,
-                all,
                 ..
-            } => Some((if *field { replacement } else { query }, all)),
+            } => Some(if *field { replacement } else { query }),
             Panel::None => None,
         }
     }
 
     fn insert_field(&mut self, text: &str) {
-        if let Some((value, all)) = self.field_mut() {
-            if *all {
-                value.clear();
-                *all = false;
-            }
-            let available = 1024usize.saturating_sub(value.len());
-            let text = &text[..text.floor_char_boundary(text.len().min(available))];
-            value.extend(text.chars().filter(|ch| !ch.is_control()));
+        if let Some(field) = self.field_mut() {
+            field.insert(text);
+            self.hits.clear();
             self.update_quick_results();
         }
     }
@@ -737,7 +892,7 @@ impl BEdit {
                 .project
                 .index
                 .as_ref()
-                .map_or_else(Vec::new, |index| index.find(query, 128));
+                .map_or_else(Vec::new, |index| index.find(&query.text, 128));
             *selected = 0;
             self.hits.clear();
         }
@@ -813,19 +968,66 @@ fn fitted(text: &str, width: usize) -> String {
     out
 }
 
-fn field_text(label: &str, input: &str, active: bool, all: bool, width: usize) -> String {
-    let caret = if active && !all { "│" } else { "" };
-    let space = width.saturating_sub(label.width() + caret.width());
-    let start = input
-        .char_indices()
-        .rev()
-        .scan(0usize, |used, (byte, ch)| {
-            *used += ch.width().unwrap_or(0);
-            (*used <= space).then_some(byte)
-        })
-        .last()
-        .unwrap_or(input.len());
-    format!("{label}{}{caret}", &input[start..])
+impl ChromeView {
+    fn field(
+        &mut self,
+        (row, col, width): (usize, usize, usize),
+        label: &str,
+        input: &Field,
+        active: bool,
+        replacement: bool,
+    ) {
+        let label_width = label.width().min(width);
+        let start = input.visual_start(width - label_width, active);
+        let selected = active.then(|| input.selection()).flatten();
+        let caret = active && selected.is_none();
+        let origin = col + label_width;
+        self.hits.push(Region {
+            row,
+            col,
+            width,
+            hit: Hit::Field {
+                replacement,
+                origin,
+                start,
+                caret,
+            },
+        });
+        let tone = if active { Tone::Accent } else { Tone::Panel };
+        self.item(row, col, width, "", tone, None);
+        self.item(row, col, label_width, label, tone, None);
+        let mut visual = origin;
+        let mut text = &input.text[start..];
+        let remaining = |visual| col + width - visual;
+        if let Some(range) = selected.filter(|range| range.end > start) {
+            let before = fitted(
+                &input.text[start..range.start.max(start)],
+                remaining(visual),
+            );
+            self.item(row, visual, before.width(), &before, tone, None);
+            visual += before.width();
+            let marked = fitted(
+                &input.text[range.start.max(start)..range.end],
+                remaining(visual),
+            );
+            self.item(row, visual, marked.width(), &marked, Tone::Active, None);
+            visual += marked.width();
+            text = &input.text[range.end..];
+        } else if caret {
+            let before = fitted(
+                &input.text[start..input.caret],
+                remaining(visual).saturating_sub(1),
+            );
+            self.item(row, visual, before.width(), &before, tone, None);
+            visual += before.width();
+            if remaining(visual) > 0 {
+                self.item(row, visual, 1, "│", tone, None);
+                visual += 1;
+            }
+            text = &input.text[input.caret..];
+        }
+        self.item(row, visual, remaining(visual), text, tone, None);
+    }
 }
 
 impl BEdit {
@@ -1041,25 +1243,13 @@ impl BEdit {
         let Some(index) = &self.project.index else {
             return;
         };
-        let children = |path: &Path| index.children.get(path).into_iter().flatten();
-        let mut levels = vec![children(&self.project.root)];
-        let mut tree = Vec::new();
-        while let Some(level) = levels.last_mut() {
-            if let Some(entry) = level.next() {
-                tree.push((levels.len() - 1, entry));
-                if entry.directory && self.expanded.contains(&entry.path) {
-                    levels.push(children(&entry.path));
-                }
-            } else {
-                levels.pop();
-            }
-        }
-        self.explorer_total = tree.len();
+        let tree = self
+            .explorer_tree
+            .get_or_insert_with(|| index.visible_tree(&self.project.root, &self.expanded));
         self.explorer_scroll = self.explorer_scroll.min(tree.len().saturating_sub(visible));
-        let active = self.document().map(Document::path);
-        for (offset, (depth, entry)) in tree
-            .into_iter()
-            .skip(self.explorer_scroll)
+        let active = self.active.map(|index| self.tabs[index].doc.path());
+        for (offset, (depth, entry)) in tree[self.explorer_scroll..]
+            .iter()
             .take(visible)
             .enumerate()
         {
@@ -1117,26 +1307,17 @@ impl BEdit {
             Panel::Quick {
                 query,
                 selected,
-                all,
                 results,
             } => {
                 let shown = available.saturating_sub(1).min(8).min(results.len());
                 let selected = (*selected).min(results.len().saturating_sub(1));
                 let first = (selected + 1).saturating_sub(shown);
-                let tone = if *all { Tone::Active } else { Tone::Accent };
                 let label = if self.project.loading() {
                     " Open (scanning)  "
                 } else {
                     " Open  "
                 };
-                chrome.item(
-                    row,
-                    left,
-                    width,
-                    &field_text(label, query, true, *all, width),
-                    tone,
-                    None,
-                );
+                chrome.field((row, left, width), label, query, true, false);
                 for (slot, (path, name)) in results.iter().enumerate().skip(first).take(shown) {
                     let tone = if slot == selected {
                         Tone::Active
@@ -1170,7 +1351,6 @@ impl BEdit {
                 replacement,
                 replace,
                 field,
-                all,
             } => {
                 let row_count = if *replace && available > 1 { 2 } else { 1 };
                 let display_replacement = *replace && *field && row_count == 1;
@@ -1185,27 +1365,16 @@ impl BEdit {
                     query
                 };
                 let input_width = if width >= 19 { width - 8 } else { width };
-                chrome.item(
-                    row,
-                    left,
-                    input_width,
-                    &field_text(
-                        if display_replacement {
-                            " Replace  "
-                        } else {
-                            " Find  "
-                        },
-                        first_input,
-                        !*field || display_replacement,
-                        *all && (!*field || display_replacement),
-                        input_width,
-                    ),
-                    if !*field || display_replacement {
-                        Tone::Active
+                chrome.field(
+                    (row, left, input_width),
+                    if display_replacement {
+                        " Replace  "
                     } else {
-                        Tone::Panel
+                        " Find  "
                     },
-                    Some(Hit::Field(display_replacement)),
+                    first_input,
+                    !*field || display_replacement,
+                    display_replacement,
                 );
                 chrome.item(
                     row,
@@ -1218,19 +1387,12 @@ impl BEdit {
                 if row_count == 2 {
                     let input_width = if width >= 28 { width - 16 } else { width };
                     let button_width = (width - input_width) / 2;
-                    chrome.item(
-                        row + 1,
-                        left,
-                        input_width,
-                        &field_text(
-                            " Replace  ",
-                            replacement,
-                            *field,
-                            *all && *field,
-                            input_width,
-                        ),
-                        if *field { Tone::Active } else { Tone::Panel },
-                        Some(Hit::Field(true)),
+                    chrome.field(
+                        (row + 1, left, input_width),
+                        " Replace  ",
+                        replacement,
+                        *field,
+                        true,
                     );
                     chrome.item(
                         row + 1,
@@ -1290,12 +1452,21 @@ impl BEdit {
                     if !self.expanded.remove(&path) {
                         self.expanded.insert(path);
                     }
+                    self.explorer_tree = None;
+                    self.hits.clear();
                 }
                 Hit::Entry(path, false) | Hit::Result(path) => self.open_path(path),
-                Hit::Field(next) => {
-                    if let Panel::Search { field, all, .. } = &mut self.panel {
-                        *field = next;
-                        *all = false;
+                Hit::Field {
+                    replacement,
+                    origin,
+                    start,
+                    caret,
+                } => {
+                    if let Panel::Search { field, .. } = &mut self.panel {
+                        *field = replacement;
+                    }
+                    if let Some(input) = self.field_mut() {
+                        input.place_at(start, col.saturating_sub(origin), caret);
                         self.focus = unique_id();
                     }
                 }
@@ -1389,9 +1560,11 @@ impl BEdit {
         {
             let old = self.explorer_scroll;
             let visible = self.layout.rows.saturating_sub(3);
-            self.explorer_scroll = old
-                .saturating_add_signed(delta)
-                .min(self.explorer_total.saturating_sub(visible));
+            self.explorer_scroll = old.saturating_add_signed(delta).min(
+                self.explorer_tree
+                    .as_ref()
+                    .map_or(0, |tree| tree.len().saturating_sub(visible)),
+            );
             self.explorer_scroll != old
         } else {
             self.document_mut()
@@ -1434,6 +1607,130 @@ mod tests {
             );
             editor.poll();
             std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn save_indexes_a_new_file_in_a_panel_and_when_closing_a_tab() {
+        let (dir, mut editor) = fixture();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while editor.project.loading() {
+            assert!(std::time::Instant::now() < deadline);
+            editor.poll();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        editor.view(90, 30);
+        for closing in [false, true] {
+            let name = if closing { "closing.rs" } else { "saved.rs" };
+            let path = dir.path().join(name);
+            editor.open_path(path.clone());
+            wait_for_open(&mut editor);
+            editor.handle(Command::Insert("fn main() {}\n".into()));
+            if closing {
+                editor.action(Action::CloseTab);
+                editor.handle(Command::ConfirmSave);
+            } else {
+                editor.action(Action::QuickOpen);
+                editor.handle(Command::Insert(name.into()));
+                assert!(
+                    matches!(&editor.panel, Panel::Quick { results, .. } if results.is_empty())
+                );
+                editor.handle(Command::Save);
+                assert!(
+                    matches!(&editor.panel, Panel::Quick { results, .. } if results.len() == 1)
+                );
+            }
+            assert!(
+                !editor.project.loading(),
+                "saving should not rescan the project"
+            );
+            assert_eq!(fs::read_to_string(path).unwrap(), "fn main() {}\n");
+            assert!(
+                editor
+                    .view(90, 30)
+                    .chrome
+                    .iter()
+                    .any(|item| item.text.trim() == name)
+            );
+        }
+    }
+
+    #[test]
+    fn search_field_supports_unicode_motion_forward_delete_and_selection() {
+        let (_dir, mut editor) = fixture();
+        let movement = |direction, extend| Command::Move {
+            direction,
+            extend,
+            by_word: false,
+            document: false,
+        };
+        editor.action(Action::Replace);
+        editor.handle(Command::Insert("a世界b".into()));
+        editor.handle(movement(Direction::Left, false));
+        editor.handle(movement(Direction::Left, false));
+        editor.handle(Command::Delete);
+        assert_eq!(editor.field_mut().unwrap().text, "a世b");
+        editor.handle(movement(Direction::Home, false));
+        editor.handle(movement(Direction::Right, true));
+        assert_eq!(editor.handle(Command::Copy), Effect::Copy("a".into()));
+        editor.handle(Command::Insert("ё".into()));
+        assert_eq!(editor.field_mut().unwrap().text, "ё世b");
+        editor.handle(Command::Tab);
+        editor.handle(Command::Insert("замена".into()));
+        editor.handle(movement(Direction::Home, false));
+        editor.handle(Command::Delete);
+        assert_eq!(editor.field_mut().unwrap().text, "амена");
+        editor.handle(Command::Tab);
+        assert_eq!(editor.field_mut().unwrap().text, "ё世b");
+        editor.view(80, 24);
+    }
+
+    #[test]
+    fn explorer_reuses_the_flattened_tree_when_layout_or_scroll_changes() {
+        let (_dir, mut editor) = fixture();
+        editor.project = crate::project::tests::synthetic_project(200);
+        editor.expanded.insert(editor.project.root.join("src"));
+        let first = editor.view(80, 25);
+        assert!(
+            first
+                .chrome
+                .iter()
+                .any(|item| item.text.trim() == "file-00000.rs")
+        );
+        let cache = editor.explorer_tree.as_ref().unwrap();
+        assert_eq!(cache.len(), 201);
+        let storage = cache.as_ptr();
+        editor.explorer_scroll = 123;
+        let later = editor.view(85, 28);
+        assert!(
+            later
+                .chrome
+                .iter()
+                .any(|item| item.text.trim() == "file-00122.rs")
+        );
+        assert_eq!(editor.explorer_tree.as_ref().unwrap().as_ptr(), storage);
+    }
+
+    #[test]
+    #[ignore = "reports Explorer layout timings"]
+    fn explorer_layout_benchmark() {
+        let (_dir, mut editor) = fixture();
+        for count in [10_000, 50_000] {
+            editor.project = crate::project::tests::synthetic_project(count);
+            editor.expanded = HashSet::from([editor.project.root.join("src")]);
+            editor.explorer_tree = None;
+            let start = std::time::Instant::now();
+            std::hint::black_box(editor.view(100, 35));
+            let rebuild = start.elapsed();
+            let start = std::time::Instant::now();
+            for frame in 0..1000 {
+                editor.explorer_scroll = frame * 23 % count;
+                std::hint::black_box(editor.view(100, 35));
+            }
+            eprintln!(
+                "{count} files: first layout {rebuild:?}, warm layout {:?}/frame",
+                start.elapsed() / 1000
+            );
         }
     }
 

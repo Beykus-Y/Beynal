@@ -178,7 +178,7 @@ Configuration lives in `$XDG_CONFIG_HOME/beyrix/config.toml` (usually `~/.config
 
 ## BEdit
 
-From a Wayland session, BEdit opens a standalone editor window. From a shell in Beyrix, it opens in the current window. Closing BEdit with Esc returns to the running shell after resolving any unsaved changes.
+From a Wayland session, BEdit opens a standalone editor window. From a shell in Beyrix, it opens in the current window. Use `bedit --standalone` or the BEdit desktop entry for a separate window. Closing BEdit with Esc returns to the running shell after resolving any unsaved changes.
 
 ```sh
 bedit                         # open the current directory
@@ -201,7 +201,7 @@ bedit --help
 | Ctrl+Shift+R | Refresh the project index. |
 | Esc / Ctrl+Shift+W | Dismiss a search or leave BEdit. |
 
-Click a folder in Explorer to expand it, a file to open it, or × to close a tab. Each open tab retains its own selection, cursor, scroll and undo history. While closing, Y saves, N discards and Esc cancels. A failed save keeps the editor open with the modified buffer.
+Click a folder in Explorer to expand it, a file to open it, or × to close a tab. Each open tab retains its own selection, cursor, scroll and undo history. Saving a project file adds it to Explorer and quick open. In the search fields, use the arrow keys, Home, End, Delete or Shift to move, edit or select text. While closing, Y saves, N discards and Esc cancels. A failed save keeps the editor open with the modified buffer. Atomic replacement preserves ownership, mode and readable Linux extended attributes including POSIX ACLs. BEdit reports an error if it cannot copy those attributes.
 
 ### Upgrading from Beynal
 

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=BEdit
+GenericName=Code Editor
+Comment=Edit project files in Beyrix
+Exec=bedit --standalone %F
+TryExec=bedit
+Icon=accessories-text-editor
+Terminal=false
+Categories=Development;TextEditor;
+MimeType=text/plain;
+Keywords=code;editor;project;
+StartupNotify=false

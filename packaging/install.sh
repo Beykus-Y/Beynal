@@ -31,6 +31,8 @@ if [ ! -L "$BINDIR/bedit" ]; then
     ln -s beyrix "$BINDIR/bedit"
 fi
 
+install -Dm644 "$here/io.github.beykus_y.BEdit.desktop" "$PREFIX/share/applications/io.github.beykus_y.BEdit.desktop"
+
 echo "Installed beyrix and bedit to $BINDIR"
 case ":${PATH:-}:" in
     *":$BINDIR:"*) ;;

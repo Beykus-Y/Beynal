@@ -11,7 +11,8 @@ Beyrix targets Linux/Wayland and includes a PTY-backed terminal and the BEdit ed
 | `src/gl.rs` | OpenGL ES 2.0 backend built on EGL and a Wayland surface |
 | `src/gpu.rs` | DRM, EGL/OpenGL and Vulkan discovery plus backend selection |
 | `src/editor.rs` | Document text, undo/redo, file metadata, selections and visible text layout |
-| `src/project.rs` | Background directory index and path lookup |
+| `src/project.rs` | Background directory index, incremental insertion of saved paths and path lookup |
+| `src/file_metadata.rs` | Linux file ownership, mode, ACL and extended attribute preservation for atomic saves |
 | `src/bedit.rs` | Workspace, tabs, panel focus, close transactions and editor view composition |
 | `src/syntax.rs` | Language selection and bounded lexical coloring of visible lines |
 | `src/keyboard.rs` | Keyboard mapping and key sequence translation using `xkbcommon` |
@@ -24,9 +25,9 @@ Beyrix targets Linux/Wayland and includes a PTY-backed terminal and the BEdit ed
 
 ## BEdit data flow
 
-The command launcher sends absolute native paths through `BEYRIX_CONTROL_SOCKET` when available. A terminal window hosts BEdit on the same surface and continues servicing the existing PTY. Standalone windows skip shell creation. The project index and file loader run independently of the frame loop. File loading returns a batch of documents, which the workspace resolves against stable tab IDs.
+The command launcher sends absolute native paths through `BEYRIX_CONTROL_SOCKET` when available. A terminal window hosts BEdit on the same surface and continues servicing the existing PTY. Standalone windows skip shell creation and advertise the Wayland application ID `io.github.beykus_y.BEdit`. Explorer caches the expanded tree and lays out only the visible range on each frame. The project index and file loader run independently of the frame loop. File loading returns a batch of documents, which the workspace resolves against stable tab IDs.
 
-The workspace owns close confirmation for each affected document. Discard decisions take effect when the close transaction completes. If the user cancels or a save fails, the workspace keeps all buffers. Document saves check file identity and change stamps, stage content in the destination directory, then atomically replace the file. New files use a no-clobber save.
+The workspace owns close confirmation for each affected document. Discard decisions take effect when the close transaction completes. If the user cancels or a save fails, the workspace keeps all buffers. Document saves check the target path, file identity and change stamps, then stage content and metadata in the destination directory before atomic replacement. Existing files retain ownership, mode, access time and extended attributes exposed by Linux, including POSIX ACLs. Modification time reflects the save. Inode identity, hard-link relationships and filesystem-specific inode flags are outside the metadata copied by this operation. New files use a no-clobber save.
 
 Both renderers consume the same view and logical grid, including tab and Explorer hit areas, line numbers, syntax ranges and selection. The current lexer runs on the visible line prefixes with a byte limit. It has no multiline state. Tree-sitter provides incremental parse trees and highlight queries, with a separate grammar and query set per language. Syntect provides Sublime grammars and cacheable parser state, with a choice of regex engines. The current lexer favors a small dependency footprint and bounded viewport work. [Tree-sitter](https://tree-sitter.github.io/tree-sitter/3-syntax-highlighting.html) · [Syntect](https://github.com/trishume/syntect#caching)
 

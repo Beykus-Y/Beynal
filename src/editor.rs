@@ -1292,13 +1292,28 @@ impl Document {
                 };
                 write().map_err(|e| format!("cannot write {}: {e}", self.path.display()))?;
             }
-            let permissions = existing.as_ref().map_or_else(
-                || std::fs::Permissions::from_mode(0o644),
-                |meta| meta.permissions(),
-            );
+            if let Some(metadata) = &existing {
+                let original = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(&self.target)
+                    .map_err(|e| {
+                        format!("cannot read metadata for {}: {e}", self.path.display())
+                    })?;
+                if original.metadata().ok().as_ref().map(Stamp::of) != disk {
+                    return Err(format!(
+                        "{} changed during save; try Ctrl+S again",
+                        self.path.display()
+                    ));
+                }
+                crate::file_metadata::preserve(&original, temp.as_file(), metadata)
+            } else {
+                temp.as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o644))
+            }
+            .map_err(|e| format!("cannot preserve metadata for {}: {e}", self.path.display()))?;
             temp.as_file()
-                .set_permissions(permissions)
-                .and_then(|()| temp.as_file().sync_all())
+                .sync_all()
                 .map_err(|e| format!("cannot sync {}: {e}", self.path.display()))?;
             if self.disk_metadata()?.as_ref().map(Stamp::of) != disk {
                 return Err(format!(
@@ -1340,6 +1355,12 @@ impl Document {
     }
 
     fn disk_metadata(&self) -> Result<Option<std::fs::Metadata>, String> {
+        if target_for(&self.path) != self.target {
+            return Err(format!(
+                "{} now resolves to a different file; reopen it before saving",
+                self.path.display()
+            ));
+        }
         match std::fs::symlink_metadata(&self.target) {
             Ok(meta) if meta.is_file() => Ok(Some(meta)),
             Ok(_) => Err(format!(
@@ -1383,10 +1404,6 @@ impl Document {
             }
             Command::Undo => changed(self.undo()),
             Command::Redo => changed(self.redo()),
-            Command::Save => match self.save() {
-                Ok(()) => Effect::Changed,
-                Err(_) => Effect::Changed,
-            },
             Command::Copy => match self.selection_text() {
                 Some(text) if !text.is_empty() => Effect::Copy(text),
                 _ => {
@@ -1408,7 +1425,8 @@ impl Document {
             },
             Command::PasteRequest => Effect::PasteRequest,
             Command::Enter => changed(self.enter()),
-            Command::Escape
+            Command::Save
+            | Command::Escape
             | Command::ConfirmCancel
             | Command::ConfirmDiscard
             | Command::ConfirmSave => Effect::None,
@@ -1858,6 +1876,44 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
         editor.save().unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "neworiginal");
+    }
+
+    #[test]
+    fn saving_through_a_symlink_preserves_the_link_and_updates_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        let link = dir.path().join("alias.txt");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink("target.txt", &link).unwrap();
+        let mut doc = Document::open(&link).unwrap();
+        doc.insert_text("new ");
+        doc.save().unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("target.txt"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new old");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn retargeted_symlink_leaves_both_files_and_buffer_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("alias.txt");
+        let previous = dir.path().join("previous.txt");
+        let next = dir.path().join("next.txt");
+        std::fs::write(&previous, "previous").unwrap();
+        std::fs::write(&next, "next").unwrap();
+        std::os::unix::fs::symlink(&previous, &link).unwrap();
+        let mut doc = Document::open(&link).unwrap();
+        doc.insert_text("draft ");
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&next, &link).unwrap();
+        assert!(doc.save().unwrap_err().contains("different file"));
+        assert!(doc.is_modified());
+        assert_eq!(std::fs::read_to_string(previous).unwrap(), "previous");
+        assert_eq!(std::fs::read_to_string(next).unwrap(), "next");
     }
 
     #[test]

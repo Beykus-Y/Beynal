@@ -20,6 +20,7 @@ Source1:        beyrix-vendor-%{upver}.tar.gz
 Source2:        io.github.beykus_y.Beyrix.desktop
 Source3:        io.github.beykus_y.Beyrix.metainfo.xml
 Source4:        beyrix.1
+Source5:        io.github.beykus_y.BEdit.desktop
 
 ExclusiveArch:  x86_64
 
@@ -63,6 +64,7 @@ The project is alpha quality and supports x86_64 Wayland sessions only.
 %install
 %cargo_install
 install -Dpm0644 %{SOURCE2} %{buildroot}%{_datadir}/applications/io.github.beykus_y.Beyrix.desktop
+install -Dpm0644 %{SOURCE5} %{buildroot}%{_datadir}/applications/io.github.beykus_y.BEdit.desktop
 install -Dpm0644 %{SOURCE3} %{buildroot}%{_metainfodir}/io.github.beykus_y.Beyrix.metainfo.xml
 install -Dpm0644 %{SOURCE4} %{buildroot}%{_mandir}/man1/beyrix.1
 %{cargo_license} > cargo-license.txt
@@ -79,6 +81,7 @@ install -Dpm0644 cargo-vendor.txt %{buildroot}%{_licensedir}/%{name}/cargo-vendo
 %{_bindir}/beyrix
 %{_bindir}/bedit
 %{_datadir}/applications/io.github.beykus_y.Beyrix.desktop
+%{_datadir}/applications/io.github.beykus_y.BEdit.desktop
 %{_metainfodir}/io.github.beykus_y.Beyrix.metainfo.xml
 %{_mandir}/man1/beyrix.1*
 %{_licensedir}/%{name}/cargo-license.txt

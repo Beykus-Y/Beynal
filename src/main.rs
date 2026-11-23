@@ -6,6 +6,7 @@ mod bedit;
 mod compat;
 mod control;
 mod editor;
+mod file_metadata;
 mod gl;
 mod gpu;
 mod keyboard;
@@ -209,15 +210,20 @@ fn run(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_bedit(args: &[std::ffi::OsString]) -> Result<(), Box<dyn std::error::Error>> {
     let mut options = true;
+    let mut standalone = false;
     let mut paths = Vec::new();
     for arg in args {
         if options {
             match arg.to_str() {
                 Some("-h" | "--help") => {
                     println!(
-                        "BEdit · Beyrix code editor\n\nUsage: bedit [--] [DIRECTORY] [FILE ...]\n\nWithout arguments, opens the current directory. Files open in tabs.\nIn Beyrix, opens in the current window.\n\nCtrl+P Open   Ctrl+Tab Switch tab   Ctrl+B Explorer\nCtrl+F Find   Ctrl+H Replace       Ctrl+S Save   Ctrl+W Close tab"
+                        "BEdit · Beyrix code editor\n\nUsage: bedit [--standalone] [--] [DIRECTORY] [FILE ...]\n\nWithout arguments, opens the current directory. Files open in tabs.\nIn Beyrix, opens in the current window. Use --standalone for a separate window.\n\nCtrl+P Open   Ctrl+Tab Switch tab   Ctrl+B Explorer\nCtrl+F Find   Ctrl+H Replace       Ctrl+S Save   Ctrl+W Close tab"
                     );
                     return Ok(());
+                }
+                Some("--standalone") => {
+                    standalone = true;
+                    continue;
                 }
                 Some("--") => {
                     options = false;
@@ -232,7 +238,11 @@ fn run_bedit(args: &[std::ffi::OsString]) -> Result<(), Box<dyn std::error::Erro
         paths.push(std::path::PathBuf::from(arg));
     }
     let request = bedit::OpenRequest::from_paths(&paths)?;
-    launch_editor(request, false)
+    if standalone {
+        wayland::run_editor(bedit::BEdit::open(request)?)
+    } else {
+        launch_editor(request, false)
+    }
 }
 
 fn edit_file(file: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {

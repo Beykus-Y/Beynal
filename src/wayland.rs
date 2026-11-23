@@ -747,7 +747,12 @@ impl State {
                 .as_ref()
                 .map_or_else(|| "Beyrix".into(), BEdit::title),
         );
-        toplevel.set_app_id("beyrix".to_string());
+        let app_id = if self.standalone_editor {
+            "io.github.beykus_y.BEdit"
+        } else {
+            "beyrix"
+        };
+        toplevel.set_app_id(app_id.to_string());
         toplevel.set_min_size(320, 200);
 
         let theme = crate::theme::AppConfig::load()

@@ -97,7 +97,7 @@ tar --sort=name --mtime="@$EPOCH" --owner=0 --group=0 --numeric-owner \
     -C "$SRCDIR" -cf - vendor | gzip -9n > "$VENDOR"
 sha256sum "$VENDOR" | tee "$VENDOR.sha256"
 
-install -m 644 "$HERE/io.github.beykus_y.Beyrix.desktop" "$OUTDIR/"
+install -m 644 "$HERE/io.github.beykus_y.Beyrix.desktop" "$HERE/io.github.beykus_y.BEdit.desktop" "$OUTDIR/"
 install -m 644 "$HERE/io.github.beykus_y.Beyrix.metainfo.xml" "$OUTDIR/"
 install -m 644 "$HERE/beyrix.1" "$OUTDIR/"
 install -m 644 "$SPEC" "$OUTDIR/"
