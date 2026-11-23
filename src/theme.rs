@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 use serde::Deserialize;
 use std::{io, path::PathBuf};
 
@@ -205,8 +209,18 @@ impl Theme {
             .filter(|p| !p.is_empty() && std::path::Path::new(p).is_absolute())
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")));
-        root.map(|root| root.join("beynal/config.toml"))
+        root.map(|root| Self::config_path_from_root(&root))
             .ok_or_else(|| "XDG_CONFIG_HOME and HOME are unavailable".to_string())
+    }
+    // Keep existing Beynal configuration working until users explicitly migrate.
+    fn config_path_from_root(root: &std::path::Path) -> PathBuf {
+        let preferred = root.join("beyrix/config.toml");
+        let legacy = root.join("beynal/config.toml");
+        if preferred.is_file() || !legacy.is_file() {
+            preferred
+        } else {
+            legacy
+        }
     }
     pub fn save_choice_at(path: &std::path::Path, name: &str) -> Result<(), String> {
         Self::builtin(name)?;
@@ -277,6 +291,19 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn config_path_falls_back_to_existing_beynal_and_prefers_beyrix() {
+        let root = tempfile::tempdir().unwrap();
+        let new_path = root.path().join("beyrix/config.toml");
+        let old_path = root.path().join("beynal/config.toml");
+        assert_eq!(Theme::config_path_from_root(root.path()), new_path);
+        std::fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+        std::fs::write(&old_path, "theme = 'minimal'\n").unwrap();
+        assert_eq!(Theme::config_path_from_root(root.path()), old_path);
+        std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+        std::fs::write(&new_path, "theme = 'signature'\n").unwrap();
+        assert_eq!(Theme::config_path_from_root(root.path()), new_path);
+    }
     #[test]
     fn preserves_comments_and_unknown_settings() {
         let dir = tempfile::tempdir().unwrap();
