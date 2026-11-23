@@ -5,6 +5,9 @@
 use serde::Deserialize;
 use std::{io, path::PathBuf};
 
+use crate::gpu::RendererChoice;
+use crate::terminal::LayoutMode;
+
 pub const ANSI: [[u8; 3]; 16] = [
     [24, 30, 39],
     [232, 127, 133],
@@ -47,6 +50,8 @@ pub struct Theme {
     pub scrollback_limit: usize,
     pub scroll_speed: usize,
     pub signature_compact: bool,
+    pub layout: LayoutMode,
+    pub renderer: RendererChoice,
 }
 impl Default for Theme {
     fn default() -> Self {
@@ -66,6 +71,8 @@ impl Default for Theme {
             scrollback_limit: 10000,
             scroll_speed: 3,
             signature_compact: false,
+            layout: LayoutMode::AsIs,
+            renderer: RendererChoice::Auto,
         }
     }
 }
@@ -80,6 +87,8 @@ struct Config {
     scrollback_limit: Option<usize>,
     scroll_speed: Option<usize>,
     signature_compact: bool,
+    layout: Option<String>,
+    renderer: Option<String>,
     background: Option<String>,
     foreground: Option<String>,
     cursor: Option<String>,
@@ -150,6 +159,14 @@ impl Theme {
             }
             t.scroll_speed = v;
         }
+        if let Some(v) = config.layout {
+            t.layout =
+                LayoutMode::parse(&v).ok_or("layout must be as-is, bottom, or bottom-input")?;
+        }
+        if let Some(v) = config.renderer {
+            t.renderer = RendererChoice::parse(&v)
+                .ok_or("renderer must be auto, opengl, vulkan, or software")?;
+        }
         if let Some(v) = config.cursor_shape {
             t.cursor_shape = match v.as_str() {
                 "block" => CursorShape::Block,
@@ -204,22 +221,55 @@ impl Theme {
         }
         Ok(t)
     }
-    fn config_path() -> Result<PathBuf, String> {
+    fn config_paths() -> Result<(PathBuf, PathBuf), String> {
         let root = std::env::var_os("XDG_CONFIG_HOME")
             .filter(|p| !p.is_empty() && std::path::Path::new(p).is_absolute())
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")));
-        root.map(|root| Self::config_path_from_root(&root))
-            .ok_or_else(|| "XDG_CONFIG_HOME and HOME are unavailable".to_string())
+        root.map(|root| {
+            (
+                root.join("beyrix/config.toml"),
+                root.join("beynal/config.toml"),
+            )
+        })
+        .ok_or_else(|| "XDG_CONFIG_HOME and HOME are unavailable".to_string())
     }
-    // Keep existing Beynal configuration working until users explicitly migrate.
-    fn config_path_from_root(root: &std::path::Path) -> PathBuf {
-        let preferred = root.join("beyrix/config.toml");
-        let legacy = root.join("beynal/config.toml");
-        if preferred.is_file() || !legacy.is_file() {
-            preferred
-        } else {
-            legacy
+    fn config_path() -> Result<PathBuf, String> {
+        let (current, legacy) = Self::config_paths()?;
+        match Self::migrate_config(&legacy, &current) {
+            Ok(_) => Ok(current),
+            Err(error) if legacy.is_file() => {
+                // Keep the old file usable instead of dropping the user's
+                // settings when the new location cannot be written.
+                eprintln!(
+                    "beyrix: could not migrate {} to {}: {error}; using legacy settings",
+                    legacy.display(),
+                    current.display()
+                );
+                Ok(legacy)
+            }
+            Err(error) => Err(format!("migrate {}: {error}", legacy.display())),
+        }
+    }
+    /// Copy the legacy configuration to the new location once. The legacy file
+    /// is never removed, and an existing Beyrix configuration is never replaced.
+    fn migrate_config(legacy: &std::path::Path, current: &std::path::Path) -> io::Result<bool> {
+        if current.exists() || !legacy.is_file() {
+            return Ok(false);
+        }
+        let parent = current
+            .parent()
+            .ok_or_else(|| io::Error::other("invalid configuration path"))?;
+        std::fs::create_dir_all(parent)?;
+        use std::io::Write;
+        let mut source = std::fs::File::open(legacy)?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        io::copy(&mut source, &mut temp)?;
+        temp.flush()?;
+        match temp.persist_noclobber(current) {
+            Ok(_) => Ok(true),
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error.error),
         }
     }
     pub fn save_choice_at(path: &std::path::Path, name: &str) -> Result<(), String> {
@@ -253,6 +303,77 @@ impl Theme {
     }
     pub fn save_choice(name: &str) -> Result<(), String> {
         Self::save_choice_at(&Self::config_path()?, name)
+    }
+    pub fn save_layout_at(path: &std::path::Path, layout: LayoutMode) -> Result<(), String> {
+        let existing = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let mut doc: toml_edit::DocumentMut = existing
+            .parse()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if let Some(item) = doc.get_mut("layout") {
+            let value = item.as_value_mut().ok_or("layout must be a string")?;
+            let decor = value.decor().clone();
+            *value = toml_edit::Value::from(layout.name());
+            *value.decor_mut() = decor;
+        } else {
+            doc.insert("layout", toml_edit::value(layout.name()));
+        }
+        let content = doc.to_string();
+        Self::parse(&content)?;
+        let parent = path.parent().ok_or("invalid config path")?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        use std::io::Write;
+        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+        temp.write_all(content.as_bytes())
+            .map_err(|e| e.to_string())?;
+        temp.persist(path).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    pub fn save_layout(layout: LayoutMode) -> Result<(), String> {
+        Self::save_layout_at(&Self::config_path()?, layout)
+    }
+    pub fn load_layout() -> Result<LayoutMode, String> {
+        Ok(Self::load()?.layout)
+    }
+    pub fn save_renderer_at(
+        path: &std::path::Path,
+        renderer: RendererChoice,
+    ) -> Result<(), String> {
+        let existing = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let mut doc: toml_edit::DocumentMut = existing
+            .parse()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if let Some(item) = doc.get_mut("renderer") {
+            let value = item.as_value_mut().ok_or("renderer must be a string")?;
+            let decor = value.decor().clone();
+            *value = toml_edit::Value::from(renderer.name());
+            *value.decor_mut() = decor;
+        } else {
+            doc.insert("renderer", toml_edit::value(renderer.name()));
+        }
+        let content = doc.to_string();
+        Self::parse(&content)?;
+        let parent = path.parent().ok_or("invalid config path")?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        use std::io::Write;
+        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+        temp.write_all(content.as_bytes())
+            .map_err(|e| e.to_string())?;
+        temp.persist(path).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    pub fn save_renderer(renderer: RendererChoice) -> Result<(), String> {
+        Self::save_renderer_at(&Self::config_path()?, renderer)
+    }
+    pub fn load_renderer() -> Result<RendererChoice, String> {
+        Ok(Self::load()?.renderer)
     }
     pub fn load_for(name: &str) -> Result<Self, String> {
         Self::builtin(name)?;
@@ -292,19 +413,6 @@ impl AppConfig {
 mod tests {
     use super::*;
     #[test]
-    fn config_path_falls_back_to_existing_beynal_and_prefers_beyrix() {
-        let root = tempfile::tempdir().unwrap();
-        let new_path = root.path().join("beyrix/config.toml");
-        let old_path = root.path().join("beynal/config.toml");
-        assert_eq!(Theme::config_path_from_root(root.path()), new_path);
-        std::fs::create_dir_all(old_path.parent().unwrap()).unwrap();
-        std::fs::write(&old_path, "theme = 'minimal'\n").unwrap();
-        assert_eq!(Theme::config_path_from_root(root.path()), old_path);
-        std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
-        std::fs::write(&new_path, "theme = 'signature'\n").unwrap();
-        assert_eq!(Theme::config_path_from_root(root.path()), new_path);
-    }
-    #[test]
     fn preserves_comments_and_unknown_settings() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -336,6 +444,101 @@ mod tests {
         assert_ne!(t.background, Theme::builtin("minimal").unwrap().background);
         assert_eq!(Theme::parse("padding=2").unwrap().name, "minimal");
     }
+    #[test]
+    fn layout_setting_parses_persists_and_keeps_comments() {
+        assert_eq!(Theme::default().layout, LayoutMode::AsIs);
+        assert_eq!(
+            Theme::parse("layout = 'bottom-input'").unwrap().layout,
+            LayoutMode::BottomInput
+        );
+        for (value, expected) in [
+            ("as-is", LayoutMode::AsIs),
+            ("bottom", LayoutMode::Bottom),
+            ("bottom-input", LayoutMode::BottomInput),
+        ] {
+            assert_eq!(
+                Theme::parse(&format!("layout = '{value}'")).unwrap().layout,
+                expected
+            );
+            assert_eq!(expected.name(), value);
+            assert_eq!(LayoutMode::parse(value), Some(expected));
+        }
+        assert!(Theme::parse("layout = 'middle'").is_err());
+        assert_eq!(LayoutMode::parse("unknown"), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# keep me\ntheme = 'minimal' # inline\nlayout = 'as-is'\n",
+        )
+        .unwrap();
+        Theme::save_layout_at(&path, LayoutMode::BottomInput).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep me") && text.contains("# inline"));
+        assert_eq!(Theme::parse(&text).unwrap().layout, LayoutMode::BottomInput);
+        Theme::save_layout_at(&path, LayoutMode::Bottom).unwrap();
+        assert_eq!(
+            Theme::parse(&std::fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .layout,
+            LayoutMode::Bottom
+        );
+    }
+
+    #[test]
+    fn renderer_setting_parses_persists_and_keeps_comments() {
+        use crate::gpu::RendererChoice;
+        assert_eq!(Theme::default().renderer, RendererChoice::Auto);
+        for (value, expected) in [
+            ("auto", RendererChoice::Auto),
+            ("opengl", RendererChoice::OpenGl),
+            ("vulkan", RendererChoice::Vulkan),
+            ("software", RendererChoice::Software),
+        ] {
+            assert_eq!(
+                Theme::parse(&format!("renderer = '{value}'"))
+                    .unwrap()
+                    .renderer,
+                expected
+            );
+        }
+        assert!(Theme::parse("renderer = 'metal'").is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# keep\nrenderer = 'auto' # inline\n").unwrap();
+        Theme::save_renderer_at(&path, RendererChoice::OpenGl).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep") && text.contains("# inline"));
+        assert_eq!(
+            Theme::parse(&text).unwrap().renderer,
+            RendererChoice::OpenGl
+        );
+    }
+
+    #[test]
+    fn legacy_config_migration_is_safe_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("beynal/config.toml");
+        let current = dir.path().join("beyrix/config.toml");
+        let settings = "theme = 'developer'\nlayout = 'bottom'\nrenderer = 'software'\n";
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, settings).unwrap();
+
+        assert!(Theme::migrate_config(&legacy, &current).unwrap());
+        assert_eq!(std::fs::read_to_string(&current).unwrap(), settings);
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), settings);
+        assert!(!Theme::migrate_config(&legacy, &current).unwrap());
+
+        std::fs::write(&legacy, "theme = 'signature'\n").unwrap();
+        assert!(!Theme::migrate_config(&legacy, &current).unwrap());
+        assert_eq!(std::fs::read_to_string(&current).unwrap(), settings);
+        assert_eq!(
+            std::fs::read_to_string(&legacy).unwrap(),
+            "theme = 'signature'\n"
+        );
+    }
+
     #[test]
     fn parses_and_rejects_invalid() {
         let t = Theme::parse(

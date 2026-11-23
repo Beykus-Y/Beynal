@@ -8,6 +8,9 @@ This is a map of the **existing** code, not a promise of future interfaces. Beyr
 | `src/wayland.rs` | Wayland connection, surface, events, shared-memory buffers, input and interaction with the terminal state |
 | `src/terminal.rs` | Terminal grid, escape-sequence interpretation via `vte`, scrollback and screen state |
 | `src/render.rs` | CPU text rendering and cell geometry, using `fontdue` |
+| `src/gl.rs` | OpenGL ES 2.0 backend built on EGL and a Wayland surface |
+| `src/gpu.rs` | DRM, EGL/OpenGL and Vulkan discovery plus backend selection |
+| `src/editor.rs` | Built-in single-file text editor model, view and file saving |
 | `src/keyboard.rs` | Keyboard mapping and key sequence translation using `xkbcommon` |
 | `src/pty.rs` | PTY process creation, Bash launch and resize |
 | `src/selection.rs` | Selection position and word/line selection behavior |
@@ -18,7 +21,7 @@ This is a map of the **existing** code, not a promise of future interfaces. Beyr
 ## Current boundaries and constraints
 
 - The graphical backend is Wayland-specific; it is **not** a portable windowing abstraction.
-- Rendering currently uses CPU and Wayland shared memory; there is no Vulkan or OpenGL backend yet.
+- Rendering uses either OpenGL ES through EGL or the CPU/`wl_shm` path, with automatic fallback to software. Vulkan device discovery exists, but there is no Vulkan renderer.
 - PTY handling currently uses Unix APIs and launches Bash. Windows ConPTY support does not exist.
 - The terminal parser and grid have their own tests, but full xterm/VT compatibility has not been established.
 

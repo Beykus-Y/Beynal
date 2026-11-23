@@ -13,7 +13,10 @@ const XKB_KEY_RIGHT: u32 = 0xff53;
 
 fn ctrl_edit_sequence(sym: u32) -> Option<&'static [u8]> {
     match sym {
-        XKB_KEY_BACKSPACE => Some(b"\x1b[127;5u"),
+        // Ctrl+W (ETB): Readline's unix-word-rubout, which uses blanks and tabs
+        // as delimiters. This is understood by any interactive line editor,
+        // unlike a bare kitty CSI-u sequence that requires shell-side bindings.
+        XKB_KEY_BACKSPACE => Some(b"\x17"),
         XKB_KEY_DELETE => Some(b"\x1b[3;5~"),
         XKB_KEY_LEFT => Some(b"\x1b[1;5D"),
         XKB_KEY_RIGHT => Some(b"\x1b[1;5C"),
@@ -120,6 +123,30 @@ impl Keyboard {
     pub fn control(&self) -> bool {
         self.modifier(c"Control")
     }
+    pub fn alt(&self) -> bool {
+        self.modifier(c"Mod1")
+    }
+    /// Keysym for the editor's key bindings.
+    pub fn sym(&self, key: u32) -> u32 {
+        if self.state.is_null() {
+            return 0;
+        }
+        unsafe { xkb_state_key_get_one_sym(self.state, key + 8) }
+    }
+    /// Text produced by a key without control-key translation.
+    pub fn text(&self, key: u32) -> Vec<u8> {
+        if self.state.is_null() {
+            return Vec::new();
+        }
+        let key = key + 8;
+        let sym = unsafe { xkb_state_key_get_one_sym(self.state, key) };
+        let mut buffer = [0i8; 64];
+        unsafe {
+            xkb_state_key_get_utf8(self.state, key, buffer.as_mut_ptr(), buffer.len());
+        }
+        let text = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_bytes();
+        translate(sym, text)
+    }
     pub fn key(&self, key: u32) -> Vec<u8> {
         if self.state.is_null() {
             return Vec::new();
@@ -204,7 +231,7 @@ mod tests {
             assert_eq!(keyboard.key(15), b"\t");
 
             for (key, plain, ctrl) in [
-                (14, &b"\x7f"[..], &b"\x1b[127;5u"[..]),
+                (14, &b"\x7f"[..], &b"\x17"[..]),
                 (111, b"\x1b[3~", b"\x1b[3;5~"),
                 (105, b"\x1b[D", b"\x1b[1;5D"),
                 (106, b"\x1b[C", b"\x1b[1;5C"),
@@ -219,6 +246,18 @@ mod tests {
         }
         keyboard.modifiers(1 << 2, 0, 0, 0);
         assert_eq!(keyboard.key(35), b"\x08"); // Ctrl+H remains distinct.
+    }
+
+    #[test]
+    fn ctrl_backspace_sends_readline_word_rubout() {
+        // 0x17 is the standard Ctrl+W control character. Readline binds it to
+        // unix-word-rubout, which splits words on blanks and tabs only.
+        assert_eq!(super::ctrl_edit_sequence(0xff08), Some(&b"\x17"[..]));
+        assert_eq!(super::translate(0xff08, b""), b"\x7f");
+        assert_eq!(super::translate(b'w' as u32, b"\x17"), b"\x17");
+        // Ctrl+H (0x08) and Ctrl+Delete must stay available for their own bindings.
+        assert_eq!(super::translate(b'h' as u32, b"\x08"), b"\x08");
+        assert_eq!(super::ctrl_edit_sequence(0xffff), Some(&b"\x1b[3;5~"[..]));
     }
 
     #[test]

@@ -11,9 +11,12 @@ use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::editor::{Command as EditorCommand, Direction, Editor, Metrics};
+use crate::gl::{GlBackend, PixelRect};
+use crate::gpu::{self, ActiveBackend, RendererChoice};
 use crate::pty::Pty;
 use crate::render;
-use crate::terminal::Terminal;
+use crate::terminal::{Screen, Terminal};
 
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
@@ -24,10 +27,20 @@ use wayland_client::{
     },
 };
 
+use wayland_protocols::wp::fractional_scale::v1::client::{
+    wp_fractional_scale_manager_v1, wp_fractional_scale_v1,
+};
+use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 const WIDTH: i32 = 800;
 const HEIGHT: i32 = 500;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Destination {
+    Terminal,
+    Editor,
+}
 
 struct Transfer {
     file: File,
@@ -35,6 +48,125 @@ struct Transfer {
     offset: usize,
     writing: bool,
     bracketed: bool,
+    destination: Destination,
+}
+
+struct KeyPress {
+    key: u32,
+    sym: u32,
+    control: bool,
+    shift: bool,
+    alt: bool,
+    text: String,
+}
+
+fn metrics(geometry: render::Geometry) -> Metrics {
+    Metrics {
+        cell_width: geometry.cell_width,
+        cell_height: geometry.cell_height,
+        padding: geometry.padding,
+    }
+}
+
+fn movement(
+    direction: Direction,
+    press: &KeyPress,
+    by_word: bool,
+    document: bool,
+) -> EditorCommand {
+    EditorCommand::Move {
+        direction,
+        extend: press.shift,
+        by_word,
+        document,
+    }
+}
+
+fn editor_command(press: &KeyPress, confirming: bool) -> Option<EditorCommand> {
+    const KEY_LEFT: u32 = 0xff51;
+    const KEY_UP: u32 = 0xff52;
+    const KEY_RIGHT: u32 = 0xff53;
+    const KEY_DOWN: u32 = 0xff54;
+    const KEY_HOME: u32 = 0xff50;
+    const KEY_END: u32 = 0xff57;
+    const KEY_PAGE_UP: u32 = 0xff55;
+    const KEY_PAGE_DOWN: u32 = 0xff56;
+    const KEY_BACKSPACE: u32 = 0xff08;
+    const KEY_DELETE: u32 = 0xffff;
+    const KEY_RETURN: u32 = 0xff0d;
+    const KEY_KP_ENTER: u32 = 0xff8d;
+    const KEY_TAB: u32 = 0xff09;
+    const KEY_ESCAPE: u32 = 0xff1b;
+    const KEY_INSERT: u32 = 0xff63;
+
+    if confirming {
+        if press.control || press.alt {
+            return None;
+        }
+        if press.sym == KEY_ESCAPE {
+            return Some(EditorCommand::ConfirmCancel);
+        }
+        return match press.key {
+            46 => Some(EditorCommand::ConfirmCancel),  // C
+            49 => Some(EditorCommand::ConfirmDiscard), // N
+            21 => Some(EditorCommand::ConfirmSave),    // Y
+            _ => None,
+        };
+    }
+
+    if press.control {
+        // Physical keycodes keep Ctrl shortcuts independent of the layout.
+        match press.key {
+            31 => return Some(EditorCommand::Save),                // S
+            44 if press.shift => return Some(EditorCommand::Redo), // Z
+            44 => return Some(EditorCommand::Undo),                // Z
+            21 => return Some(EditorCommand::Redo),                // Y
+            46 => return Some(EditorCommand::Copy),                // C
+            45 => return Some(EditorCommand::Cut),                 // X
+            47 => return Some(EditorCommand::PasteRequest),        // V
+            30 => return Some(EditorCommand::SelectAll),           // A
+            110 => return Some(EditorCommand::PasteRequest),       // Insert
+            _ => {}
+        }
+        return match press.sym {
+            KEY_LEFT => Some(movement(Direction::Left, press, true, false)),
+            KEY_RIGHT => Some(movement(Direction::Right, press, true, false)),
+            KEY_UP => Some(movement(Direction::Up, press, false, false)),
+            KEY_DOWN => Some(movement(Direction::Down, press, false, false)),
+            KEY_HOME => Some(movement(Direction::Home, press, false, true)),
+            KEY_END => Some(movement(Direction::End, press, false, true)),
+            _ => None,
+        };
+    }
+    let command = match press.sym {
+        KEY_ESCAPE => return Some(EditorCommand::Escape),
+        KEY_RETURN | KEY_KP_ENTER => return Some(EditorCommand::Enter),
+        KEY_TAB => return Some(EditorCommand::Tab),
+        KEY_BACKSPACE => return Some(EditorCommand::Backspace),
+        KEY_DELETE => return Some(EditorCommand::Delete),
+        KEY_INSERT if press.shift => return Some(EditorCommand::PasteRequest),
+        KEY_LEFT => movement(Direction::Left, press, false, false),
+        KEY_RIGHT => movement(Direction::Right, press, false, false),
+        KEY_UP => movement(Direction::Up, press, false, false),
+        KEY_DOWN => movement(Direction::Down, press, false, false),
+        KEY_HOME => movement(Direction::Home, press, false, false),
+        KEY_END => movement(Direction::End, press, false, false),
+        KEY_PAGE_UP => movement(Direction::PageUp, press, false, false),
+        KEY_PAGE_DOWN => movement(Direction::PageDown, press, false, false),
+        _ => {
+            if press.alt
+                || press.text.is_empty()
+                || press
+                    .text
+                    .chars()
+                    .any(|ch| ch.is_control() && ch != '\t' && ch != '\n')
+            {
+                return None;
+            }
+            EditorCommand::Insert(press.text.clone())
+        }
+    };
+    Some(command)
 }
 fn set_nonblocking(fd: &impl AsRawFd) -> std::io::Result<()> {
     let fd = fd.as_raw_fd();
@@ -117,11 +249,32 @@ struct State {
     frame_pending: bool,
     pixels: Vec<u8>,
     terminal: Option<Terminal>,
+    editor: Option<Editor>,
     renderer: Option<render::Renderer>,
+    backend: ActiveBackend,
+    gl: Option<GlBackend>,
+    scale: f32,
+    damage_full: bool,
+    damage_hashes: Vec<u64>,
+    damage_signature: Option<TerminalSignature>,
+    damage_history: VecDeque<RowDamage>,
+    dump_deadline: Option<std::time::Instant>,
+    viewporter: Option<wp_viewporter::WpViewporter>,
+    viewport: Option<wp_viewport::WpViewport>,
+    fractional_manager: Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
+    fractional_scale: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
     pty: Option<Pty>,
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
+    run_with(None)
+}
+
+pub fn run_editor(path: std::path::PathBuf) -> Result<(), Box<dyn Error>> {
+    run_with(Some(path))
+}
+
+fn run_with(editor_path: Option<std::path::PathBuf>) -> Result<(), Box<dyn Error>> {
     let connection =
         Connection::connect_to_env().map_err(|e| format!("connect to Wayland: {e}"))?;
     let mut event_queue = connection.new_event_queue();
@@ -137,7 +290,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         blink_on: true,
         width: WIDTH,
         height: HEIGHT,
-        debug_input: std::env::var_os("BEYRIX_DEBUG_INPUT").as_deref()
+        scale: 1.0,
+        dump_deadline: crate::compat::env("BEYRIX_GL_DUMP")
+            .map(|_| std::time::Instant::now() + Duration::from_millis(3000)),
+        debug_input: crate::compat::env("BEYRIX_DEBUG_INPUT").as_deref()
             == Some(std::ffi::OsStr::new("1")),
         ..Default::default()
     };
@@ -151,9 +307,15 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         return Err("Wayland compositor lacks required protocols".into());
     }
 
+    let display_ptr = display.id().as_ptr().cast();
     state
-        .create_window(&qh)
+        .create_window(&qh, display_ptr)
         .map_err(|e| format!("create window and PTY: {e}"))?;
+    if let Some(path) = editor_path {
+        state
+            .open_editor(path)
+            .map_err(|e| format!("open editor: {e}"))?;
+    }
     connection
         .flush()
         .map_err(|e| format!("flush Wayland requests: {e}"))?;
@@ -168,9 +330,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
         if let Some(control) = &state.control {
             match control.receive() {
-                Ok(Some(name)) => {
+                Ok(Some(crate::control::Message::Theme(name))) => {
                     if let Err(e) = state.apply_theme(&name) {
                         eprintln!("theme update: {e}");
+                    }
+                }
+                Ok(Some(crate::control::Message::Open(path))) => {
+                    if let Err(e) = state.open_editor(path) {
+                        eprintln!("open file: {e}");
                     }
                 }
                 Ok(None) => {}
@@ -182,7 +349,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             .is_none_or(|t| (t.elapsed().as_millis() / 600) % 2 == 0);
         if blink_on != state.blink_on {
             state.blink_on = blink_on;
+            if state.keyboard_focus && state.editor.is_some() {
+                state.dirty = true;
+            }
             if state.keyboard_focus
+                && state.editor.is_none()
                 && let (Some(renderer), Some(terminal)) = (&state.renderer, &state.terminal)
                 && terminal.screen().cursor_visible
                 && terminal.screen().view_offset() == 0
@@ -190,6 +361,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             {
                 state.dirty = true;
             }
+        }
+        if state
+            .dump_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            state.dump_deadline = None;
+            state.damage_full = true;
+            state.dirty = true;
         }
         state.pump_clipboard();
         state.update_drag(true);
@@ -274,8 +453,242 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalSignature {
+    width: usize,
+    height: usize,
+    columns: usize,
+    rows: usize,
+    visible_start: usize,
+    layout_offset: usize,
+    view_offset: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RowDamage {
+    full: bool,
+    ranges: Vec<(usize, usize)>,
+}
+
+impl RowDamage {
+    fn full() -> Self {
+        Self {
+            full: true,
+            ranges: Vec::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.full && self.ranges.is_empty()
+    }
+
+    fn merge(&mut self, other: &RowDamage) {
+        if self.full {
+            return;
+        }
+        if other.full {
+            self.full = true;
+            self.ranges.clear();
+            return;
+        }
+        for range in &other.ranges {
+            self.ranges.push(*range);
+        }
+        self.normalize();
+    }
+
+    fn normalize(&mut self) {
+        if self.ranges.len() < 2 {
+            return;
+        }
+        self.ranges.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(self.ranges.len());
+        for (start, end) in self.ranges.drain(..) {
+            match merged.last_mut() {
+                Some((_, last_end)) if start <= *last_end => {
+                    *last_end = (*last_end).max(end);
+                }
+                _ => merged.push((start, end)),
+            }
+        }
+        self.ranges = merged;
+    }
+}
+
+fn hash_mix(hash: &mut u64, value: u64) {
+    *hash ^= value;
+    *hash = hash.wrapping_mul(0x100000001b3);
+}
+
+type CursorHashState = (
+    Option<usize>,
+    (
+        bool,
+        bool,
+        bool,
+        Option<crate::terminal::CursorStyle>,
+        usize,
+    ),
+);
+
+fn cursor_state(screen: &Screen, focused: bool, blink_on: bool) -> CursorHashState {
+    let row =
+        (screen.cursor_visible && screen.view_offset() == 0).then_some(screen.cursor_display_row());
+    (
+        row,
+        (
+            focused,
+            blink_on,
+            screen.cursor_visible,
+            screen.cursor_style,
+            render::Renderer::cursor_x(screen),
+        ),
+    )
+}
+
+fn row_hash(
+    screen: &Screen,
+    y: usize,
+    selection: &crate::selection::Selection,
+    cursor: CursorHashState,
+) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for x in 0..screen.columns {
+        let Some(cell) = screen.get(x, y) else {
+            hash_mix(&mut hash, 0xff);
+            continue;
+        };
+        hash_mix(&mut hash, cell.character as u64);
+        for ch in &cell.combining {
+            hash_mix(&mut hash, *ch as u64);
+        }
+        hash_mix(
+            &mut hash,
+            u64::from(cell.wide)
+                | (u64::from(cell.continuation) << 1)
+                | (u64::from(cell.written) << 2),
+        );
+        hash_mix(
+            &mut hash,
+            u32::from_le_bytes([cell.fg[0], cell.fg[1], cell.fg[2], 0]) as u64,
+        );
+        hash_mix(
+            &mut hash,
+            u32::from_le_bytes([cell.bg[0], cell.bg[1], cell.bg[2], 0]) as u64,
+        );
+        let origin = |origin: crate::terminal::ColorOrigin| match origin {
+            crate::terminal::ColorOrigin::DefaultForeground => 0u64,
+            crate::terminal::ColorOrigin::DefaultBackground => 1,
+            crate::terminal::ColorOrigin::Indexed(index) => 2 + index as u64,
+            crate::terminal::ColorOrigin::Rgb => 1000,
+        };
+        hash_mix(&mut hash, origin(cell.fg_origin));
+        hash_mix(&mut hash, origin(cell.bg_origin));
+        hash_mix(&mut hash, u64::from(selection.contains(screen, y, x)));
+    }
+    if cursor.0 == Some(y) {
+        let (focused, blink_on, visible, style, column) = cursor.1;
+        hash_mix(&mut hash, u64::from(focused));
+        hash_mix(&mut hash, u64::from(blink_on));
+        hash_mix(&mut hash, u64::from(visible));
+        hash_mix(
+            &mut hash,
+            style.map_or(0, |style| {
+                let shape = match style.shape {
+                    crate::theme::CursorShape::Block => 1,
+                    crate::theme::CursorShape::Beam => 2,
+                    crate::theme::CursorShape::Underline => 3,
+                };
+                shape | (u64::from(style.blink) << 4)
+            }),
+        );
+        hash_mix(&mut hash, column as u64);
+    }
+    hash
+}
+
+#[allow(clippy::too_many_arguments)]
+fn terminal_damage(
+    screen: &Screen,
+    selection: &crate::selection::Selection,
+    focused: bool,
+    blink_on: bool,
+    logical: (usize, usize),
+    hashes: &mut Vec<u64>,
+    signature: &mut Option<TerminalSignature>,
+    force_full: bool,
+) -> RowDamage {
+    let current = TerminalSignature {
+        width: logical.0,
+        height: logical.1,
+        columns: screen.columns,
+        rows: screen.rows,
+        visible_start: screen.visible_start(),
+        layout_offset: screen.layout_offset(),
+        view_offset: screen.view_offset(),
+    };
+    let cursor = cursor_state(screen, focused, blink_on);
+    if force_full || signature.as_ref() != Some(&current) || hashes.len() != screen.rows {
+        *signature = Some(current);
+        hashes.clear();
+        hashes.extend((0..screen.rows).map(|y| row_hash(screen, y, selection, cursor)));
+        return RowDamage::full();
+    }
+    let mut damage = RowDamage::default();
+    for y in 0..screen.rows {
+        let hash = row_hash(screen, y, selection, cursor);
+        if hashes.get(y).copied() != Some(hash) {
+            if let Some((_, end)) = damage.ranges.last_mut()
+                && *end == y
+            {
+                *end = y + 1;
+            } else {
+                damage.ranges.push((y, y + 1));
+            }
+        }
+        if let Some(slot) = hashes.get_mut(y) {
+            *slot = hash;
+        } else {
+            hashes.push(hash);
+        }
+    }
+    damage.normalize();
+    damage
+}
+
+fn physical_size(logical: (i32, i32), scale: f32) -> (i32, i32) {
+    (
+        (logical.0 as f32 * scale).round().max(1.0) as i32,
+        (logical.1 as f32 * scale).round().max(1.0) as i32,
+    )
+}
+
+fn row_pixel_rect(
+    geometry: render::Geometry,
+    logical: (usize, usize),
+    scale: f32,
+    physical: (i32, i32),
+    range: (usize, usize),
+) -> PixelRect {
+    let base = geometry.for_window(logical.0.max(1), logical.1.max(1));
+    let cell_h = base.cell_height as f32 * scale;
+    let padding = base.padding as f32 * scale;
+    let top = (padding + range.0 as f32 * cell_h).floor() as i32;
+    let bottom = ((padding + range.1 as f32 * cell_h).ceil() as i32).min(physical.1);
+    PixelRect {
+        x: 0,
+        y: top.max(0),
+        w: physical.0,
+        h: (bottom - top.max(0)).max(0),
+    }
+}
+
 impl State {
-    fn create_window(&mut self, qh: &QueueHandle<Self>) -> Result<(), Box<dyn Error>> {
+    fn create_window(
+        &mut self,
+        qh: &QueueHandle<Self>,
+        display_ptr: *mut std::ffi::c_void,
+    ) -> Result<(), Box<dyn Error>> {
         let compositor = self.compositor.as_ref().unwrap();
         let wm_base = self.wm_base.as_ref().unwrap();
 
@@ -290,15 +703,77 @@ impl State {
         let theme = crate::theme::AppConfig::load()
             .map_err(|e| format!("load configuration: {e}"))?
             .theme;
+        if let (Some(manager), Some(_)) = (&self.fractional_manager, &self.viewporter) {
+            self.fractional_scale = Some(manager.get_fractional_scale(&surface, qh, ()));
+        }
+        if let Some(viewporter) = &self.viewporter {
+            let viewport = viewporter.get_viewport(&surface, qh, ());
+            viewport.set_destination(WIDTH, HEIGHT);
+            self.viewport = Some(viewport);
+            if surface.version() >= 3 {
+                surface.set_buffer_scale(1);
+            }
+        }
         let renderer =
             render::Renderer::with_theme(theme.clone()).map_err(|e| format!("load fonts: {e}"))?;
         let (columns, rows) = renderer.geometry.grid_size(WIDTH as usize, HEIGHT as usize);
+        let requested = theme.renderer;
+        let mut gl = None;
+        let reason;
+        if requested == RendererChoice::Software {
+            reason = "software selected explicitly in configuration".to_string();
+        } else if requested == RendererChoice::Vulkan {
+            reason =
+                "vulkan requested but the Vulkan rendering backend is not implemented; using software"
+                    .to_string();
+        } else {
+            let surface_ptr = surface.id().as_ptr().cast();
+            match GlBackend::new(display_ptr, surface_ptr, WIDTH, HEIGHT) {
+                Ok(backend) => {
+                    let renderer_string = backend.renderer_string();
+                    let software = gpu::EglProbe::is_software_renderer(&renderer_string);
+                    if requested == RendererChoice::Auto && software {
+                        reason = format!(
+                            "auto: EGL renderer {renderer_string} is software; using software backend"
+                        );
+                    } else if requested == RendererChoice::Auto {
+                        reason =
+                            format!("auto: hardware OpenGL renderer detected ({renderer_string})");
+                        gl = Some(backend);
+                    } else {
+                        reason = format!("opengl selected explicitly ({renderer_string})");
+                        gl = Some(backend);
+                    }
+                }
+                Err(error) => {
+                    reason = format!("OpenGL backend unavailable ({error}); using software");
+                    eprintln!("beyrix: {reason}");
+                }
+            }
+        }
+        if self.debug_input {
+            eprintln!(
+                "[output] backend={} requested={} reason={}",
+                if gl.is_some() { "opengl" } else { "software" },
+                requested,
+                reason
+            );
+        }
+        self.backend = if gl.is_some() {
+            ActiveBackend::OpenGl
+        } else {
+            ActiveBackend::Software
+        };
+        self.gl = gl;
         let theme_name = theme.name.clone();
         if let Some(control) = &self.control {
             control.set_prompt(&theme)?;
         }
         let terminal = Terminal::with_theme(columns, rows, theme);
-        self.create_buffers(WIDTH, HEIGHT, qh)?;
+        if self.backend == ActiveBackend::Software {
+            self.create_buffers(WIDTH, HEIGHT, qh)?;
+        }
+        self.damage_full = true;
 
         // Начальный commit без буфера:
         // ждём configure от композитора.
@@ -329,10 +804,116 @@ impl State {
         Ok(())
     }
 
+    fn set_fractional_scale(&mut self, scale: u32, qh: &QueueHandle<Self>) {
+        let scale = (scale as f32 / 120.0).clamp(0.5, 4.0);
+        self.apply_scale(scale, qh);
+    }
+
+    fn set_preferred_scale(&mut self, factor: i32, qh: &QueueHandle<Self>) {
+        if self.fractional_scale.is_some() {
+            return;
+        }
+        let factor = factor.clamp(1, 4) as f32;
+        self.apply_scale(factor, qh);
+    }
+
+    fn apply_scale(&mut self, scale: f32, qh: &QueueHandle<Self>) {
+        if !scale.is_finite() || (scale - self.scale).abs() < 0.001 {
+            return;
+        }
+        self.scale = scale;
+        if self.viewport.is_none()
+            && self.gl.is_some()
+            && let Some(surface) = &self.surface
+            && surface.version() >= 3
+        {
+            surface.set_buffer_scale(scale.round().clamp(1.0, 4.0) as i32);
+        }
+        if self.gl.is_some() {
+            let (width, height) = physical_size((self.width, self.height), scale);
+            let result = self.gl.as_mut().map(|gl| gl.resize(width, height));
+            if let Some(Err(error)) = result {
+                eprintln!("beyrix: OpenGL resize failed ({error}); using software");
+                self.gl = None;
+                self.backend = ActiveBackend::Software;
+                if let Err(error) = self.ensure_software_buffers(qh) {
+                    eprintln!("beyrix: cannot create software buffers: {error}");
+                    self.running = false;
+                }
+            }
+        }
+        self.damage_full = true;
+        self.dirty = true;
+    }
+
+    fn ensure_software_buffers(&mut self, qh: &QueueHandle<Self>) -> Result<(), Box<dyn Error>> {
+        if self
+            .buffers
+            .iter()
+            .any(|buffer| buffer.generation == self.generation)
+        {
+            return Ok(());
+        }
+        self.create_buffers(self.width, self.height, qh)
+    }
+
+    fn fallback_to_software(
+        &mut self,
+        reason: String,
+        qh: &QueueHandle<Self>,
+    ) -> Result<(), Box<dyn Error>> {
+        eprintln!("beyrix: OpenGL backend disabled ({reason}); using software");
+        self.gl = None;
+        self.backend = ActiveBackend::Software;
+        self.damage_full = true;
+        self.damage_hashes.clear();
+        self.damage_signature = None;
+        self.damage_history.clear();
+        self.frame_pending = false;
+        self.ensure_software_buffers(qh)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn open_editor(&mut self, path: std::path::PathBuf) -> Result<(), Box<dyn Error>> {
+        if let Some(editor) = &self.editor
+            && editor.is_modified()
+        {
+            let message = "Save or discard the current file before opening another one";
+            if let Some(editor) = &mut self.editor {
+                editor.set_message(message, true);
+            }
+            self.dirty = true;
+            return Err(message.into());
+        }
+        let editor = Editor::open(path)?;
+        if let Some(toplevel) = &self.toplevel {
+            toplevel.set_title(format!("Beyrix - {}", editor.display_name()));
+        }
+        self.editor = Some(editor);
+        self.selection.clear();
+        self.damage_full = true;
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn close_editor(&mut self) {
+        self.editor = None;
+        if let Some(toplevel) = &self.toplevel {
+            toplevel.set_title("Beyrix".to_string());
+        }
+        self.damage_full = true;
+        self.dirty = true;
+    }
+
     fn apply_theme(&mut self, name: &str) -> Result<(), Box<dyn Error>> {
         let theme = crate::theme::Theme::load_for(name)?;
         let renderer = self.renderer.as_mut().ok_or("renderer unavailable")?;
         renderer.retheme(theme.clone())?;
+        if let Some(gl) = &mut self.gl {
+            gl.invalidate_atlas();
+        }
+        self.damage_full = true;
         let (cols, rows) = renderer
             .geometry
             .grid_size(self.width as usize, self.height as usize);
@@ -399,14 +980,30 @@ impl State {
             .ok_or("renderer unavailable")?
             .geometry
             .grid_size(width as usize, height as usize);
-        self.generation += 1;
-        self.create_buffers(width, height, qh)?;
+        let physical = physical_size((width, height), self.scale);
+        let mut gl_error = None;
+        if let Some(gl) = &mut self.gl
+            && let Err(error) = gl.resize(physical.0, physical.1)
+        {
+            gl_error = Some(error);
+        }
+        if let Some(error) = gl_error {
+            self.fallback_to_software(error, qh)?;
+        }
+        if self.gl.is_none() {
+            self.generation += 1;
+            self.create_buffers(width, height, qh)?;
+        }
+        self.damage_full = true;
         if let Some(pty) = &self.pty {
             pty.resize(columns as u16, rows as u16)
                 .map_err(|e| format!("TIOCSWINSZ: {e}"))?;
         }
         if let Some(terminal) = &mut self.terminal {
             terminal.resize(columns, rows);
+        }
+        if let Some(editor) = &mut self.editor {
+            editor.follow_cursor();
         }
         self.width = width;
         self.height = height;
@@ -425,7 +1022,11 @@ impl State {
     fn scroll_pointer(&mut self) {
         let steps = self.wheel_steps.take().unwrap_or(self.wheel_axis / 10.0);
         self.wheel_axis = 0.0;
-        if let Some(terminal) = &mut self.terminal {
+        if let Some(editor) = &mut self.editor {
+            let (rows, remainder) = wheel_rows(self.wheel_remainder, steps, 3);
+            self.wheel_remainder = remainder;
+            self.dirty |= editor.scroll_lines(-rows);
+        } else if let Some(terminal) = &mut self.terminal {
             let screen = terminal.screen_mut();
             let (rows, remainder) = wheel_rows(self.wheel_remainder, steps, screen.scroll_speed());
             self.wheel_remainder = remainder;
@@ -435,6 +1036,29 @@ impl State {
     }
 
     fn update_drag(&mut self, tick: bool) {
+        if self.editor.is_some() {
+            let (Some(renderer), Some(editor)) = (&self.renderer, &mut self.editor) else {
+                return;
+            };
+            if !self.pointer_focus || !editor.is_mouse_dragging() {
+                return;
+            }
+            let geometry = renderer
+                .geometry
+                .for_window(self.width as usize, self.height as usize);
+            let (x, y) = self.pointer_position;
+            if tick {
+                let top = geometry.padding as f64;
+                let bottom = top + (editor.view_rows() * geometry.cell_height) as f64;
+                if y < top {
+                    self.dirty |= editor.scroll_lines(-1);
+                } else if y >= bottom {
+                    self.dirty |= editor.scroll_lines(1);
+                }
+            }
+            self.dirty |= editor.mouse_drag(x, y, metrics(geometry));
+            return;
+        }
         if !self.selection.is_dragging() || !self.pointer_focus {
             self.drag_scroll_at = None;
             return;
@@ -487,23 +1111,35 @@ impl State {
             self.data_device = Some(manager.get_data_device(seat, qh, ()));
         }
     }
-    fn copy(&mut self, serial: u32, qh: &QueueHandle<Self>) {
+    fn set_clipboard(&mut self, text: String, serial: u32, qh: &QueueHandle<Self>) {
         let (Some(manager), Some(device)) = (&self.data_manager, &self.data_device) else {
             return;
         };
-        let Some(text) = self
-            .terminal
-            .as_ref()
-            .and_then(|t| self.selection.text(t.screen()))
-        else {
+        if text.is_empty() {
             return;
-        };
+        }
         let source = manager.create_data_source(qh, Arc::new(text.into_bytes()));
         source.offer("text/plain;charset=utf-8".into());
         source.offer("text/plain".into());
         device.set_selection(Some(&source), serial);
         if let Some(old) = self.data_source.replace(source) {
             old.destroy();
+        }
+        if let Some(editor) = &mut self.editor {
+            editor.set_message("Copied", false);
+            self.dirty = true;
+        }
+    }
+    fn copy(&mut self, serial: u32, qh: &QueueHandle<Self>) {
+        let text = if let Some(editor) = &self.editor {
+            editor.selection_text()
+        } else {
+            self.terminal
+                .as_ref()
+                .and_then(|t| self.selection.text(t.screen()))
+        };
+        if let Some(text) = text {
+            self.set_clipboard(text, serial, qh);
         }
     }
     fn paste(&mut self) {
@@ -540,15 +1176,22 @@ impl State {
             return;
         }
         offer.receive(mime.into(), write.as_fd());
+        let destination = if self.editor.is_some() {
+            Destination::Editor
+        } else {
+            Destination::Terminal
+        };
         self.transfers.push(Transfer {
             file: File::from(read),
             bytes: Vec::new(),
             offset: 0,
             writing: false,
-            bracketed: self
-                .terminal
-                .as_ref()
-                .is_some_and(|t| t.screen().bracketed_paste),
+            bracketed: destination == Destination::Terminal
+                && self
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|t| t.screen().bracketed_paste),
+            destination,
         });
     }
     fn pump_clipboard(&mut self) {
@@ -595,17 +1238,26 @@ impl State {
                 let transfer = self.transfers.swap_remove(i);
                 if success {
                     match std::str::from_utf8(&transfer.bytes) {
-                        Ok(_) => {
-                            let bytes = paste_bytes(&transfer.bytes, transfer.bracketed);
+                        Ok(text) => {
                             if self.debug_input {
                                 eprintln!(
-                                    "[clipboard] payload received={} queued={} bracketed={}",
+                                    "[clipboard] payload received={} destination={:?}",
                                     transfer.bytes.len(),
-                                    bytes.len(),
-                                    transfer.bracketed
+                                    transfer.destination
                                 );
                             }
-                            self.input.extend(bytes);
+                            match transfer.destination {
+                                Destination::Editor => {
+                                    if let Some(editor) = &mut self.editor {
+                                        editor.insert_text(text);
+                                        self.dirty = true;
+                                    }
+                                }
+                                Destination::Terminal => {
+                                    let bytes = paste_bytes(&transfer.bytes, transfer.bracketed);
+                                    self.input.extend(bytes);
+                                }
+                            }
                         }
                         Err(e) => eprintln!("clipboard invalid UTF-8: {e}"),
                     }
@@ -648,15 +1300,42 @@ impl State {
         let Some(pty) = &self.pty else {
             return Ok(());
         };
-        let mut bytes = [0u8; 8192];
-        let n = unsafe {
-            libc::read(
-                pty.master.as_raw_fd(),
-                bytes.as_mut_ptr().cast(),
-                bytes.len(),
-            )
+        let fd = pty.master.as_raw_fd();
+        let (before, epoch, was_selected) = match &self.terminal {
+            Some(terminal) => (
+                visible_state(terminal.screen()),
+                terminal.screen().selection_epoch,
+                self.selection.active(terminal.screen()),
+            ),
+            None => return Ok(()),
         };
-        if n <= 0 {
+        let mut bytes = [0u8; 65536];
+        let mut total = 0usize;
+        let mut closed = false;
+        // Drain a large burst in one pass. Rendering once per burst instead of
+        // once per 8 KiB read is the difference between being frame-rate bound
+        // and being limited by the parser.
+        const MAX_BURST: usize = 512 * 1024;
+        loop {
+            let n = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+            if n > 0 {
+                let n = n as usize;
+                total += n;
+                let terminal = self.terminal.as_mut().unwrap();
+                let old_bracketed = terminal.screen().bracketed_paste;
+                terminal.process(&bytes[..n]);
+                if self.debug_input && old_bracketed != terminal.screen().bracketed_paste {
+                    eprintln!(
+                        "[clipboard] bracketed paste={}",
+                        terminal.screen().bracketed_paste
+                    );
+                }
+                self.input.extend(terminal.take_responses());
+                if total >= MAX_BURST {
+                    break;
+                }
+                continue;
+            }
             if n < 0 {
                 let error = std::io::Error::last_os_error();
                 if self.debug_input {
@@ -665,12 +1344,29 @@ impl State {
                 if error.kind() == std::io::ErrorKind::Interrupted
                     || error.kind() == std::io::ErrorKind::WouldBlock
                 {
-                    return Ok(());
+                    break;
                 }
-                if error.raw_os_error() != Some(libc::EIO) {
-                    return Err(error.into());
+                if error.raw_os_error() == Some(libc::EIO) {
+                    closed = true;
+                    break;
                 }
+                return Err(error.into());
             }
+            closed = true;
+            break;
+        }
+        if self.debug_input {
+            eprintln!("[output] PTY burst {total} bytes");
+        }
+        if total > 0
+            && let Some(terminal) = &self.terminal
+        {
+            self.dirty |= before != visible_state(terminal.screen())
+                || was_selected != self.selection.active(terminal.screen())
+                || (terminal.screen().view_offset() < terminal.screen().rows
+                    && epoch != terminal.screen().selection_epoch);
+        }
+        if closed {
             if self.debug_input {
                 eprintln!("[output] PTY closed; reaping bash");
             }
@@ -679,42 +1375,131 @@ impl State {
                     libc::waitpid(pty.child_pid, std::ptr::null_mut(), 0);
                 }
             }
-            return Ok(());
         }
-        let terminal = self.terminal.as_mut().unwrap();
-        let old_bracketed = terminal.screen().bracketed_paste;
-        let before = visible_state(terminal.screen());
-        let epoch = terminal.screen().selection_epoch;
-        let was_selected = self.selection.active(terminal.screen());
-        if self.debug_input {
-            eprintln!("[output] PTY read {n} bytes");
-        }
-        terminal.process(&bytes[..n as usize]);
-        if self.debug_input && old_bracketed != terminal.screen().bracketed_paste {
-            eprintln!(
-                "[clipboard] bracketed paste={}",
-                terminal.screen().bracketed_paste
-            );
-        }
-        self.input.extend(terminal.take_responses());
-        if self.debug_input {
-            eprintln!(
-                "[output] terminal processed {n} bytes, cursor=({}, {})",
-                terminal.screen().cursor_x,
-                terminal.screen().cursor_y
-            );
-        }
-        self.dirty |= before != visible_state(terminal.screen())
-            || was_selected != self.selection.active(terminal.screen())
-            || (terminal.screen().view_offset() < terminal.screen().rows
-                && epoch != terminal.screen().selection_epoch);
         Ok(())
+    }
+
+    fn editor_key(&mut self, key: u32, serial: u32, qh: &QueueHandle<Self>) {
+        let Some(keyboard) = &self.xkb else {
+            return;
+        };
+        let sym = keyboard.sym(key);
+        let text = String::from_utf8_lossy(&keyboard.text(key)).into_owned();
+        let press = KeyPress {
+            key,
+            sym,
+            control: keyboard.control(),
+            shift: keyboard.shift(),
+            alt: keyboard.alt(),
+            text,
+        };
+        let confirming = self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.is_confirming_close());
+        let Some(command) = editor_command(&press, confirming) else {
+            return;
+        };
+        let effect = match &mut self.editor {
+            Some(editor) => editor.handle(command),
+            None => return,
+        };
+        self.apply_editor_effect(effect, serial, qh);
+    }
+
+    fn apply_editor_effect(
+        &mut self,
+        effect: crate::editor::Effect,
+        serial: u32,
+        qh: &QueueHandle<Self>,
+    ) {
+        use crate::editor::Effect;
+        match effect {
+            Effect::Copy(text) => self.set_clipboard(text, serial, qh),
+            Effect::Cut(text) => self.set_clipboard(text, serial, qh),
+            Effect::PasteRequest => self.paste(),
+            Effect::Close => self.close_editor(),
+            Effect::CloseWindow => self.running = false,
+            Effect::None => return,
+            Effect::Changed => {}
+        }
+        self.dirty = true;
     }
 
     fn redraw(&mut self, qh: &QueueHandle<Self>) -> Result<(), Box<dyn Error>> {
         if !self.configured || !self.dirty || self.frame_pending {
             return Ok(());
         }
+        if self.backend == ActiveBackend::OpenGl && self.gl.is_some() {
+            let logical = (self.width as usize, self.height as usize);
+            let force_full = self.damage_full || self.editor.is_some();
+            self.damage_full = false;
+            let mut damage = if let Some(terminal) = &self.terminal {
+                terminal_damage(
+                    terminal.screen(),
+                    &self.selection,
+                    self.keyboard_focus,
+                    self.blink_on,
+                    logical,
+                    &mut self.damage_hashes,
+                    &mut self.damage_signature,
+                    force_full,
+                )
+            } else {
+                RowDamage::full()
+            };
+            if damage.is_empty() {
+                self.dirty = false;
+                return Ok(());
+            }
+            let mut full = damage.full;
+            if !full {
+                let (partial, age) = match &self.gl {
+                    Some(gl) => (gl.can_partial(), gl.buffer_age().unwrap_or(0)),
+                    None => (false, 0),
+                };
+                if !partial || age <= 0 {
+                    full = true;
+                } else {
+                    let extra = (age as usize).saturating_sub(1);
+                    if extra > self.damage_history.len() {
+                        full = true;
+                    } else {
+                        for past in self.damage_history.iter().rev().take(extra) {
+                            damage.merge(past);
+                            if damage.full {
+                                full = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if full {
+                damage = RowDamage::full();
+            }
+            match self.render_gl_frame(full, &damage, qh) {
+                Ok(()) => {
+                    self.frame_pending = true;
+                    self.dirty = false;
+                    self.damage_history
+                        .push_back(if full { RowDamage::full() } else { damage });
+                    while self.damage_history.len() > 4 {
+                        self.damage_history.pop_front();
+                    }
+                }
+                Err(reason) => {
+                    self.fallback_to_software(reason, qh)?;
+                    self.redraw_software(qh)?;
+                }
+            }
+            return Ok(());
+        }
+        self.redraw_software(qh)
+    }
+
+    fn redraw_software(&mut self, qh: &QueueHandle<Self>) -> Result<(), Box<dyn Error>> {
+        self.ensure_software_buffers(qh)?;
         let Some(index) = self
             .buffers
             .iter()
@@ -726,14 +1511,29 @@ impl State {
             (&self.surface, &self.terminal, &mut self.renderer)
         {
             let frame = &mut self.buffers[index];
-            renderer.render_into(
-                terminal.screen(),
-                (self.width as usize, self.height as usize),
-                &self.selection,
-                self.keyboard_focus,
-                self.blink_on,
-                &mut self.pixels,
-            );
+            match &mut self.editor {
+                Some(editor) => {
+                    let (columns, rows) = renderer
+                        .geometry
+                        .grid_size(self.width as usize, self.height as usize);
+                    let view = editor.view(columns, rows);
+                    renderer.render_editor_into(
+                        &view,
+                        (self.width as usize, self.height as usize),
+                        self.keyboard_focus,
+                        self.blink_on,
+                        &mut self.pixels,
+                    );
+                }
+                None => renderer.render_into(
+                    terminal.screen(),
+                    (self.width as usize, self.height as usize),
+                    &self.selection,
+                    self.keyboard_focus,
+                    self.blink_on,
+                    &mut self.pixels,
+                ),
+            }
             frame.file.write_all_at(&self.pixels, 0)?;
             surface.attach(Some(&frame.buffer), 0, 0);
             surface.damage_buffer(0, 0, self.width, self.height);
@@ -751,11 +1551,111 @@ impl State {
         }
         Ok(())
     }
+
+    fn render_gl_frame(
+        &mut self,
+        full: bool,
+        damage: &RowDamage,
+        qh: &QueueHandle<Self>,
+    ) -> Result<(), String> {
+        let logical = (self.width as usize, self.height as usize);
+        let scale = self.scale;
+        let physical = physical_size((self.width, self.height), scale);
+        let geometry = self
+            .renderer
+            .as_ref()
+            .ok_or("renderer unavailable")?
+            .geometry;
+        let rects: Vec<PixelRect> = if full {
+            vec![PixelRect {
+                x: 0,
+                y: 0,
+                w: physical.0,
+                h: physical.1,
+            }]
+        } else {
+            damage
+                .ranges
+                .iter()
+                .map(|range| row_pixel_rect(geometry, logical, scale, physical, *range))
+                .filter(|rect| rect.h > 0 && rect.w > 0)
+                .collect()
+        };
+        if rects.is_empty() {
+            return Ok(());
+        }
+        if let Some(surface) = &self.surface {
+            surface.frame(qh, ());
+        }
+        let renderer = self.renderer.as_mut().ok_or("renderer unavailable")?;
+        let gl = self.gl.as_mut().ok_or("OpenGL backend unavailable")?;
+        if full {
+            let scene = match &mut self.editor {
+                Some(editor) => {
+                    let (columns, rows) = geometry.grid_size(logical.0, logical.1);
+                    let view = editor.view(columns, rows);
+                    renderer.build_editor_scene(
+                        &view,
+                        logical,
+                        self.keyboard_focus,
+                        self.blink_on,
+                        scale,
+                    )
+                }
+                None => {
+                    let terminal = self.terminal.as_ref().ok_or("terminal unavailable")?;
+                    renderer.build_terminal_scene(
+                        terminal.screen(),
+                        logical,
+                        &self.selection,
+                        self.keyboard_focus,
+                        self.blink_on,
+                        scale,
+                        None,
+                    )
+                }
+            };
+            gl.prepare_scene(renderer, &scene);
+            gl.draw(&scene, &rects, true)?;
+        } else {
+            for (rect, range) in rects.iter().zip(damage.ranges.iter()) {
+                let scene = match &mut self.editor {
+                    Some(editor) => {
+                        let (columns, rows) = geometry.grid_size(logical.0, logical.1);
+                        let view = editor.view(columns, rows);
+                        renderer.build_editor_scene(
+                            &view,
+                            logical,
+                            self.keyboard_focus,
+                            self.blink_on,
+                            scale,
+                        )
+                    }
+                    None => {
+                        let terminal = self.terminal.as_ref().ok_or("terminal unavailable")?;
+                        renderer.build_terminal_scene(
+                            terminal.screen(),
+                            logical,
+                            &self.selection,
+                            self.keyboard_focus,
+                            self.blink_on,
+                            scale,
+                            Some(*range),
+                        )
+                    }
+                };
+                gl.prepare_scene(renderer, &scene);
+                gl.draw(&scene, &[*rect], false)?;
+            }
+        }
+        gl.present(&rects, full)
+    }
 }
 
 #[derive(PartialEq, Eq)]
 struct VisibleState {
     start: usize,
+    offset: usize,
     revision: u64,
     cursor: Option<(usize, usize, Option<crate::terminal::CursorStyle>)>,
 }
@@ -769,11 +1669,12 @@ fn visible_state(screen: &crate::terminal::Screen) -> VisibleState {
     };
     let cursor = (screen.cursor_visible && screen.view_offset() == 0).then_some((
         render::Renderer::cursor_x(screen),
-        screen.cursor_y,
+        screen.cursor_display_row(),
         screen.cursor_style,
     ));
     VisibleState {
         start: screen.visible_start(),
+        offset: screen.layout_offset(),
         revision,
         cursor,
     }
@@ -811,7 +1712,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 "wl_compositor" => {
                     state.compositor = Some(registry.bind::<wl_compositor::WlCompositor, _, _>(
                         name,
-                        version.min(4),
+                        version.min(6),
                         qh,
                         (),
                     ));
@@ -843,6 +1744,24 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 "xdg_wm_base" => {
                     state.wm_base =
                         Some(registry.bind::<xdg_wm_base::XdgWmBase, _, _>(name, 1, qh, ()));
+                }
+                "wp_fractional_scale_manager_v1" => {
+                    state.fractional_manager = Some(
+                        registry.bind::<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, _, _>(
+                            name,
+                            version.min(1),
+                            qh,
+                            (),
+                        ),
+                    );
+                }
+                "wp_viewporter" => {
+                    state.viewporter = Some(registry.bind::<wp_viewporter::WpViewporter, _, _>(
+                        name,
+                        version.min(1),
+                        qh,
+                        (),
+                    ));
                 }
 
                 _ => {}
@@ -902,7 +1821,17 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
         _: &QueueHandle<Self>,
     ) {
         match event {
-            xdg_toplevel::Event::Close => state.running = false,
+            xdg_toplevel::Event::Close => {
+                if let Some(editor) = &mut state.editor {
+                    if editor.request_close() {
+                        state.running = false;
+                    } else {
+                        state.dirty = true;
+                    }
+                } else {
+                    state.running = false;
+                }
+            }
             xdg_toplevel::Event::Configure { width, height, .. } => {
                 let previous = state
                     .proposed_size
@@ -919,7 +1848,37 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
 }
 
 delegate_noop!(State: ignore wl_compositor::WlCompositor);
-delegate_noop!(State: ignore wl_surface::WlSurface);
+impl Dispatch<wl_surface::WlSurface, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_surface::WlSurface,
+        event: wl_surface::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_surface::Event::PreferredBufferScale { factor } = event {
+            state.set_preferred_scale(factor, qh);
+        }
+    }
+}
+impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wp_fractional_scale_v1::WpFractionalScaleV1,
+        event: wp_fractional_scale_v1::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
+            state.set_fractional_scale(scale, qh);
+        }
+    }
+}
+delegate_noop!(State: ignore wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1);
+delegate_noop!(State: ignore wp_viewporter::WpViewporter);
+delegate_noop!(State: ignore wp_viewport::WpViewport);
 delegate_noop!(State: ignore wl_shm::WlShm);
 delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 impl Dispatch<wl_buffer::WlBuffer, u64> for State {
@@ -1022,6 +1981,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 state.wheel_steps = None;
                 state.wheel_remainder = 0.0;
                 state.selection.release();
+                if let Some(editor) = &mut state.editor {
+                    editor.mouse_release();
+                }
             }
             wl_pointer::Event::Axis {
                 axis: wayland_client::WEnum::Value(wl_pointer::Axis::VerticalScroll),
@@ -1061,21 +2023,31 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 ..
             } => match button_state {
                 wl_pointer::ButtonState::Pressed if state.pointer_focus => {
-                    if let (Some(renderer), Some(terminal)) = (&state.renderer, &state.terminal) {
+                    let geometry = state.renderer.as_ref().map(|renderer| {
+                        renderer
+                            .geometry
+                            .for_window(state.width as usize, state.height as usize)
+                    });
+                    if let Some(geometry) = geometry {
                         let (x, y) = state.pointer_position;
-                        let p = crate::selection::position(
-                            renderer
-                                .geometry
-                                .for_window(state.width as usize, state.height as usize),
-                            x,
-                            y,
-                            terminal.screen(),
-                        );
-                        state.selection.press(terminal.screen(), p, time, x, y);
-                        state.dirty = true;
+                        if let Some(editor) = &mut state.editor {
+                            editor.mouse_press(x, y, metrics(geometry), time);
+                            state.dirty = true;
+                        } else if let Some(terminal) = &state.terminal {
+                            let p = crate::selection::position(geometry, x, y, terminal.screen());
+                            state.selection.press(terminal.screen(), p, time, x, y);
+                            state.dirty = true;
+                        }
                     }
                 }
-                wl_pointer::ButtonState::Released => state.selection.release(),
+                wl_pointer::ButtonState::Released => {
+                    if let Some(editor) = &mut state.editor {
+                        editor.mouse_release();
+                        state.dirty = true;
+                    } else {
+                        state.selection.release();
+                    }
+                }
                 _ => {}
             },
             _ => {}
@@ -1162,6 +2134,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                     && key_state == wayland_client::WEnum::Value(wl_keyboard::KeyState::Pressed)
                     && let Some(x) = &state.xkb
                 {
+                    if state.editor.is_some() {
+                        state.editor_key(key, serial, qh);
+                        return;
+                    }
                     if x.shift() && !x.control() && matches!(key, 102 | 107 | 104 | 109) {
                         if let Some(t) = &mut state.terminal {
                             let rows = t.screen().rows as isize;
@@ -1219,6 +2195,194 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
 mod input_tests {
     use super::*;
     use std::os::fd::FromRawFd;
+
+    #[test]
+    fn damage_tracks_changed_rows_and_cursor_moves() {
+        let mut terminal = Terminal::new(10, 4);
+        let selection = crate::selection::Selection::default();
+        let mut hashes = Vec::new();
+        let mut signature = None;
+        let full = terminal_damage(
+            terminal.screen(),
+            &selection,
+            true,
+            false,
+            (100, 80),
+            &mut hashes,
+            &mut signature,
+            true,
+        );
+        assert!(full.full, "first frame must repaint everything");
+        let same = terminal_damage(
+            terminal.screen(),
+            &selection,
+            true,
+            false,
+            (100, 80),
+            &mut hashes,
+            &mut signature,
+            false,
+        );
+        assert!(same.is_empty(), "idle state must produce no damage");
+        terminal.process(b"a\r\nb");
+        let changed = terminal_damage(
+            terminal.screen(),
+            &selection,
+            true,
+            false,
+            (100, 80),
+            &mut hashes,
+            &mut signature,
+            false,
+        );
+        assert!(!changed.full);
+        assert_eq!(changed.ranges, vec![(0, 2)]);
+        terminal.process(b"\x1b[3;1H");
+        let cursor = terminal_damage(
+            terminal.screen(),
+            &selection,
+            true,
+            false,
+            (100, 80),
+            &mut hashes,
+            &mut signature,
+            false,
+        );
+        assert!(!cursor.full);
+        assert_eq!(cursor.ranges, vec![(1, 3)]);
+    }
+
+    #[test]
+    fn damage_history_merge_unions_ranges() {
+        let mut damage = RowDamage {
+            full: false,
+            ranges: vec![(1, 3), (7, 9)],
+        };
+        damage.merge(&RowDamage {
+            full: false,
+            ranges: vec![(2, 5), (9, 10)],
+        });
+        assert_eq!(damage.ranges, vec![(1, 5), (7, 10)]);
+        damage.merge(&RowDamage::full());
+        assert!(damage.full);
+    }
+
+    #[test]
+    fn editor_shortcuts_are_layout_independent_and_leave_terminal_keys_alone() {
+        let press = |key, sym, control, shift, alt, text: &str| KeyPress {
+            key,
+            sym,
+            control,
+            shift,
+            alt,
+            text: text.to_string(),
+        };
+        assert_eq!(
+            editor_command(&press(31, 's' as u32, true, false, false, "s"), false),
+            Some(EditorCommand::Save)
+        );
+        // Linux evdev codes: Z=44, Y=21, C=46, X=45, V=47, A=30.
+        assert_eq!(
+            editor_command(&press(44, 'z' as u32, true, false, false, "z"), false),
+            Some(EditorCommand::Undo)
+        );
+        assert_eq!(
+            editor_command(&press(44, 'z' as u32, true, true, false, "z"), false),
+            Some(EditorCommand::Redo)
+        );
+        assert_eq!(
+            editor_command(&press(21, 'y' as u32, true, false, false, "y"), false),
+            Some(EditorCommand::Redo)
+        );
+        assert_eq!(
+            editor_command(&press(46, 'c' as u32, true, false, false, "c"), false),
+            Some(EditorCommand::Copy)
+        );
+        assert_eq!(
+            editor_command(&press(45, 'x' as u32, true, false, false, "x"), false),
+            Some(EditorCommand::Cut)
+        );
+        assert_eq!(
+            editor_command(&press(47, 'v' as u32, true, false, false, "v"), false),
+            Some(EditorCommand::PasteRequest)
+        );
+        assert_eq!(
+            editor_command(&press(30, 'a' as u32, true, false, false, "a"), false),
+            Some(EditorCommand::SelectAll)
+        );
+        assert_eq!(
+            editor_command(&press(110, 0xff63, true, false, false, ""), false),
+            Some(EditorCommand::PasteRequest)
+        );
+        assert_eq!(
+            editor_command(&press(105, 0xff51, true, false, false, ""), false),
+            Some(EditorCommand::Move {
+                direction: Direction::Left,
+                extend: false,
+                by_word: true,
+                document: false,
+            })
+        );
+        assert_eq!(
+            editor_command(&press(105, 0xff51, false, true, false, ""), false),
+            Some(EditorCommand::Move {
+                direction: Direction::Left,
+                extend: true,
+                by_word: false,
+                document: false,
+            })
+        );
+        assert_eq!(
+            editor_command(&press(36, 0xff0d, false, false, false, "\r"), false),
+            Some(EditorCommand::Enter)
+        );
+        assert_eq!(
+            editor_command(&press(1, 0xff1b, false, false, false, "\x1b"), false),
+            Some(EditorCommand::Escape)
+        );
+        assert_eq!(
+            editor_command(&press(30, 'a' as u32, false, false, false, "a"), false),
+            Some(EditorCommand::Insert("a".into()))
+        );
+        assert_eq!(
+            editor_command(&press(30, 'a' as u32, false, false, true, "a"), false),
+            None
+        );
+        assert_eq!(
+            editor_command(&press(67, 0xffbe, false, false, false, "\x1bOP"), false),
+            None
+        );
+    }
+
+    #[test]
+    fn confirm_dialog_uses_c_n_y_and_esc_in_any_layout() {
+        let press = |key, sym, text: &str| KeyPress {
+            key,
+            sym,
+            control: false,
+            shift: false,
+            alt: false,
+            text: text.to_string(),
+        };
+        assert_eq!(
+            editor_command(&press(46, 0x0441, "с"), true),
+            Some(EditorCommand::ConfirmCancel)
+        );
+        assert_eq!(
+            editor_command(&press(49, 0x0442, "т"), true),
+            Some(EditorCommand::ConfirmDiscard)
+        );
+        assert_eq!(
+            editor_command(&press(21, 0x043d, "н"), true),
+            Some(EditorCommand::ConfirmSave)
+        );
+        assert_eq!(
+            editor_command(&press(1, 0xff1b, "\x1b"), true),
+            Some(EditorCommand::ConfirmCancel)
+        );
+        // Other keys are ignored while the warning is visible.
+        assert_eq!(editor_command(&press(24, 0x043e, "о"), true), None);
+    }
 
     #[test]
     fn stationary_drag_at_edge_extends_into_older_history() {
@@ -1289,6 +2453,7 @@ mod input_tests {
             offset: 0,
             writing: false,
             bracketed: true,
+            destination: Destination::Terminal,
         });
         let text = "один\nдва".as_bytes();
         write.write_all(&text[..3]).unwrap();
@@ -1306,6 +2471,40 @@ mod input_tests {
             paste_bytes(text, true)
         );
     }
+    #[test]
+    fn editor_clipboard_paste_preserves_utf8_and_newlines() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        let mut write = File::from(unsafe { OwnedFd::from_raw_fd(fds[1]) });
+        set_nonblocking(&read).unwrap();
+        let mut state = State {
+            editor: Some(Editor::open(dir.path().join("paste.txt")).unwrap()),
+            ..Default::default()
+        };
+        state.transfers.push(Transfer {
+            file: File::from(read),
+            bytes: Vec::new(),
+            offset: 0,
+            writing: false,
+            bracketed: false,
+            destination: Destination::Editor,
+        });
+        let text = "первая строка\nsecond line\n\n世界";
+        write.write_all(text.as_bytes()).unwrap();
+        drop(write);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while state.editor.as_ref().is_some_and(|e| e.text().is_empty())
+            && std::time::Instant::now() < deadline
+        {
+            state.pump_clipboard();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(state.editor.as_ref().unwrap().text(), text);
+        assert!(state.input.is_empty());
+    }
+
     #[test]
     fn paste_framing_and_missing_clipboard() {
         assert!(paste_bytes(b"", true).is_empty());
@@ -1362,7 +2561,7 @@ mod input_tests {
     }
 
     #[test]
-    fn readline_accepts_bracketed_paste_and_edits_with_arrow_keys() {
+    fn plain_bash_readline_edit_keys_and_bracketed_paste() {
         let pty = Pty::spawn_with_size(Some((80, 24))).unwrap();
         set_nonblocking(&pty.master).unwrap();
         let mut state = State {
@@ -1376,17 +2575,19 @@ mod input_tests {
         state.input.push_back(b'\n');
         state.write_input().unwrap();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let wait_for = |state: &mut State, marker: &str| loop {
-            state.read_pty().unwrap();
-            let screen = state.terminal.as_ref().unwrap().screen();
-            if screen.bracketed_paste
-                && (0..screen.rows).any(|row| screen.line(row).contains(marker))
-            {
-                break;
+        let wait_for = |state: &mut State, marker: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                state.read_pty().unwrap();
+                let screen = state.terminal.as_ref().unwrap().screen();
+                if screen.bracketed_paste
+                    && (0..screen.rows).any(|row| screen.line(row).contains(marker))
+                {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "missing {marker}");
+                std::thread::sleep(Duration::from_millis(5));
             }
-            assert!(std::time::Instant::now() < deadline, "missing {marker}");
-            std::thread::sleep(Duration::from_millis(5));
         };
         wait_for(&mut state, "READLINE_READY");
 
@@ -1397,8 +2598,81 @@ mod input_tests {
         state.write_input().unwrap();
         wait_for(&mut state, "READLINE_OKX");
 
+        // The same editing keys must also work in a plain interactive Bash that
+        // never sourced the Beyrix rcfile, relying only on Readline's stock
+        // bindings: Ctrl+Delete sends CSI 3;5~ (kill-word) and Ctrl+Backspace
+        // sends Ctrl+W (unix-word-rubout). Each case edits a pasted printf
+        // argument, so the output marker cannot appear in the echoed command.
+        // Arguments containing blanks are quoted so a failed edit cannot split
+        // into several words and reuse the printf format into a false marker.
+        let cases: &[(&[u8], &[u8], &str)] = &[
+            // Ctrl+Delete kills the rest of the word, not just one character.
+            (
+                b"printf 'READLINE_CD1_<%s>\\n' 'OKXY'",
+                b"\x1b[D\x1b[D\x1b[D\x1b[3;5~",
+                "READLINE_CD1_<OK>",
+            ),
+            // Ctrl+Delete skips blanks before killing the next word.
+            (
+                b"printf 'READLINE_CD2_<%s>\\n' 'OK   XY'",
+                b"\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D\x1b[D\x1b[3;5~",
+                "READLINE_CD2_<OK>",
+            ),
+            // Ctrl+Delete skips a tab before killing the next word.
+            (
+                b"printf 'READLINE_CD3_<%s>\\n' 'OK\tXY'",
+                b"\x1b[D\x1b[D\x1b[D\x1b[D\x1b[3;5~",
+                "READLINE_CD3_<OK>",
+            ),
+            // Ctrl+Delete at the end of the line is a no-op.
+            (
+                b"printf 'READLINE_CD4_<%s>\\n' 'DONE'",
+                b"\x1b[3;5~",
+                "READLINE_CD4_<DONE>",
+            ),
+            // Backspace still deletes a single character.
+            (
+                b"printf 'READLINE_BS_<%s>\\n' OKX",
+                b"\x7f",
+                "READLINE_BS_<OK>",
+            ),
+            // Delete still deletes a single character.
+            (
+                b"printf 'READLINE_DEL_<%s>\\n' OKXY",
+                b"\x1b[D\x1b[D\x1b[3~",
+                "READLINE_DEL_<OKY>",
+            ),
+            // Ctrl+Backspace rubs the whole blank-delimited word before the
+            // cursor (OK.foo, not just foo); the trailing blank left behind is
+            // dropped by Bash word splitting, hence the empty second <%s>.
+            (
+                b"printf 'READLINE_CW_<%s><%s>\\n' X OK.foo",
+                b"\x17",
+                "READLINE_CW_<X><>",
+            ),
+            // Ctrl+Left and Ctrl+Right still move by words.
+            (
+                b"printf 'READLINE_CL_<%s>\\n' OX",
+                b"\x1b[1;5DK",
+                "READLINE_CL_<KOX>",
+            ),
+            (
+                b"printf 'READLINE_CR_<%s>\\n' OX",
+                b"\x1b[D\x1b[D\x1b[1;5CK",
+                "READLINE_CR_<OXK>",
+            ),
+        ];
+        for (command, keys, marker) in cases {
+            state.input.extend(paste_bytes(command, true));
+            state.input.extend(*keys);
+            state.input.push_back(b'\n');
+            state.write_input().unwrap();
+            wait_for(&mut state, marker);
+        }
+
         state.input.extend(b"exit\n");
         state.write_input().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while state.pty.is_some() && std::time::Instant::now() < deadline {
             state.read_pty().unwrap();
             std::thread::sleep(Duration::from_millis(5));
@@ -1509,6 +2783,13 @@ mod input_tests {
             ("abc", "def", b"\x1b[D", 1, "ab", "cdef"),
             ("abc", "def", b"\x1b[C", 1, "abcd", "ef"),
             ("hello   world", "", b"\x17", 1, "hello   ", ""),
+            ("hello   world", "", b"\x17", 2, "", ""),
+            ("one\ttwo", "", b"\x17", 1, "one\t", ""),
+            ("one\ttwo", "", b"\x17", 2, "", ""),
+            ("one \t two", "", b"\x17", 1, "one \t ", ""),
+            ("one ", " \ttwo", b"\x17", 1, "", " \ttwo"),
+            ("cd /tmp/папка/café", "", b"\x17", 1, "cd ", ""),
+            ("cd /tmp/папка/café", "", b"\x17", 2, "", ""),
             (
                 "__beyrix_test_command com",
                 "",
@@ -1568,6 +2849,28 @@ mod input_tests {
         state.input.push_back(3); // Ctrl+C without a selection
         state.write_input().unwrap();
         wait_for(&mut state, "ELEMENT_CANCEL");
+        // The trap output can appear while Bash is still finishing interrupt
+        // cleanup: it briefly re-enters Readline and runs PROMPT_COMMAND before
+        // the next prompt, and input sent in that window can be discarded. Wait
+        // for the fresh prompt below ELEMENT_CANCEL before capturing the line.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            state.read_pty().unwrap();
+            let screen = state.terminal.as_ref().unwrap().screen();
+            let prompt_ready = (0..screen.rows)
+                .position(|row| screen.line(row).contains("ELEMENT_CANCEL"))
+                .is_some_and(|row| {
+                    (row + 1..screen.rows).any(|r| screen.line(r).trim_end().ends_with('$'))
+                });
+            if prompt_ready {
+                break;
+            }
+            assert!(
+                state.pty.is_some() && std::time::Instant::now() < deadline,
+                "missing prompt after ELEMENT_CANCEL"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         capture(&mut state, cases.len() + 1, "", "");
 
         state.input.extend(br#"set -o vi; bind -m vi-insert -x '"\e[99~":__capture'; printf 'ELEMENT_%s\n' VI_READY"#);
@@ -1580,6 +2883,73 @@ mod input_tests {
         state.input.extend(left);
         state.input.extend(back);
         capture(&mut state, cases.len() + 2, "один", "два");
+
+        state.input.extend(b"exit\n");
+        state.write_input().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while state.pty.is_some() && std::time::Instant::now() < deadline {
+            state.read_pty().unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(state.pty.is_none());
+    }
+
+    #[test]
+    fn bottom_input_keeps_bash_lines_ordered_above_the_prompt() {
+        let pty = Pty::spawn_with_size(Some((60, 8))).unwrap();
+        set_nonblocking(&pty.master).unwrap();
+        let theme = crate::theme::Theme {
+            layout: crate::terminal::LayoutMode::BottomInput,
+            ..Default::default()
+        };
+        let mut state = State {
+            pty: Some(pty),
+            terminal: Some(Terminal::with_theme(60, 8, theme)),
+            ..Default::default()
+        };
+        let wait_for = |state: &mut State, ready: &dyn Fn(&crate::terminal::Screen) -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                state.read_pty().unwrap();
+                let screen = state.terminal.as_ref().unwrap().screen();
+                if ready(screen) {
+                    return;
+                }
+                assert!(
+                    state.pty.is_some() && std::time::Instant::now() < deadline,
+                    "timed out waiting for the Bash prompt"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let prompt_ready = |screen: &crate::terminal::Screen| {
+            screen.line(screen.rows - 1).trim_end() == "LAYOUT_PROMPT>"
+        };
+        state.input.extend(b"PS1='LAYOUT_PROMPT> '\n");
+        state.write_input().unwrap();
+        wait_for(&mut state, &prompt_ready);
+
+        state.input.extend(b"printf 'LAYOUT_ONE\\nLAYOUT_TWO\\n'\n");
+        state.write_input().unwrap();
+        wait_for(&mut state, &|screen| {
+            prompt_ready(screen)
+                && (0..screen.rows).any(|row| screen.line(row).contains("LAYOUT_ONE"))
+                && (0..screen.rows).any(|row| screen.line(row).contains("LAYOUT_TWO"))
+        });
+        let screen = state.terminal.as_ref().unwrap().screen();
+        let row_of = |text: &str| {
+            (0..screen.rows)
+                .find(|&row| screen.line(row).trim_end() == text)
+                .unwrap_or_else(|| panic!("missing {text}"))
+        };
+        assert!(row_of("LAYOUT_ONE") < row_of("LAYOUT_TWO"));
+        assert_eq!(screen.cursor_display_row(), screen.rows - 1);
+        assert!(screen.cursor_y < screen.rows - 1);
+        assert_eq!(
+            screen.layout_offset(),
+            screen.rows - 1 - screen.cursor_y,
+            "the real cursor stays in the PTY while the view is shifted"
+        );
 
         state.input.extend(b"exit\n");
         state.write_input().unwrap();
@@ -1761,6 +3131,7 @@ impl Dispatch<wl_data_source::WlDataSource, Arc<Vec<u8>>> for State {
                     offset: 0,
                     writing: true,
                     bracketed: false,
+                    destination: Destination::Terminal,
                 });
             }
             wl_data_source::Event::Cancelled => {

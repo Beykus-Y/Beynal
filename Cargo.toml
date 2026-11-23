@@ -1,7 +1,7 @@
 [package]
 name = "beyrix"
 description = "Experimental open-source terminal emulator for Linux/Wayland"
-repository = "https://github.com/Beykus-Y/Beynal"
+repository = "https://github.com/Beykus-Y/Beyrix"
 license = "MPL-2.0"
 readme = "README.md"
 keywords = ["terminal", "wayland", "emulator"]
@@ -11,12 +11,18 @@ edition = "2024"
 
 [dependencies]
 fontdue = "0.9.5"
+glow = "0.16.0"
+khronos-egl = { version = "6.0.0", features = ["dynamic"] }
 libc = "0.2.191"
+libloading = "0.8.9"
 serde = { version = "1.0.229", features = ["derive"] }
 tempfile = "3.27.0"
 toml = "1.2.2"
 toml_edit = "0.25.20"
 unicode-width = "0.2.3"
 vte = "0.15.0"
-wayland-client = "0.31.15"
-wayland-protocols = { version = "0.32.13", features = ["client"] }
+# The system backend exposes `ObjectId::as_ptr`, which is required to hand a
+# `wl_surface` to `wl_egl_window_create`. `dlopen` keeps the binary startable
+# even on a machine without libwayland at link time.
+wayland-client = { version = "0.31.15", features = ["system", "dlopen"] }
+wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }

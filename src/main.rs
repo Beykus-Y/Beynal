@@ -2,7 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+mod compat;
 mod control;
+mod editor;
+mod gl;
+mod gpu;
 mod keyboard;
 mod prompt;
 mod pty;
@@ -85,6 +89,16 @@ fn print_help() {
         ("theme", "Show the active theme"),
         ("theme list", "List built-in themes"),
         ("theme set NAME", "Save a theme and update this window"),
+        ("layout [list|set NAME]", "Show or save the cursor layout"),
+        (
+            "renderer [list|set NAME]",
+            "Show or save the rendering backend",
+        ),
+        (
+            "gpu",
+            "Show detected GPUs, graphics APIs and backend choice",
+        ),
+        ("edit FILE", "Open a file in the built-in editor"),
         ("--pty", "Run Bash in the current terminal"),
         ("--help", "Show this help"),
     ] {
@@ -95,11 +109,13 @@ fn print_help() {
 fn run(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
     match args {
         ["--help" | "-h"] => print_help(),
-        [] if std::env::var_os("BEYRIX_CONTROL_SOCKET").is_some() => print_help(),
+        [] if crate::compat::env("BEYRIX_CONTROL_SOCKET").is_some() => print_help(),
         [] | ["open"] => wayland::run()?,
         ["--pty"] => run_pty()?,
+        ["edit", file] => edit_file(file)?,
+        ["edit", ..] => return Err("usage: beyrix edit FILE".into()),
         ["theme"] => {
-            let active = std::env::var_os("BEYRIX_PROMPT_THEME")
+            let active = crate::compat::env("BEYRIX_PROMPT_THEME")
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .and_then(|data| {
                     data.lines()
@@ -116,8 +132,8 @@ fn run(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
         ["theme", "list"] => println!("minimal\ndeveloper\nsignature"),
         ["theme", "set", name] => {
             theme::Theme::save_choice(name)?;
-            match std::env::var_os("BEYRIX_CONTROL_SOCKET") {
-                Some(path) => match control::notify(std::path::Path::new(&path), name) {
+            match crate::compat::env("BEYRIX_CONTROL_SOCKET") {
+                Some(path) => match control::notify_theme(std::path::Path::new(&path), name) {
                     Ok(()) => println!("Theme: {name} (update requested)"),
                     Err(e) => {
                         eprintln!("Theme saved for next launch; window notification failed: {e}")
@@ -127,6 +143,35 @@ fn run(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         ["theme", ..] => return Err("usage: beyrix theme [list | set NAME]".into()),
+        ["layout"] => println!("{}", theme::Theme::load_layout()?.name()),
+        ["layout", "list"] => {
+            for mode in terminal::LayoutMode::ALL {
+                println!("{}", mode.name());
+            }
+        }
+        ["layout", "set", name] => {
+            let mode = terminal::LayoutMode::parse(name).ok_or_else(|| {
+                format!("unknown layout {name:?}; expected as-is, bottom, or bottom-input")
+            })?;
+            theme::Theme::save_layout(mode)?;
+            println!("Layout: {} (saved for new windows)", mode.name());
+        }
+        ["layout", ..] => return Err("usage: beyrix layout [list | set NAME]".into()),
+        ["renderer"] => println!("{}", theme::Theme::load_renderer()?),
+        ["renderer", "list"] => {
+            for choice in gpu::RendererChoice::ALL {
+                println!("{}", choice.name());
+            }
+        }
+        ["renderer", "set", name] => {
+            let choice = gpu::RendererChoice::parse(name).ok_or_else(|| {
+                format!("unknown renderer {name:?}; expected auto, opengl, vulkan, or software")
+            })?;
+            theme::Theme::save_renderer(choice)?;
+            println!("Renderer: {} (saved for new windows)", choice.name());
+        }
+        ["renderer", ..] => return Err("usage: beyrix renderer [list | set NAME]".into()),
+        ["gpu"] => graphics_report()?,
         [command @ ("open" | "--pty" | "--help" | "-h"), ..] => {
             return Err(format!("{command} takes no arguments").into());
         }
@@ -134,6 +179,46 @@ fn run(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("unknown command {command:?}. See beyrix --help").into());
         }
     }
+    Ok(())
+}
+
+fn edit_file(file: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let path = std::path::PathBuf::from(file);
+    // Validate before creating a window or talking to a running one, so CLI
+    // errors (missing permissions, invalid UTF-8, directories) are immediate.
+    editor::Editor::open(&path)?;
+    if let Some(socket) = crate::compat::env("BEYRIX_CONTROL_SOCKET") {
+        match control::notify_open(std::path::Path::new(&socket), &path) {
+            Ok(()) => {
+                println!("Opened {} in the running Beyrix window", path.display());
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("beyrix: running window unavailable ({error}); starting a new window")
+            }
+        }
+    }
+    wayland::run_editor(path)?;
+    Ok(())
+}
+
+fn graphics_report() -> Result<(), Box<dyn std::error::Error>> {
+    use wayland_client::Proxy;
+    let requested = theme::Theme::load_renderer()?;
+    let connection = match wayland_client::Connection::connect_to_env() {
+        Ok(connection) => Some(connection),
+        Err(error) => {
+            eprintln!("beyrix: Wayland display unavailable for EGL probe: {error}");
+            None
+        }
+    };
+    let display = connection
+        .as_ref()
+        .map(|connection| connection.display().id().as_ptr().cast());
+    // Keep the connection alive while EGL is initialized on its display.
+    let report = gpu::report(display);
+    let decision = gpu::decide(requested, &report.egl);
+    gpu::print_report(&report, &decision);
     Ok(())
 }
 

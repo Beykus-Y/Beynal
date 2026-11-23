@@ -185,7 +185,8 @@ impl Pty {
 fn command_directory(executable: &std::path::Path) -> io::Result<tempfile::TempDir> {
     let dir = tempfile::tempdir()?;
     std::os::unix::fs::symlink(executable, dir.path().join("beyrix"))?;
-    // Keep the old shell command available inside existing prompt integrations.
+    // Keep the old command name available inside shells started by Beynal
+    // until existing sessions finish their upgrade.
     std::os::unix::fs::symlink(executable, dir.path().join("beynal"))?;
     Ok(dir)
 }

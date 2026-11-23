@@ -18,7 +18,7 @@ pub fn position(geometry: Geometry, x: f64, y: f64, screen: &Screen) -> Position
         .floor()
         .max(0.0) as usize;
     Position {
-        row: screen.visible_start() + row.min(screen.rows.saturating_sub(1)),
+        row: screen.display_row_or_visible(row.min(screen.rows.saturating_sub(1))),
         col: col.min(screen.columns.saturating_sub(1)),
     }
 }
@@ -156,7 +156,10 @@ impl Selection {
     }
 
     pub fn contains(&self, screen: &Screen, row: usize, col: usize) -> bool {
-        self.contains_absolute(screen, screen.visible_start() + row, col)
+        match screen.display_row(row) {
+            Some(row) => self.contains_absolute(screen, row, col),
+            None => false,
+        }
     }
     fn contains_absolute(&self, screen: &Screen, row: usize, col: usize) -> bool {
         let Some((start, end)) = self.range(screen) else {
@@ -237,6 +240,29 @@ fn word(screen: &Screen, mut p: Position) -> (Position, Position) {
 mod tests {
     use super::*;
     use crate::terminal::Terminal;
+    #[test]
+    fn bottom_input_display_rows_map_to_absolute_selection_rows() {
+        let theme = crate::theme::Theme {
+            layout: crate::terminal::LayoutMode::BottomInput,
+            ..Default::default()
+        };
+        let mut t = Terminal::with_theme(6, 3, theme.clone());
+        t.process(b"abc");
+        assert_eq!(t.screen().display_row(2), Some(0));
+        let g = Geometry::from_theme(&theme);
+        assert_eq!(
+            position(g, 22.0, 53.0, t.screen()),
+            Position { row: 0, col: 1 }
+        );
+        let mut s = Selection::default();
+        s.press(t.screen(), Position { row: 0, col: 0 }, 0, 0., 0.);
+        s.motion(t.screen(), Position { row: 0, col: 2 });
+        s.release();
+        assert_eq!(s.text(t.screen()).as_deref(), Some("abc"));
+        assert!(s.contains(t.screen(), 2, 1));
+        assert!(!s.contains(t.screen(), 0, 1));
+    }
+
     #[test]
     fn reverse_selection_survives_output_and_expires_with_history() {
         let theme = crate::theme::Theme {

@@ -2,9 +2,45 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+use std::cell::Cell as LayoutCache;
 use std::collections::VecDeque;
 use unicode_width::UnicodeWidthChar;
 use vte::{Params, Parser, Perform};
+
+/// Vertical placement of the terminal grid inside the window.
+///
+/// The enum only affects presentation. PTY coordinates, the cell grid, the
+/// scrollback and the alternate screen are never rewritten.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LayoutMode {
+    /// Standard terminal: the shell starts at the top-left cell.
+    #[default]
+    AsIs,
+    /// The shell starts on the last row. After that the terminal behaves exactly
+    /// like a standard terminal, including any cursor movement the application
+    /// performs.
+    Bottom,
+    /// The lowest written row (normally the prompt/input line) is kept on the
+    /// last row by shifting the whole visible grid down. Disabled on the
+    /// alternate screen and while browsing scrollback.
+    BottomInput,
+}
+
+impl LayoutMode {
+    pub const ALL: [Self; 3] = [Self::AsIs, Self::Bottom, Self::BottomInput];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::AsIs => "as-is",
+            Self::Bottom => "bottom",
+            Self::BottomInput => "bottom-input",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.name() == name)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColorOrigin {
@@ -88,6 +124,7 @@ pub struct Screen {
     pub cursor_style: Option<CursorStyle>,
     pub revision: u64,
     pub bracketed_paste: bool,
+    layout: LayoutMode,
     fg: [u8; 3],
     bg: [u8; 3],
     fg_origin: ColorOrigin,
@@ -105,6 +142,7 @@ pub struct Screen {
     pub selection_epoch: u64,
     viewport_offset: usize,
     wraps: Vec<bool>,
+    layout_cache: LayoutCache<Option<(u64, Option<usize>)>>,
 }
 
 impl Screen {
@@ -118,7 +156,8 @@ impl Screen {
             bg: theme.background,
             ..Cell::default()
         };
-        Self {
+        let layout = theme.layout;
+        let mut screen = Self {
             columns,
             rows,
             cursor_x: 0,
@@ -128,6 +167,7 @@ impl Screen {
             cursor_style: None,
             revision: 0,
             bracketed_paste: false,
+            layout,
             fg: theme.foreground,
             bg: theme.background,
             fg_origin: ColorOrigin::DefaultForeground,
@@ -145,7 +185,78 @@ impl Screen {
             selection_epoch: 0,
             viewport_offset: 0,
             wraps: vec![false; rows],
+            layout_cache: LayoutCache::new(None),
+        };
+        // The shell inherits the real cursor position, so the first prompt is
+        // printed on the last row without touching its output coordinates.
+        if layout == LayoutMode::Bottom {
+            screen.cursor_y = rows.saturating_sub(1);
         }
+        screen
+    }
+
+    pub fn set_layout(&mut self, layout: LayoutMode) {
+        if self.layout != layout {
+            self.layout = layout;
+            self.revision += 1;
+        }
+    }
+
+    /// Number of blank display rows inserted above the grid.
+    pub fn layout_offset(&self) -> usize {
+        if self.layout != LayoutMode::BottomInput
+            || self.alternate.is_some()
+            || self.viewport_offset > 0
+        {
+            0
+        } else {
+            // Anchor the lowest written row (normally the input line) to the
+            // bottom. Including the cursor keeps an empty or freshly cleared
+            // screen bottom aligned without hiding content written below it.
+            let bottom = self.lowest_written_row().unwrap_or(0).max(self.cursor_y);
+            self.rows.saturating_sub(1).saturating_sub(bottom)
+        }
+    }
+
+    fn lowest_written_row(&self) -> Option<usize> {
+        if let Some((revision, row)) = self.layout_cache.get()
+            && revision == self.revision
+        {
+            return row;
+        }
+        let row = (0..self.rows).rev().find(|&y| {
+            self.cells[y * self.columns..(y + 1) * self.columns]
+                .iter()
+                .any(|cell| cell.written)
+        });
+        self.layout_cache.set(Some((self.revision, row)));
+        row
+    }
+
+    /// Display row of the cursor; equals `cursor_y` outside `bottom-input`.
+    pub fn cursor_display_row(&self) -> usize {
+        (self.cursor_y + self.layout_offset()).min(self.rows.saturating_sub(1))
+    }
+
+    fn display_start(&self) -> isize {
+        self.visible_start() as isize - self.layout_offset() as isize
+    }
+
+    /// Absolute row shown at display row `y`, or `None` for padding above the
+    /// oldest retained line.
+    pub fn display_row(&self, y: usize) -> Option<usize> {
+        if y >= self.rows {
+            return None;
+        }
+        let row = self.display_start().checked_add(y as isize)?;
+        (row >= self.history_base as isize && row < self.newest_row() as isize)
+            .then_some(row as usize)
+    }
+
+    /// Absolute row for a click, clamped to the live content when the pointer is
+    /// over the blank top padding.
+    pub fn display_row_or_visible(&self, y: usize) -> usize {
+        self.display_row(y).unwrap_or_else(|| self.visible_start())
     }
 
     pub fn get(&self, x: usize, y: usize) -> Option<&Cell> {
@@ -153,7 +264,7 @@ impl Screen {
             return None;
         }
 
-        self.get_absolute(x, self.visible_start() + y)
+        self.get_absolute(x, self.display_row(y)?)
             .filter(|cell| !cell.wide || x + 1 < self.columns)
     }
     pub fn visible_start(&self) -> usize {
@@ -252,6 +363,7 @@ impl Screen {
         }
         change(&mut self.fg, self.fg_origin);
         change(&mut self.bg, self.bg_origin);
+        self.set_layout(theme.layout);
         self.theme = theme;
         self.trim_history();
     }
@@ -342,6 +454,7 @@ impl Screen {
         self.cursor_y -= shift;
         self.saved.1 = self.saved.1.saturating_sub(shift);
         self.selection_epoch += 1;
+        self.revision += 1;
         if let Some(saved) = &mut self.alternate {
             let blank = Cell {
                 fg: self.theme.foreground,
@@ -488,6 +601,39 @@ impl Screen {
             }
         }
     }
+    /// Shift grid rows by `n` cells inside `start..end`, then blank the freed
+    /// rows. `Cell` owns a `Vec`, so this cannot use `copy_within`; the duplicated
+    /// source row is forgotten with `ptr::write` (no drop) after its ownership has
+    /// moved, while the row leaving the grid is dropped with `fill`.
+    fn shift_cells(&mut self, start: usize, end: usize, n: usize, up: bool, blank: &Cell) {
+        let total = end.saturating_sub(start);
+        if n == 0 || n > total {
+            return;
+        }
+        if n == total {
+            self.cells[start..end].fill(blank.clone());
+            return;
+        }
+        let moved = total - n;
+        unsafe {
+            let ptr = self.cells.as_mut_ptr();
+            if up {
+                // Drop the row that scrolls out before overwriting it.
+                self.cells[start..start + n].fill(blank.clone());
+                std::ptr::copy(ptr.add(start + n), ptr.add(start), moved);
+                for index in 0..n {
+                    std::ptr::write(ptr.add(end - n + index), blank.clone());
+                }
+            } else {
+                self.cells[end - n..end].fill(blank.clone());
+                std::ptr::copy(ptr.add(start), ptr.add(start + n), moved);
+                for index in 0..n {
+                    std::ptr::write(ptr.add(start + index), blank.clone());
+                }
+            }
+        }
+    }
+
     fn scroll_region(&mut self, up: bool, count: usize) {
         if self.rows == 0 || self.columns == 0 {
             return;
@@ -510,16 +656,17 @@ impl Screen {
             for row in (self.scroll_bottom + 1 - n / self.columns)..=self.scroll_bottom {
                 self.wraps[row] = false;
             }
-            self.cells[start..end].rotate_left(n);
-            self.cells[end - n..end].fill(blank);
+            // `rotate_left` walks the grid several times. Scrolling is the hot
+            // path for line-oriented output, so shift rows with one memmove and
+            // explicitly forget the duplicated row at the tail.
+            self.shift_cells(start, end, n, true, &blank);
         } else {
             self.selection_epoch += 1;
             self.wraps[self.scroll_top..=self.scroll_bottom].rotate_right(n / self.columns);
             for row in self.scroll_top..self.scroll_top + n / self.columns {
                 self.wraps[row] = false;
             }
-            self.cells[start..end].rotate_right(n);
-            self.cells[start..start + n].fill(blank);
+            self.shift_cells(start, end, n, false, &blank);
         }
     }
     fn erase(&mut self, start: usize, end: usize) {
@@ -710,6 +857,7 @@ impl Perform for Screen {
                     (25, 'l') => self.cursor_visible = false,
                     (47 | 1047 | 1049, 'h') if self.alternate.is_none() => {
                         self.selection_epoch += 1;
+                        self.revision += 1;
                         let blank = self.blank();
                         self.alternate = Some(SavedScreen {
                             cells: std::mem::replace(
@@ -738,6 +886,7 @@ impl Perform for Screen {
                     (47 | 1047 | 1049, 'l') => {
                         if let Some(saved) = self.alternate.take() {
                             self.selection_epoch += 1;
+                            self.revision += 1;
                             self.wraps = saved.wraps;
                             self.cells = saved.cells;
                             (self.cursor_x, self.cursor_y) = saved.cursor;
@@ -1307,6 +1456,133 @@ mod tests {
         t.process(b"\x1b[2;2H\x1b[1K");
         assert!(t.screen().line(1).starts_with("  o"));
     }
+    #[test]
+    fn scrolling_combining_rows_keeps_ownership_correct() {
+        let mut t = Terminal::new(6, 3);
+        for _ in 0..2000 {
+            t.process("e\u{301}\r\n".as_bytes());
+        }
+        // Reaching here without a double free / corrupted grid is the point;
+        // also verify the last line is intact and history is populated.
+        assert!(t.screen().visible_start() > 0);
+        for _ in 0..2000 {
+            t.process("x\r\n".as_bytes());
+        }
+        assert!(
+            (0..t.screen().rows).any(|row| t.screen().line(row).trim_end() == "x"),
+            "the last written row must survive scrolling"
+        );
+    }
+
+    #[test]
+    fn bottom_layout_starts_on_last_row_then_uses_standard_scrolling() {
+        let theme = crate::theme::Theme {
+            layout: LayoutMode::Bottom,
+            ..Default::default()
+        };
+        let mut t = Terminal::with_theme(12, 3, theme);
+        assert_eq!(t.screen().cursor_y, 2);
+        assert_eq!(t.screen().layout_offset(), 0);
+        t.process(b"$ first");
+        assert_eq!(t.screen().line(2).trim_end(), "$ first");
+        t.process(b"\r\nsecond\r\nthird");
+        assert_eq!(t.screen().line(0).trim_end(), "$ first");
+        assert_eq!(t.screen().line(1).trim_end(), "second");
+        assert_eq!(t.screen().line(2).trim_end(), "third");
+        assert_eq!(t.screen().cursor_y, 2);
+        t.process(b"\x1b[6n");
+        assert_eq!(t.take_responses(), b"\x1b[3;6R");
+    }
+
+    #[test]
+    fn bottom_input_pins_the_input_line_without_faking_coordinates() {
+        let theme = crate::theme::Theme {
+            layout: LayoutMode::BottomInput,
+            ..Default::default()
+        };
+        let mut t = Terminal::with_theme(10, 4, theme);
+        assert_eq!(t.screen().cursor_y, 0, "real cursor must stay at the top");
+        assert_eq!(t.screen().layout_offset(), 3);
+        assert_eq!(t.screen().cursor_display_row(), 3);
+        t.process(b"$ one");
+        assert_eq!(t.screen().line(3).trim_end(), "$ one");
+        t.process(b"\r\ntwo\r\nthree");
+        assert_eq!(t.screen().layout_offset(), 1);
+        assert_eq!(t.screen().line(1).trim_end(), "$ one");
+        assert_eq!(t.screen().line(2).trim_end(), "two");
+        assert_eq!(t.screen().line(3).trim_end(), "three");
+        assert_eq!(t.screen().cursor_display_row(), 3);
+        // Moving the real cursor up must not hide text below it.
+        t.process(b"\x1b[2;1H");
+        assert_eq!(t.screen().cursor_display_row(), 2);
+        assert_eq!(t.screen().line(3).trim_end(), "three");
+        t.process(b"\x1b[6n");
+        assert_eq!(t.take_responses(), b"\x1b[2;1R");
+    }
+
+    #[test]
+    fn bottom_input_maps_history_alternate_screen_and_resize() {
+        let theme = crate::theme::Theme {
+            layout: LayoutMode::BottomInput,
+            ..Default::default()
+        };
+        let mut t = Terminal::with_theme(10, 3, theme);
+        t.process(b"one\r\ntwo\r\nthree\r\nfour");
+        assert_eq!(t.screen().line(0).trim_end(), "two");
+        assert_eq!(t.screen().line(2).trim_end(), "four");
+        assert!(t.screen_mut().scroll_view(1));
+        assert_eq!(t.screen().layout_offset(), 0);
+        assert_eq!(t.screen().line(0).trim_end(), "one");
+        t.screen_mut().reset_view();
+        t.process(b"\x1b[?1049hALT");
+        assert_eq!(t.screen().layout_offset(), 0);
+        assert_eq!(t.screen().cursor_display_row(), 0);
+        assert_eq!(t.screen().line(0).trim_end(), "ALT");
+        t.process(b"\x1b[?1049l");
+        t.process(b"\x1b[?25l");
+        t.resize(8, 2);
+        assert_eq!(t.screen().line(1).trim_end(), "four");
+        assert_eq!(t.screen().cursor_display_row(), 1);
+    }
+
+    #[test]
+    fn bottom_input_does_not_clip_content_below_the_cursor() {
+        let theme = crate::theme::Theme {
+            layout: LayoutMode::BottomInput,
+            ..Default::default()
+        };
+        let mut t = Terminal::with_theme(10, 3, theme);
+        t.process(b"top\r\nbottom");
+        assert_eq!(t.screen().layout_offset(), 1);
+        t.process(b"\x1b[1;1H!");
+        assert_eq!(t.screen().layout_offset(), 1);
+        assert_eq!(t.screen().line(1).trim_end(), "!op");
+        assert_eq!(t.screen().line(2).trim_end(), "bottom");
+        assert_eq!(t.screen().cursor_display_row(), 1);
+    }
+
+    #[test]
+    fn layout_mode_names_round_trip() {
+        for mode in LayoutMode::ALL {
+            assert_eq!(LayoutMode::parse(mode.name()), Some(mode));
+        }
+        assert_eq!(LayoutMode::parse("normal"), None);
+    }
+
+    #[test]
+    fn switching_to_bottom_input_only_changes_presentation() {
+        let mut t = Terminal::new(10, 3);
+        t.process(b"abc");
+        assert_eq!(t.screen().layout_offset(), 0);
+        t.screen_mut().set_layout(LayoutMode::BottomInput);
+        assert_eq!(t.screen().cursor_y, 0);
+        assert_eq!(t.screen().layout_offset(), 2);
+        assert_eq!(t.screen().cursor_display_row(), 2);
+        assert_eq!(t.screen().line(2).trim_end(), "abc");
+        t.screen_mut().set_layout(LayoutMode::AsIs);
+        assert_eq!(t.screen().line(0).trim_end(), "abc");
+    }
+
     #[test]
     fn writes_text() {
         let mut terminal = Terminal::new(20, 5);

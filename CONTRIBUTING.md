@@ -4,7 +4,7 @@ Thanks for helping make Beyrix a better terminal. We welcome bug reports, compat
 
 ## Before you start
 
-1. Search existing [issues](https://github.com/Beykus-Y/Beynal/issues) and pull requests to avoid duplicate work.
+1. Search existing [issues](https://github.com/Beykus-Y/Beyrix/issues) and pull requests to avoid duplicate work.
 2. For a small, clear fix, submit a focused PR. For architecture changes or large features, open an issue first and discuss the approach.
 3. For a first contribution, look for `good first issue` and `help wanted` labels once the maintainers have assigned them.
 4. Be respectful and follow our [Code of Conduct](CODE_OF_CONDUCT.md).
