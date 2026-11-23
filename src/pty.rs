@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 use std::ffi::CString;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -126,13 +130,13 @@ impl Pty {
 
             if let Some((socket, prompt)) = &control {
                 unsafe {
-                    libc::setenv(c"BEYNAL_CONTROL_SOCKET".as_ptr(), socket.as_ptr(), 1);
-                    libc::setenv(c"BEYNAL_PROMPT_THEME".as_ptr(), prompt.as_ptr(), 1);
+                    libc::setenv(c"BEYRIX_CONTROL_SOCKET".as_ptr(), socket.as_ptr(), 1);
+                    libc::setenv(c"BEYRIX_PROMPT_THEME".as_ptr(), prompt.as_ptr(), 1);
                 }
             }
             if let Some(path) = &command_path {
                 unsafe {
-                    libc::setenv(c"BEYNAL_COMMAND_DIR".as_ptr(), path.as_ptr(), 1);
+                    libc::setenv(c"BEYRIX_COMMAND_DIR".as_ptr(), path.as_ptr(), 1);
                 }
             }
             if size.is_some() {
@@ -180,6 +184,8 @@ impl Pty {
 
 fn command_directory(executable: &std::path::Path) -> io::Result<tempfile::TempDir> {
     let dir = tempfile::tempdir()?;
+    std::os::unix::fs::symlink(executable, dir.path().join("beyrix"))?;
+    // Keep the old shell command available inside existing prompt integrations.
     std::os::unix::fs::symlink(executable, dir.path().join("beynal"))?;
     Ok(dir)
 }
@@ -193,6 +199,10 @@ mod tests {
     fn command_directory_resolves_real_executable() {
         let executable = std::env::current_exe().unwrap();
         let dir = command_directory(&executable).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(dir.path().join("beyrix")).unwrap(),
+            executable
+        );
         assert_eq!(
             std::fs::canonicalize(dir.path().join("beynal")).unwrap(),
             executable

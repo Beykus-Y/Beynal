@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fs::File;
@@ -133,7 +137,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         blink_on: true,
         width: WIDTH,
         height: HEIGHT,
-        debug_input: std::env::var_os("BEYNAL_DEBUG_INPUT").as_deref()
+        debug_input: std::env::var_os("BEYRIX_DEBUG_INPUT").as_deref()
             == Some(std::ffi::OsStr::new("1")),
         ..Default::default()
     };
@@ -279,8 +283,8 @@ impl State {
         let xdg_surface = wm_base.get_xdg_surface(&surface, qh, ());
         let toplevel = xdg_surface.get_toplevel(qh, ());
 
-        toplevel.set_title("Beynal".to_string());
-        toplevel.set_app_id("beynal".to_string());
+        toplevel.set_title("Beyrix".to_string());
+        toplevel.set_app_id("beyrix".to_string());
         toplevel.set_min_size(320, 200);
 
         let theme = crate::theme::AppConfig::load()
@@ -1318,7 +1322,7 @@ mod input_tests {
     fn bash_output_reaches_terminal_grid() {
         let pty = Pty::spawn().unwrap();
         let fd = pty.master.as_raw_fd();
-        let command = b"echo BEYNAL_PTY_TEST_7391\nexit\n";
+        let command = b"echo BEYRIX_PTY_TEST_7391\nexit\n";
         assert_eq!(
             unsafe { libc::write(fd, command.as_ptr().cast(), command.len()) },
             command.len() as isize
@@ -1348,12 +1352,12 @@ mod input_tests {
         }
         let text = String::from_utf8_lossy(&output);
         assert!(
-            text.matches("BEYNAL_PTY_TEST_7391").count() >= 2,
+            text.matches("BEYRIX_PTY_TEST_7391").count() >= 2,
             "bash output: {text:?}"
         );
         assert!(
             (0..terminal.screen().rows)
-                .any(|y| terminal.screen().line(y).contains("BEYNAL_PTY_TEST_7391"))
+                .any(|y| terminal.screen().line(y).contains("BEYRIX_PTY_TEST_7391"))
         );
     }
 
@@ -1447,7 +1451,7 @@ mod input_tests {
                 READLINE_POINT=0
             }
             bind -x '"\e[99~":__capture'
-            complete -W 'combined' __beynal_test_command
+            complete -W 'combined' __beyrix_test_command
             printf 'ELEMENT_%s\n' READY
         }"#;
         state.input.extend(setup);
@@ -1506,11 +1510,11 @@ mod input_tests {
             ("abc", "def", b"\x1b[C", 1, "abcd", "ef"),
             ("hello   world", "", b"\x17", 1, "hello   ", ""),
             (
-                "__beynal_test_command com",
+                "__beyrix_test_command com",
                 "",
                 b"\t",
                 1,
-                "__beynal_test_command combined ",
+                "__beyrix_test_command combined ",
                 "",
             ),
         ];
@@ -1600,7 +1604,7 @@ mod input_tests {
         let pty = Pty::spawn_with_size(Some((80, 24))).unwrap();
         set_nonblocking(&pty.master).unwrap();
         let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(file.path(), "BEYNAL_NANO_FILE end\n").unwrap();
+        std::fs::write(file.path(), "BEYRIX_NANO_FILE end\n").unwrap();
         let mut state = State {
             pty: Some(pty),
             terminal: Some(Terminal::new(80, 24)),
@@ -1628,7 +1632,7 @@ mod input_tests {
                 std::thread::sleep(Duration::from_millis(5));
             }
         };
-        wait_for(&mut state, "BEYNAL_NANO_FILE end");
+        wait_for(&mut state, "BEYRIX_NANO_FILE end");
         assert!(
             state
                 .terminal

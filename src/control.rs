@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 use std::{
     io,
     os::unix::{fs::PermissionsExt, net::UnixDatagram},
@@ -18,7 +22,7 @@ impl Control {
     }
     fn new_in(root: &std::path::Path) -> io::Result<Self> {
         let dir = tempfile::Builder::new()
-            .prefix("beynal-")
+            .prefix("beyrix-")
             .tempdir_in(root)?;
         let path = dir.path().join("control.sock");
         let socket = UnixDatagram::bind(&path)?;
