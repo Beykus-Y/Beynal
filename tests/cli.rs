@@ -1,19 +1,23 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 use std::{path::Path, process::Command};
 
 fn cli(config: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_beynal"))
+    Command::new(env!("CARGO_BIN_EXE_beyrix"))
         .env("XDG_CONFIG_HOME", config)
-        .env_remove("BEYNAL_CONTROL_SOCKET")
-        .env_remove("BEYNAL_PROMPT_THEME")
+        .env_remove("BEYRIX_CONTROL_SOCKET")
+        .env_remove("BEYRIX_PROMPT_THEME")
         .args(args)
         .output()
         .unwrap()
 }
 
 #[test]
-fn redirected_help_inside_beynal_is_short_plain_text() {
-    let output = Command::new(env!("CARGO_BIN_EXE_beynal"))
-        .env("BEYNAL_CONTROL_SOCKET", "/nonexistent")
+fn redirected_help_inside_beyrix_is_short_plain_text() {
+    let output = Command::new(env!("CARGO_BIN_EXE_beyrix"))
+        .env("BEYRIX_CONTROL_SOCKET", "/nonexistent")
         .env("TERM", "xterm-256color")
         .output()
         .unwrap();
@@ -36,7 +40,7 @@ fn cli_theme_and_invalid_arguments() {
     assert_eq!(cli(config, &["theme"]).stdout, b"signature\n");
     for (args, error) in [
         (&["unknown"][..], "unknown command"),
-        (&["theme", "set"][..], "usage: beynal theme"),
+        (&["theme", "set"][..], "usage: beyrix theme"),
         (&["theme", "set", "unknown"][..], "unknown theme"),
         (&["open", "extra"][..], "takes no arguments"),
     ] {
