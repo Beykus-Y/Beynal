@@ -1,0 +1,61 @@
+name: COPR
+
+# Publish a Fedora source package to COPR when a release is published.
+#
+# The repository secret COPR_CONFIG must contain a complete copr-cli
+# configuration file. Without it the workflow succeeds without publishing.
+# The token is written to a temporary file and is never committed or printed.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example v0.1.0-alpha.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build SRPM and submit to COPR
+    runs-on: ubuntu-24.04
+    container: fedora:44
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install packaging tools
+        run: |
+          dnf -y install cargo cargo-rpm-macros copr-cli curl gcc git gzip \
+            rpm-build tar
+
+      - name: Write COPR configuration
+        id: creds
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
+        run: |
+          if [ -z "$COPR_CONFIG" ]; then
+            echo "COPR_CONFIG is not configured; skipping publication."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            install -d -m 0700 "$HOME/.config"
+            printf '%s\n' "$COPR_CONFIG" > "$HOME/.config/copr"
+            chmod 0600 "$HOME/.config/copr"
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create SRPM and submit
+        if: steps.creds.outputs.enabled == 'true'
+        run: ./packaging/fedora/make-sources.sh "$TAG" --submit
+
+      - name: Remove COPR configuration
+        if: always()
+        run: rm -f "$HOME/.config/copr"

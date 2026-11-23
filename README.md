@@ -57,6 +57,29 @@ All screenshots and the GIF are real captures of the release build running under
 - X11-only sessions, Windows, macOS and ARM64 are **not** supported by this release. No binaries or compatibility claims exist for those platforms.
 - Vulkan device discovery is implemented, but there is **no Vulkan renderer**. Selecting `vulkan` falls back to software.
 
+## Install on Fedora (COPR)
+
+Beyrix is packaged for Fedora 44 and 45 on x86_64 in the
+[beykus-y/beyrix](https://copr.fedorainfracloud.org/coprs/beykus-y/beyrix/) COPR
+project. The package is built from the tagged source with locked, vendored
+dependencies and is installed and updated through DNF:
+
+```sh
+sudo dnf copr enable beykus-y/beyrix
+sudo dnf install beyrix
+```
+
+Then start it from a Wayland session:
+
+```sh
+beyrix
+```
+
+The package installs the `beyrix` binary, a desktop entry, AppStream metadata, a
+manual page and the license information for the bundled crates. See
+[packaging/fedora/README.md](packaging/fedora/README.md) for build, packaging and
+release details.
+
 ## Install from GitHub Releases
 
 Download the Linux x86_64 archive and checksums, verify them, then install the binary into your user path:
@@ -178,6 +201,7 @@ If you already installed a `beynal` binary system-wide, update any shell aliases
 - [Security policy](SECURITY.md)
 - [Code of Conduct](CODE_OF_CONDUCT.md)
 - [Release notes](docs/releases/v0.1.0-alpha.1.md)
+- [Fedora/COPR packaging](packaging/fedora/README.md)
 
 ## Contributing and helping the project
 

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Beyrix
+GenericName=Terminal Emulator
+Comment=Experimental Wayland terminal emulator
+Exec=beyrix
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;wayland;console;
+StartupNotify=false

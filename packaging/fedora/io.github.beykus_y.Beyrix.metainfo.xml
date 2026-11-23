@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.beykus_y.Beyrix</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MPL-2.0</project_license>
+  <name>Beyrix</name>
+  <summary>Experimental Wayland terminal emulator</summary>
+  <description>
+    <p>
+      Beyrix is an experimental terminal emulator for Linux and Wayland. It
+      renders with OpenGL ES through EGL and falls back to a software renderer
+      when hardware acceleration is unavailable.
+    </p>
+    <p>
+      The project is alpha quality, supports x86_64 Wayland sessions only and
+      provides a PTY-backed Bash session plus a small built-in editor.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.beykus_y.Beyrix.desktop</launchable>
+  <url type="homepage">https://github.com/Beykus-Y/Beyrix</url>
+  <url type="bugtracker">https://github.com/Beykus-Y/Beyrix/issues</url>
+  <developer id="io.github.beykus_y">
+    <name>Beyrix contributors</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <categories>
+    <category>System</category>
+    <category>TerminalEmulator</category>
+  </categories>
+  <releases>
+    <release version="0.1.0~alpha.1" date="2026-11-24" type="development">
+      <description>
+        <p>First public alpha release with Fedora packaging.</p>
+      </description>
+    </release>
+  </releases>
+</component>

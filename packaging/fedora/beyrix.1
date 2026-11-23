@@ -1,0 +1,81 @@
+.\" This Source Code Form is subject to the terms of the Mozilla Public
+.\" License, v. 2.0. If a copy of the MPL was not distributed with this
+.\" file, You can obtain one at https://mozilla.org/MPL/2.0/.
+.TH BEYRIX 1 "2026-11-24" "Beyrix 0.1.0-alpha.1" "User Commands"
+.SH NAME
+beyrix \- experimental Wayland terminal emulator
+.SH SYNOPSIS
+.B beyrix
+.RI [ command ]
+.SH DESCRIPTION
+.B beyrix
+is an experimental terminal emulator for Linux and Wayland.
+It renders with OpenGL ES through EGL and falls back to software rendering
+when hardware acceleration is unavailable.
+The interactive session runs Bash through a pseudo-terminal.
+.PP
+Run without arguments to open a new window.
+.SH COMMANDS
+.TP
+.B open
+Open a new terminal window.
+.TP
+.B theme
+Print the active theme.
+.TP
+.B theme list
+List the built-in themes: minimal, developer and signature.
+.TP
+.BI "theme set " NAME
+Save a theme and update the current window when a control socket is available.
+.TP
+.B layout [list]
+Show the cursor layout. The supported layouts are as-is, bottom and bottom-input.
+.TP
+.BI "layout set " NAME
+Save the cursor layout.
+.TP
+.B renderer [list]
+Show the rendering backend. The supported values are auto, opengl, vulkan and
+software. The Vulkan backend is diagnostics only; selecting it falls back to
+software rendering.
+.TP
+.BI "renderer set " NAME
+Save the rendering backend.
+.TP
+.B gpu
+Print the detected GPUs, graphics APIs and the selected backend.
+.TP
+.BI "edit " FILE
+Open FILE in the built-in editor.
+.TP
+.B --pty
+Run Bash in the current terminal instead of opening a window.
+.TP
+.B --help
+Print the command summary.
+.SH ENVIRONMENT
+.TP
+.B BEYRIX_CONTROL_SOCKET
+Control socket used to notify a running window about configuration changes.
+.TP
+.B BEYRIX_PROMPT_THEME
+Path to the prompt theme file used by the Bash integration.
+.TP
+.B XDG_CONFIG_HOME
+Base directory for the configuration file
+.IR beyrix/config.toml .
+The legacy
+.I beynal/config.toml
+is migrated when the new file does not exist.
+.SH FILES
+.TP
+.I ~/.config/beyrix/config.toml
+User configuration.
+.SH SEE ALSO
+Documentation is installed in
+.I /usr/share/doc/beyrix/
+and at
+.IR https://github.com/Beykus-Y/Beyrix .
+.SH BUGS
+Report bugs at https://github.com/Beykus-Y/Beyrix/issues.
