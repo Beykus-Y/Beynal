@@ -11,7 +11,7 @@ Thanks for helping make Beyrix a better terminal. We welcome bug reports, compat
 
 ## Local setup
 
-Beyrix is currently a Linux/Wayland Rust project (edition 2024). You will need a recent stable Rust toolchain, Bash, the Wayland development libraries, and other native dependencies provided by your Linux distribution.
+Beyrix is currently a Linux/Wayland Rust project (edition 2024). Read the [architecture overview](docs/ARCHITECTURE.md) for an introduction to the existing modules. You will need a recent stable Rust toolchain, Bash, the Wayland development libraries, and other native dependencies provided by your Linux distribution.
 
 ```sh
 cargo fmt --all -- --check
