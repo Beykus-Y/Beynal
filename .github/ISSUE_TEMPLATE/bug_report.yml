@@ -1,0 +1,37 @@
+name: Bug report
+description: Report reproducible Beyrix behavior that needs fixing
+title: "[Bug] "
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Include the actual result and expected result.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include exact terminal commands or escape sequences where possible.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Beyrix version or commit
+      placeholder: 0.1.0 / commit SHA
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Linux distro, Wayland compositor and shell
+      placeholder: Fedora 44, Niri, Bash
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Logs, traces or screenshots
+      description: Remove tokens and personal information. Do not share security vulnerabilities publicly.
