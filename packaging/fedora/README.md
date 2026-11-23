@@ -54,9 +54,10 @@ rpmbuild --rebuild dist/fedora/beyrix-0.1.0~alpha.1-1.fc44.src.rpm
 
 1. Bump `version` in `Cargo.toml`, run `cargo build --locked`, and commit the
    resulting `Cargo.lock`.
-2. Tag the commit (`git tag vX.Y.Z`) and push the tag.
-3. Update `%global upver`, `Version:` and the `%changelog` entry in
-   `beyrix.spec`.
+2. Update `%global upver`, `Version:` and the `%changelog` entry in
+   `beyrix.spec`, then commit both files to `main`. The packaging automation
+   checks that the tag and `%global upver` agree.
+3. Tag the commit (`git tag vX.Y.Z`) and push the tag.
 4. Generate and submit the SRPM:
 
    ```sh

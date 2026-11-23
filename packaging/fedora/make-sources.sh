@@ -36,6 +36,11 @@ fi
 TAG="${TAG#v}"
 UPVER="$TAG"
 
+if [[ $UPVER != "$SPEC_UPVER" ]]; then
+    echo "error: tag $TAG does not match %global upver $SPEC_UPVER in beyrix.spec" >&2
+    exit 1
+fi
+
 COPR_PROJECT="${COPR_PROJECT:-beykus-y/beyrix}"
 
 if ! command -v cargo >/dev/null; then

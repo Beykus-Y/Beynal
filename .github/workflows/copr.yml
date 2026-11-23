@@ -27,9 +27,13 @@ jobs:
     env:
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
     steps:
-      - name: Check out the tag
+      - name: Install git for the checkout action
+        run: dnf -y install git
+
+      - name: Check out the packaging branch
         uses: actions/checkout@v7
         with:
+          ref: main
           fetch-depth: 0
 
       - name: Install packaging tools
