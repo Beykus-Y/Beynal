@@ -48,6 +48,7 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/docs"
 
 install -m 755 "$BIN" "$STAGE/beyrix"
+ln -s beyrix "$STAGE/bedit"
 install -m 644 LICENSE README.md CONFIGURATION.en.md CONFIGURATION.md "$STAGE/"
 install -m 644 docs/ARCHITECTURE.md "$STAGE/docs/ARCHITECTURE.md"
 install -m 755 packaging/install.sh "$STAGE/install.sh"

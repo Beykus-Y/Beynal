@@ -22,7 +22,7 @@ These features exist in the current code and are exercised by the test suite or 
 - **Selection and clipboard**: mouse selection, double-click word selection, triple-click logical-line selection, drag scrolling, Ctrl+C/Ctrl+V with Wayland clipboard and bracketed paste.
 - **SGR mouse reporting** for TUI applications, including button, wheel, motion, modifier bits and legacy X10 encoding.
 - **Three cursor layouts**: `as-is`, `bottom` and `bottom-input`.
-- **Built-in editor** (`beyrix edit FILE`) with UTF-8/BOM/CRLF handling, undo/redo, clipboard, word navigation, atomic saves, permission preservation and conflict warnings.
+- **BEdit code editor** with project Explorer, tabs, syntax colors, find and replace, UTF-8/BOM/CRLF handling, undo/redo, clipboard, atomic saves and conflict warnings.
 - **Themes and prompt integration**: built-in `minimal`, `developer` and `signature` themes, Git-aware Bash prompts, live theme updates through a local control socket.
 - **Customization** of font size, padding, colors, cursor shape/blink, scrolling and renderer through TOML configuration.
 - **CLI tools**: theme/layout/renderer selection, `beyrix gpu` diagnostics, `beyrix edit`, and `beyrix --pty`.
@@ -101,6 +101,7 @@ If `~/.local/bin` is not in your `PATH`, add it to your shell profile. You can a
 
 ```sh
 install -Dm755 beyrix ~/.local/bin/beyrix
+ln -s beyrix ~/.local/bin/bedit
 ```
 
 Then start Beyrix from a Wayland session:
@@ -109,7 +110,7 @@ Then start Beyrix from a Wayland session:
 beyrix
 ```
 
-The archive contains the `beyrix` executable, `LICENSE`, `README.md`, the English and Russian configuration guides, the architecture overview, `install.sh` and `BUILD-INFO.txt` with the source commit and build toolchain. The binary is dynamically linked against the system libc and `libxkbcommon`; the Wayland and EGL libraries are loaded at runtime. It is not a fully static or universal binary.
+The archive contains the `beyrix` executable, a relative `bedit` symlink, `LICENSE`, `README.md`, the English and Russian configuration guides, the architecture overview, `install.sh` and `BUILD-INFO.txt` with the source commit and build toolchain. The binary is dynamically linked against the system libc and `libxkbcommon`; the Wayland and EGL libraries are loaded at runtime. It is not a fully static or universal binary.
 
 ## Build from source
 
@@ -132,8 +133,10 @@ git clone https://github.com/Beykus-Y/Beyrix.git
 cd Beyrix
 cargo build --release --locked
 ./target/release/beyrix --help
-./target/release/beyrix
+./target/release/bedit .
 ```
+
+To install both commands into Cargo’s bin directory, run `cargo install --path . --locked`. The Fedora package and the release archive also install both commands.
 
 A small helper script is included:
 
@@ -168,10 +171,37 @@ beyrix layout set bottom-input
 beyrix renderer list       # auto, opengl, vulkan, software
 beyrix renderer set software
 beyrix gpu                 # DRM/EGL/Vulkan diagnostics and backend decision
-beyrix edit notes.md       # open a file in the built-in editor
+beyrix edit notes.md       # open a file in BEdit (legacy command)
 ```
 
 Configuration lives in `$XDG_CONFIG_HOME/beyrix/config.toml` (usually `~/.config/beyrix/config.toml`). See [CONFIGURATION.en.md](CONFIGURATION.en.md) for the English reference or [CONFIGURATION.md](CONFIGURATION.md) for the original Russian documentation.
+
+## BEdit
+
+From a Wayland session, BEdit opens a standalone editor window. From a shell in Beyrix, it opens in the current window. Closing BEdit with Esc returns to the running shell after resolving any unsaved changes.
+
+```sh
+bedit                         # open the current directory
+bedit .
+bedit /path/to/project
+bedit main.rs
+bedit main.rs Cargo.toml
+bedit /path/to/project /path/to/project/README.md
+bedit --help
+```
+
+| Shortcut | Action |
+| --- | --- |
+| Ctrl+P | Find a project file by path. Use ↑/↓ and Enter to open it. |
+| Ctrl+Tab / Ctrl+Shift+Tab | Switch tabs forward or backward. |
+| Ctrl+B | Hide or show Explorer. |
+| Ctrl+F | Find a literal, case-sensitive match. Enter finds the next match and Shift+Enter finds the previous one. |
+| Ctrl+H | Find and replace. Tab moves to the replacement field. Enter replaces one match and Ctrl+Enter replaces all. |
+| Ctrl+S / Ctrl+W | Save the active file or close its tab. |
+| Ctrl+Shift+R | Refresh the project index. |
+| Esc / Ctrl+Shift+W | Dismiss a search or leave BEdit. |
+
+Click a folder in Explorer to expand it, a file to open it, or × to close a tab. Each open tab retains its own selection, cursor, scroll and undo history. While closing, Y saves, N discards and Esc cancels. A failed save keeps the editor open with the modified buffer.
 
 ### Upgrading from Beynal
 
@@ -186,7 +216,7 @@ If you already installed a `beynal` binary system-wide, update any shell aliases
 - **No Vulkan renderer.** Vulkan devices are detected for diagnostics only; the `vulkan` renderer option falls back to software.
 - **One session per window.** Tabs, split panes and multiple terminal sessions in one window do not exist yet.
 - **No keyboard autorepeat handling** from the compositor in the graphical window. Typing works, but holding a key does not repeat inside Beyrix.
-- **Editor scope.** One file at a time, no tabs, no syntax highlighting and no LSP. Unsaved changes require confirmation before closing.
+- **Editor scope.** BEdit reads UTF-8 text and preserves BOM and a file’s consistent LF or CRLF convention. Highlighting is lexical and line-local. Explorer skips directory symlinks and common dependency/build folders, and scans up to 50,000 entries. Open tabs and histories live in memory. LSP and a terminal pane are planned.
 - **`bottom-input` edge case.** Asynchronous output written while a line is being edited can still overwrite the input line, because the PTY uses standard terminal semantics.
 - **Hardware acceleration is optional.** GPU selection depends on the compositor, EGL and driver. Software rendering is the guaranteed fallback and can use more CPU on large windows.
 - **Not security-audited.** Beyrix executes shell programs and handles terminal escape sequences and clipboard data. Treat it as experimental software.

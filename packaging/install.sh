@@ -20,9 +20,18 @@ if [ ! -x "$here/beyrix" ]; then
 fi
 
 install -d "$BINDIR"
+if [ -e "$BINDIR/bedit" ] || [ -L "$BINDIR/bedit" ]; then
+    if [ "$(readlink "$BINDIR/bedit" || true)" != "beyrix" ]; then
+        echo "install.sh: $BINDIR/bedit already exists and is not the Beyrix link" >&2
+        exit 1
+    fi
+fi
 install -m 755 "$here/beyrix" "$BINDIR/beyrix"
+if [ ! -L "$BINDIR/bedit" ]; then
+    ln -s beyrix "$BINDIR/bedit"
+fi
 
-echo "Installed Beyrix to $BINDIR/beyrix"
+echo "Installed beyrix and bedit to $BINDIR"
 case ":${PATH:-}:" in
     *":$BINDIR:"*) ;;
     *) echo "Add $BINDIR to PATH, then run: beyrix" ;;

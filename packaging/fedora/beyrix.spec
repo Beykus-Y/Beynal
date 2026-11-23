@@ -49,7 +49,7 @@ Recommends:     libvulkan.so.1()(64bit)
 Beyrix is an experimental terminal emulator for Linux and Wayland. It renders
 with OpenGL ES through EGL and falls back to software rendering when hardware
 acceleration is unavailable. A PTY-backed Bash session provides the interactive
-shell, and a small built-in editor opens files from the command line.
+shell, and BEdit opens projects and edits multiple files in tabs.
 
 The project is alpha quality and supports x86_64 Wayland sessions only.
 
@@ -77,6 +77,7 @@ install -Dpm0644 cargo-vendor.txt %{buildroot}%{_licensedir}/%{name}/cargo-vendo
 %license LICENSE
 %doc README.md CONFIGURATION.en.md CONFIGURATION.md
 %{_bindir}/beyrix
+%{_bindir}/bedit
 %{_datadir}/applications/io.github.beykus_y.Beyrix.desktop
 %{_metainfodir}/io.github.beykus_y.Beyrix.metainfo.xml
 %{_mandir}/man1/beyrix.1*
