@@ -1,12 +1,16 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 # Preserve the private command directory even if .bashrc replaces PATH.
-__beynal_command_dir=${BEYNAL_COMMAND_DIR-}
+__beyrix_command_dir=${BEYRIX_COMMAND_DIR-}
 [[ -r "$HOME/.bashrc" ]] && source "$HOME/.bashrc"
-if [[ -n $__beynal_command_dir ]]; then PATH="$__beynal_command_dir${PATH:+:$PATH}"; export PATH; fi
-unset BEYNAL_COMMAND_DIR __beynal_command_dir
+if [[ -n $__beyrix_command_dir ]]; then PATH="$__beyrix_command_dir${PATH:+:$PATH}"; export PATH; fi
+unset BEYRIX_COMMAND_DIR __beyrix_command_dir
 
 # READLINE_POINT and Bash substring offsets use characters in the active locale.
 # Match only the element touching the cursor on the requested side.
-__beynal_edit_element() {
+__beyrix_edit_element() {
     local point=$READLINE_POINT side element target
     local blank=$'[ \t]' word=$'[! \t]'
 
@@ -46,22 +50,22 @@ __beynal_edit_element() {
 }
 
 if [[ $- == *i* ]]; then
-    for __beynal_keymap in emacs-standard vi-insert vi-command; do
-        bind -m "$__beynal_keymap" -x '"\e[127;5u":__beynal_edit_element left delete'
-        bind -m "$__beynal_keymap" -x '"\e[3;5~":__beynal_edit_element right delete'
-        bind -m "$__beynal_keymap" -x '"\e[1;5D":__beynal_edit_element left move'
-        bind -m "$__beynal_keymap" -x '"\e[1;5C":__beynal_edit_element right move'
+    for __beyrix_keymap in emacs-standard vi-insert vi-command; do
+        bind -m "$__beyrix_keymap" -x '"\e[127;5u":__beyrix_edit_element left delete'
+        bind -m "$__beyrix_keymap" -x '"\e[3;5~":__beyrix_edit_element right delete'
+        bind -m "$__beyrix_keymap" -x '"\e[1;5D":__beyrix_edit_element left move'
+        bind -m "$__beyrix_keymap" -x '"\e[1;5C":__beyrix_edit_element right move'
     done
-    unset __beynal_keymap
+    unset __beyrix_keymap
 fi
 
-__beynal_prompt() {
+__beyrix_prompt() {
     local status=$? style=minimal compact=false branch dirty='' path
-    if [[ -r ${BEYNAL_PROMPT_THEME-} ]]; then
+    if [[ -r ${BEYRIX_PROMPT_THEME-} ]]; then
         {
             IFS= read -r style
             IFS= read -r compact
-        } < "$BEYNAL_PROMPT_THEME"
+        } < "$BEYRIX_PROMPT_THEME"
     fi
 
     path=$PWD
@@ -73,7 +77,7 @@ __beynal_prompt() {
     if [[ $style == minimal && $path != '~' && $path != '/' ]]; then
         path=${path##*/}
     fi
-    __beynal_path=${path//[[:cntrl:]]/?}
+    __beyrix_path=${path//[[:cntrl:]]/?}
 
     branch=$(command git symbolic-ref --quiet --short HEAD 2>/dev/null) ||
         branch=$(command git rev-parse --short HEAD 2>/dev/null) || branch=''
@@ -83,18 +87,18 @@ __beynal_prompt() {
         fi
     fi
 
-    __beynal_git=''
-    __beynal_status=''
+    __beyrix_git=''
+    __beyrix_status=''
     case $style in
         developer)
-            [[ -z $branch ]] || __beynal_git=" | $branch$dirty"
-            (( status == 0 )) || __beynal_status=" | exit $status"
-            PS1='\[\e[0;32m\]\u@\h\[\e[0m\] \[\e[0;34m\]${__beynal_path}\[\e[0;36m\]${__beynal_git}\[\e[0;31m\]${__beynal_status}\[\e[0m\] \$ '
+            [[ -z $branch ]] || __beyrix_git=" | $branch$dirty"
+            (( status == 0 )) || __beyrix_status=" | exit $status"
+            PS1='\[\e[0;32m\]\u@\h\[\e[0m\] \[\e[0;34m\]${__beyrix_path}\[\e[0;36m\]${__beyrix_git}\[\e[0;31m\]${__beyrix_status}\[\e[0m\] \$ '
             ;;
         signature)
-            [[ -z $branch ]] || __beynal_git="  ⎇ $branch$dirty"
-            (( status == 0 )) || __beynal_status="  exit $status"
-            PS1='\[\e[0;35m\]◆\[\e[0;36m\] ${__beynal_path}\[\e[0;35m\]${__beynal_git}\[\e[0;91m\]${__beynal_status}'
+            [[ -z $branch ]] || __beyrix_git="  ⎇ $branch$dirty"
+            (( status == 0 )) || __beyrix_status="  exit $status"
+            PS1='\[\e[0;35m\]◆\[\e[0;36m\] ${__beyrix_path}\[\e[0;35m\]${__beyrix_git}\[\e[0;91m\]${__beyrix_status}'
             if [[ $compact == true ]]; then
                 PS1+='\[\e[0;35m\] ❯\[\e[0m\] '
             else
@@ -102,10 +106,10 @@ __beynal_prompt() {
             fi
             ;;
         *)
-            [[ -z $branch ]] || __beynal_git=" · $branch"
-            PS1='\[\e[0;36m\]${__beynal_path}\[\e[0;90m\]${__beynal_git}\[\e[0m\] \$ '
+            [[ -z $branch ]] || __beyrix_git=" · $branch"
+            PS1='\[\e[0;36m\]${__beyrix_path}\[\e[0;90m\]${__beyrix_git}\[\e[0m\] \$ '
             ;;
     esac
     return "$status"
 }
-PROMPT_COMMAND=(__beynal_prompt "${PROMPT_COMMAND[@]}")
+PROMPT_COMMAND=(__beyrix_prompt "${PROMPT_COMMAND[@]}")
