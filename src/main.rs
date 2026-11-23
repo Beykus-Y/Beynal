@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 mod control;
 mod keyboard;
 mod prompt;
@@ -54,13 +58,13 @@ fn main() -> std::process::ExitCode {
         .map(|arg| arg.to_str())
         .collect::<Option<Vec<_>>>()
     else {
-        eprintln!("beynal: arguments must be valid UTF-8");
+        eprintln!("beyrix: arguments must be valid UTF-8");
         return std::process::ExitCode::FAILURE;
     };
     match run(&args) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("beynal: {error}");
+            eprintln!("beyrix: {error}");
             std::process::ExitCode::FAILURE
         }
     }
@@ -75,7 +79,7 @@ fn print_help() {
     } else {
         ("", "")
     };
-    println!("{accent}Beynal{reset} · Wayland terminal\n");
+    println!("{accent}Beyrix{reset} · Wayland terminal\n");
     for (command, description) in [
         ("open", "Open a new window"),
         ("theme", "Show the active theme"),
@@ -84,18 +88,18 @@ fn print_help() {
         ("--pty", "Run Bash in the current terminal"),
         ("--help", "Show this help"),
     ] {
-        println!("  {accent}beynal {command:<14}{reset}  {description}");
+        println!("  {accent}beyrix {command:<14}{reset}  {description}");
     }
 }
 
 fn run(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
     match args {
         ["--help" | "-h"] => print_help(),
-        [] if std::env::var_os("BEYNAL_CONTROL_SOCKET").is_some() => print_help(),
+        [] if std::env::var_os("BEYRIX_CONTROL_SOCKET").is_some() => print_help(),
         [] | ["open"] => wayland::run()?,
         ["--pty"] => run_pty()?,
         ["theme"] => {
-            let active = std::env::var_os("BEYNAL_PROMPT_THEME")
+            let active = std::env::var_os("BEYRIX_PROMPT_THEME")
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .and_then(|data| {
                     data.lines()
@@ -112,7 +116,7 @@ fn run(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
         ["theme", "list"] => println!("minimal\ndeveloper\nsignature"),
         ["theme", "set", name] => {
             theme::Theme::save_choice(name)?;
-            match std::env::var_os("BEYNAL_CONTROL_SOCKET") {
+            match std::env::var_os("BEYRIX_CONTROL_SOCKET") {
                 Some(path) => match control::notify(std::path::Path::new(&path), name) {
                     Ok(()) => println!("Theme: {name} (update requested)"),
                     Err(e) => {
@@ -122,12 +126,12 @@ fn run(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
                 None => println!("Theme: {name} (saved for next launch)"),
             }
         }
-        ["theme", ..] => return Err("usage: beynal theme [list | set NAME]".into()),
+        ["theme", ..] => return Err("usage: beyrix theme [list | set NAME]".into()),
         [command @ ("open" | "--pty" | "--help" | "-h"), ..] => {
             return Err(format!("{command} takes no arguments").into());
         }
         [command, ..] => {
-            return Err(format!("unknown command {command:?}. See beynal --help").into());
+            return Err(format!("unknown command {command:?}. See beyrix --help").into());
         }
     }
     Ok(())
