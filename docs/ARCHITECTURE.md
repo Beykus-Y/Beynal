@@ -12,6 +12,7 @@ This is a map of the **existing** code, not a promise of future interfaces. Beyr
 | `src/gpu.rs` | DRM, EGL/OpenGL and Vulkan discovery plus backend selection |
 | `src/editor.rs` | Built-in single-file text editor model, view and file saving |
 | `src/keyboard.rs` | Keyboard mapping and key sequence translation using `xkbcommon` |
+| `src/mouse.rs` | Mouse reporting modes and SGR/X10 pointer event encoding |
 | `src/pty.rs` | PTY process creation, Bash launch and resize |
 | `src/selection.rs` | Selection position and word/line selection behavior |
 | `src/theme.rs` | Themes, TOML configuration and persisted theme changes |

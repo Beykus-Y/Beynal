@@ -124,6 +124,8 @@ pub struct Screen {
     pub cursor_style: Option<CursorStyle>,
     pub revision: u64,
     pub bracketed_paste: bool,
+    mouse: crate::mouse::Mode,
+    mouse_sgr: bool,
     layout: LayoutMode,
     fg: [u8; 3],
     bg: [u8; 3],
@@ -167,6 +169,8 @@ impl Screen {
             cursor_style: None,
             revision: 0,
             bracketed_paste: false,
+            mouse: crate::mouse::Mode::Off,
+            mouse_sgr: false,
             layout,
             fg: theme.foreground,
             bg: theme.background,
@@ -193,6 +197,14 @@ impl Screen {
             screen.cursor_y = rows.saturating_sub(1);
         }
         screen
+    }
+
+    pub fn mouse_mode(&self) -> crate::mouse::Mode {
+        self.mouse
+    }
+
+    pub fn mouse_sgr(&self) -> bool {
+        self.mouse_sgr
     }
 
     pub fn set_layout(&mut self, layout: LayoutMode) {
@@ -841,6 +853,41 @@ impl Perform for Screen {
                             2
                         }
                     }
+                    1000 => {
+                        if self.mouse == crate::mouse::Mode::Click {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    1002 => {
+                        if self.mouse == crate::mouse::Mode::Drag {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    1003 => {
+                        if self.mouse == crate::mouse::Mode::Motion {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    1006 => {
+                        if self.mouse_sgr {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    2004 => {
+                        if self.bracketed_paste {
+                            1
+                        } else {
+                            2
+                        }
+                    }
                     _ => 0,
                 };
                 self.responses
@@ -855,6 +902,14 @@ impl Perform for Screen {
                     (2004, 'l') => self.bracketed_paste = false,
                     (25, 'h') => self.cursor_visible = true,
                     (25, 'l') => self.cursor_visible = false,
+                    (1000 | 1002 | 1003, 'h') => {
+                        if let Some(mode) = crate::mouse::Mode::from_decimal((*param).into()) {
+                            self.mouse = mode;
+                        }
+                    }
+                    (1000 | 1002 | 1003, 'l') => self.mouse = crate::mouse::Mode::Off,
+                    (1006, 'h') => self.mouse_sgr = true,
+                    (1006, 'l') => self.mouse_sgr = false,
                     (47 | 1047 | 1049, 'h') if self.alternate.is_none() => {
                         self.selection_epoch += 1;
                         self.revision += 1;
@@ -1381,6 +1436,45 @@ mod tests {
         t.process(b"\x1b[?2004l");
         assert!(!t.screen().bracketed_paste);
     }
+    #[test]
+    fn tracks_mouse_modes_and_reports_them_through_decrqm() {
+        use crate::mouse::Mode;
+        let mut t = Terminal::new(10, 2);
+        assert_eq!(t.screen().mouse_mode(), Mode::Off);
+        assert!(!t.screen().mouse_sgr());
+
+        t.process(b"\x1b[?1002h\x1b[?1006h");
+        assert_eq!(t.screen().mouse_mode(), Mode::Drag);
+        assert!(t.screen().mouse_sgr());
+        t.process(b"\x1b[?1000$p\x1b[?1002$p\x1b[?1006$p\x1b[?2004$p");
+        assert_eq!(
+            t.take_responses(),
+            b"\x1b[?1000;2$y\x1b[?1002;1$y\x1b[?1006;1$y\x1b[?2004;2$y"
+        );
+
+        // Focus reporting is not implemented, so its query must stay
+        // unrecognized instead of being advertised as supported.
+        t.process(b"\x1b[?2004h");
+        assert_eq!(t.screen().mouse_mode(), Mode::Drag);
+        t.process(b"\x1b[?1004$p\x1b[?2004$p");
+        assert_eq!(t.take_responses(), b"\x1b[?1004;0$y\x1b[?2004;1$y");
+
+        t.process(b"\x1b[?1002l\x1b[?1006l");
+        assert_eq!(t.screen().mouse_mode(), Mode::Off);
+        assert!(!t.screen().mouse_sgr());
+    }
+
+    #[test]
+    fn alternate_screen_keeps_mouse_reporting_mode() {
+        use crate::mouse::Mode;
+        let mut t = Terminal::new(10, 3);
+        t.process(b"\x1b[?1003h\x1b[?1006h\x1b[?1049h");
+        assert_eq!(t.screen().mouse_mode(), Mode::Motion);
+        assert!(t.screen().mouse_sgr());
+        t.process(b"\x1b[?1049l");
+        assert_eq!(t.screen().mouse_mode(), Mode::Motion);
+    }
+
     #[test]
     fn resize_preserves_both_screens_and_clamps_cursor() {
         let mut t = Terminal::new(6, 3);

@@ -8,6 +8,7 @@ mod editor;
 mod gl;
 mod gpu;
 mod keyboard;
+mod mouse;
 mod prompt;
 mod pty;
 mod render;

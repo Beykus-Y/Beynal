@@ -8,7 +8,7 @@
 
 - Native Wayland window with OpenGL ES and CPU/`wl_shm` renderers; the backend is chosen automatically and falls back to software.
 - PTY-backed interactive Bash sessions.
-- Scrollback, selection, clipboard integration and basic terminal escape sequence handling.
+- Scrollback, selection, clipboard integration, SGR mouse reporting for TUI applications and basic terminal escape sequence handling.
 - Three cursor layouts: `as-is`, `bottom` and `bottom-input`.
 - Built-in text editor for `beyrix edit FILE`.
 - Built-in `minimal`, `developer`, and `signature` prompt themes.

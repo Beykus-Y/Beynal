@@ -224,6 +224,8 @@ struct State {
     wheel_axis: f64,
     wheel_steps: Option<f64>,
     wheel_remainder: f64,
+    wheel_mouse_remainder: f64,
+    mouse_button: Option<crate::mouse::Button>,
     drag_scroll_at: Option<std::time::Instant>,
     selection: crate::selection::Selection,
     input: VecDeque<u8>,
@@ -1019,13 +1021,198 @@ impl State {
         Ok(())
     }
 
+    fn pointer_modifiers(&self) -> crate::mouse::Modifiers {
+        self.xkb
+            .as_ref()
+            .map_or_else(crate::mouse::Modifiers::default, |xkb| {
+                crate::mouse::Modifiers {
+                    shift: xkb.shift(),
+                    alt: xkb.alt(),
+                    ctrl: xkb.control(),
+                }
+            })
+    }
+
+    fn mouse_mode(&self) -> crate::mouse::Mode {
+        self.terminal
+            .as_ref()
+            .map_or(crate::mouse::Mode::Off, |terminal| {
+                terminal.screen().mouse_mode()
+            })
+    }
+
+    /// Whether pointer events belong to the application rather than to
+    /// Beyrix's selection. Shift keeps text selection available in every
+    /// application that enables mouse reporting.
+    fn mouse_reporting(&self) -> bool {
+        self.mouse_mode() != crate::mouse::Mode::Off && !self.pointer_modifiers().shift
+    }
+
+    fn mouse_cell(&self) -> Option<(usize, usize)> {
+        let terminal = self.terminal.as_ref()?;
+        let renderer = self.renderer.as_ref()?;
+        let screen = terminal.screen();
+        let geometry = renderer
+            .geometry
+            .for_window(self.width as usize, self.height as usize);
+        let (x, y) = self.pointer_position;
+        let column = ((x - geometry.padding as f64) / geometry.cell_width as f64)
+            .floor()
+            .max(0.0) as usize;
+        let display_row = ((y - geometry.padding as f64) / geometry.cell_height as f64)
+            .floor()
+            .max(0.0) as usize;
+        let row = display_row
+            .saturating_sub(screen.layout_offset())
+            .min(screen.rows.saturating_sub(1));
+        Some((column.min(screen.columns.saturating_sub(1)), row))
+    }
+
+    fn report_mouse(
+        &mut self,
+        button: Option<crate::mouse::Button>,
+        pressed: bool,
+        motion: bool,
+    ) -> bool {
+        let Some((mode, sgr)) = self.terminal.as_ref().map(|terminal| {
+            (
+                terminal.screen().mouse_mode(),
+                terminal.screen().mouse_sgr(),
+            )
+        }) else {
+            return false;
+        };
+        let Some((column, row)) = self.mouse_cell() else {
+            return false;
+        };
+        let Some(bytes) = crate::mouse::encode(crate::mouse::Event {
+            mode,
+            sgr,
+            button,
+            column,
+            row,
+            pressed,
+            motion,
+            modifiers: self.pointer_modifiers(),
+        }) else {
+            return false;
+        };
+        // Applications normally leave the alternate screen for mouse-driven
+        // output; a click in the live grid must not edit a scrollback view that
+        // the application cannot see.
+        if pressed
+            && !motion
+            && self
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.screen().view_offset() > 0)
+        {
+            self.dirty = true;
+            if let Some(terminal) = &mut self.terminal {
+                terminal.screen_mut().reset_view();
+            }
+        }
+        self.input.extend(bytes);
+        true
+    }
+
+    fn pointer_button(&mut self, button: crate::mouse::Button, pressed: bool, time: u32) {
+        if self.editor.is_some() {
+            let geometry = self.renderer.as_ref().map(|renderer| {
+                renderer
+                    .geometry
+                    .for_window(self.width as usize, self.height as usize)
+            });
+            let Some(editor) = &mut self.editor else {
+                return;
+            };
+            if pressed {
+                if button == crate::mouse::Button::Left
+                    && let Some(geometry) = geometry
+                {
+                    let (x, y) = self.pointer_position;
+                    editor.mouse_press(x, y, metrics(geometry), time);
+                    self.dirty = true;
+                }
+            } else {
+                editor.mouse_release();
+                self.dirty = true;
+            }
+            return;
+        }
+        if pressed {
+            if self.mouse_reporting() && self.report_mouse(Some(button), true, false) {
+                self.mouse_button = Some(button);
+                return;
+            }
+            if button == crate::mouse::Button::Left
+                && let (Some(geometry), Some(terminal)) = (
+                    self.renderer.as_ref().map(|renderer| {
+                        renderer
+                            .geometry
+                            .for_window(self.width as usize, self.height as usize)
+                    }),
+                    self.terminal.as_ref(),
+                )
+            {
+                let (x, y) = self.pointer_position;
+                let position = crate::selection::position(geometry, x, y, terminal.screen());
+                self.selection
+                    .press(terminal.screen(), position, time, x, y);
+                self.dirty = true;
+            }
+        } else if let Some(held) = self.mouse_button.take() {
+            if self.mouse_mode() != crate::mouse::Mode::Off {
+                self.report_mouse(Some(held), false, false);
+            }
+        } else if button == crate::mouse::Button::Left {
+            self.selection.release();
+        }
+    }
+
+    fn pointer_motion(&mut self) {
+        if self.editor.is_some() || self.selection.is_dragging() {
+            self.update_drag(false);
+            return;
+        }
+        if self.mouse_reporting() {
+            match (self.mouse_mode(), self.mouse_button) {
+                (crate::mouse::Mode::Motion, None) => {
+                    self.report_mouse(None, true, true);
+                    return;
+                }
+                (crate::mouse::Mode::Drag | crate::mouse::Mode::Motion, Some(button)) => {
+                    self.report_mouse(Some(button), true, true);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.update_drag(false);
+    }
+
     fn scroll_pointer(&mut self) {
         let steps = self.wheel_steps.take().unwrap_or(self.wheel_axis / 10.0);
         self.wheel_axis = 0.0;
+        let steps = if steps.is_finite() { steps } else { 0.0 };
         if let Some(editor) = &mut self.editor {
             let (rows, remainder) = wheel_rows(self.wheel_remainder, steps, 3);
             self.wheel_remainder = remainder;
             self.dirty |= editor.scroll_lines(-rows);
+        } else if self.mouse_reporting() {
+            // Report whole wheel notches and keep the fractional remainder so
+            // high-resolution touchpad scrolling does not lose events.
+            self.wheel_mouse_remainder += steps;
+            let notches = self.wheel_mouse_remainder.trunc();
+            self.wheel_mouse_remainder -= notches;
+            let button = if notches > 0.0 {
+                crate::mouse::Button::WheelDown
+            } else {
+                crate::mouse::Button::WheelUp
+            };
+            for _ in 0..notches.abs().min(64.0) as usize {
+                self.report_mouse(Some(button), true, false);
+            }
         } else if let Some(terminal) = &mut self.terminal {
             let screen = terminal.screen_mut();
             let (rows, remainder) = wheel_rows(self.wheel_remainder, steps, screen.scroll_speed());
@@ -1980,6 +2167,12 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 state.wheel_axis = 0.0;
                 state.wheel_steps = None;
                 state.wheel_remainder = 0.0;
+                state.wheel_mouse_remainder = 0.0;
+                if let Some(button) = state.mouse_button.take()
+                    && state.mouse_mode() != crate::mouse::Mode::Off
+                {
+                    state.report_mouse(Some(button), false, false);
+                }
                 state.selection.release();
                 if let Some(editor) = &mut state.editor {
                     editor.mouse_release();
@@ -2014,42 +2207,30 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 ..
             } => {
                 state.pointer_position = (surface_x, surface_y);
-                state.update_drag(false);
+                state.pointer_motion();
             }
             wl_pointer::Event::Button {
-                button: 0x110,
+                button,
                 state: wayland_client::WEnum::Value(button_state),
                 time,
                 ..
-            } => match button_state {
-                wl_pointer::ButtonState::Pressed if state.pointer_focus => {
-                    let geometry = state.renderer.as_ref().map(|renderer| {
-                        renderer
-                            .geometry
-                            .for_window(state.width as usize, state.height as usize)
-                    });
-                    if let Some(geometry) = geometry {
-                        let (x, y) = state.pointer_position;
-                        if let Some(editor) = &mut state.editor {
-                            editor.mouse_press(x, y, metrics(geometry), time);
-                            state.dirty = true;
-                        } else if let Some(terminal) = &state.terminal {
-                            let p = crate::selection::position(geometry, x, y, terminal.screen());
-                            state.selection.press(terminal.screen(), p, time, x, y);
-                            state.dirty = true;
-                        }
-                    }
+            } => {
+                if !state.pointer_focus {
+                    return;
                 }
-                wl_pointer::ButtonState::Released => {
-                    if let Some(editor) = &mut state.editor {
-                        editor.mouse_release();
-                        state.dirty = true;
-                    } else {
-                        state.selection.release();
+                let Some(button) = crate::mouse::Button::from_linux(button) else {
+                    return;
+                };
+                match button_state {
+                    wl_pointer::ButtonState::Pressed => {
+                        state.pointer_button(button, true, time);
                     }
+                    wl_pointer::ButtonState::Released => {
+                        state.pointer_button(button, false, time);
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             _ => {}
         }
     }
@@ -2382,6 +2563,74 @@ mod input_tests {
         );
         // Other keys are ignored while the warning is visible.
         assert_eq!(editor_command(&press(24, 0x043e, "о"), true), None);
+    }
+
+    #[test]
+    fn mouse_reporting_encodes_clicks_drags_and_wheel() {
+        use crate::mouse::Button;
+        let mut terminal = Terminal::new(20, 10);
+        terminal.process(b"\x1b[?1002h\x1b[?1006h");
+        let mut state = State {
+            terminal: Some(terminal),
+            renderer: Some(render::Renderer::new().unwrap()),
+            pointer_focus: true,
+            width: 200,
+            height: 240,
+            ..Default::default()
+        };
+        let geometry = state
+            .renderer
+            .as_ref()
+            .unwrap()
+            .geometry
+            .for_window(state.width as usize, state.height as usize);
+        state.pointer_position = (
+            geometry.padding as f64 + geometry.cell_width as f64 * 2.0 + 1.0,
+            geometry.padding as f64 + geometry.cell_height as f64 * 3.0 + 1.0,
+        );
+
+        state.pointer_button(Button::Left, true, 10);
+        assert_eq!(state.input.make_contiguous(), b"\x1b[<0;3;4M");
+        state.input.clear();
+
+        state.pointer_motion();
+        assert_eq!(state.input.make_contiguous(), b"\x1b[<32;3;4M");
+        state.input.clear();
+
+        state.pointer_button(Button::Left, false, 11);
+        assert_eq!(state.input.make_contiguous(), b"\x1b[<0;3;4m");
+        assert!(!state.selection.is_dragging());
+        state.input.clear();
+
+        state.wheel_steps = Some(1.0);
+        state.scroll_pointer();
+        assert_eq!(state.input.make_contiguous(), b"\x1b[<65;3;4M");
+        assert_eq!(
+            state.terminal.as_ref().unwrap().screen().view_offset(),
+            0,
+            "wheel must go to the application, not the scrollback"
+        );
+
+        state.terminal.as_mut().unwrap().process(b"\x1b[?1003h");
+        state.input.clear();
+        state.pointer_motion();
+        assert_eq!(state.input.make_contiguous(), b"\x1b[<35;3;4M");
+    }
+
+    #[test]
+    fn pointer_still_selects_when_mouse_reporting_is_off() {
+        use crate::mouse::Button;
+        let mut state = State {
+            terminal: Some(Terminal::new(20, 10)),
+            renderer: Some(render::Renderer::new().unwrap()),
+            pointer_focus: true,
+            width: 200,
+            height: 240,
+            ..Default::default()
+        };
+        state.pointer_button(Button::Left, true, 10);
+        assert!(state.input.is_empty());
+        assert!(state.selection.is_dragging());
     }
 
     #[test]
