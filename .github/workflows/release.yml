@@ -105,6 +105,7 @@ jobs:
             gh release create "$tag" \
               dist/*.tar.gz dist/SHA256SUMS \
               --verify-tag \
+              --target "$GITHUB_SHA" \
               --title "Beyrix $tag" \
               --notes-file "$generated" \
               "${prerelease[@]}"
