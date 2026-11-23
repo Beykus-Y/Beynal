@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 // Bash expands parameter values only once, so directory and Git output are never shell code.
 pub fn script() -> &'static str {
     include_str!("prompt_developer.sh")
@@ -13,18 +17,18 @@ mod tests {
         std::fs::write(&path, "minimal\nfalse\n").unwrap();
         let code = format!(
             r#"{} 
-            __beynal_prompt; printf '%s\n' "$PS1"
-            printf 'signature\nfalse\n' > "$BEYNAL_PROMPT_THEME"
-            __beynal_prompt; printf '%s\n' "$PS1"
-            printf 'signature\ntrue\n' > "$BEYNAL_PROMPT_THEME"
-            __beynal_prompt; printf '%s\n' "$PS1"
+            __beyrix_prompt; printf '%s\n' "$PS1"
+            printf 'signature\nfalse\n' > "$BEYRIX_PROMPT_THEME"
+            __beyrix_prompt; printf '%s\n' "$PS1"
+            printf 'signature\ntrue\n' > "$BEYRIX_PROMPT_THEME"
+            __beyrix_prompt; printf '%s\n' "$PS1"
             "#,
             script()
         );
         let out = std::process::Command::new("bash")
             .args(["-c", &code])
             .env("HOME", dir.path())
-            .env("BEYNAL_PROMPT_THEME", path)
+            .env("BEYRIX_PROMPT_THEME", path)
             .output()
             .unwrap();
         let prompts = String::from_utf8(out.stdout).unwrap();
@@ -39,23 +43,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
-        std::os::unix::fs::symlink("/bin/true", bin.join("beynal")).unwrap();
+        std::os::unix::fs::symlink("/bin/true", bin.join("beyrix")).unwrap();
         std::fs::write(dir.path().join(".bashrc"), "PATH=/bin\n").unwrap();
-        let code = format!("{}\ncommand -v beynal; beynal theme list", script());
+        let code = format!("{}\ncommand -v beyrix; beyrix theme list", script());
         let output = std::process::Command::new("bash")
             .args(["-c", &code])
             .env("HOME", dir.path())
-            .env("BEYNAL_COMMAND_DIR", &bin)
+            .env("BEYRIX_COMMAND_DIR", &bin)
             .output()
             .unwrap();
         assert!(output.status.success());
-        assert!(String::from_utf8_lossy(&output.stdout).contains("beynal"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("beyrix"));
     }
     #[test]
     fn no_git_indicator_outside_repository() {
         let dir = tempfile::tempdir().unwrap();
         let code = format!(
-            "{}\n__beynal_prompt; printf '%s' \"${{__beynal_git:-${{__beynal_branch:-}}}}\"",
+            "{}\n__beyrix_prompt; printf '%s' \"${{__beyrix_git:-${{__beyrix_branch:-}}}}\"",
             script()
         );
         let output = std::process::Command::new("bash")
@@ -84,19 +88,19 @@ mod tests {
         for name in ["minimal", "developer", "signature"] {
             std::fs::write(&theme, format!("{name}\nfalse\n")).unwrap();
             let run = format!(
-                "{}\nfalse; __beynal_prompt; printf '%s\n%s\n%s' \"$PS1\" \"${{__beynal_git:-${{__beynal_branch:-}}}}\" \"${{__beynal_status:-0}}\"",
+                "{}\nfalse; __beyrix_prompt; printf '%s\n%s\n%s' \"$PS1\" \"${{__beyrix_git:-${{__beyrix_branch:-}}}}\" \"${{__beyrix_status:-0}}\"",
                 script()
             );
             let output = std::process::Command::new("bash")
                 .args(["-c", &run])
                 .env("HOME", dir.path())
                 .current_dir(&root)
-                .env("BEYNAL_PROMPT_THEME", &theme)
+                .env("BEYRIX_PROMPT_THEME", &theme)
                 .output()
                 .unwrap();
             assert!(output.status.success());
             let text = String::from_utf8(output.stdout).unwrap();
-            assert!(text.contains("${__beynal_path}"));
+            assert!(text.contains("${__beyrix_path}"));
             assert!(text.contains("master") || text.contains("main"));
             assert!(!text.contains("No commits yet"));
             if name != "minimal" {
