@@ -10,7 +10,9 @@
 //! columns are computed with `unicode-width`, so wide characters and combining
 //! marks are handled without splitting UTF-8 sequences.
 
-use std::io::Write;
+use crate::syntax::{Language, Style};
+use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use unicode_width::UnicodeWidthChar;
@@ -100,6 +102,7 @@ struct Stamp {
     len: u64,
     ino: u64,
     dev: u64,
+    changed: (i64, i64),
 }
 
 impl Stamp {
@@ -110,6 +113,7 @@ impl Stamp {
             len: meta.len(),
             ino: meta.ino(),
             dev: meta.dev(),
+            changed: (meta.ctime(), meta.ctime_nsec()),
         }
     }
 }
@@ -122,7 +126,7 @@ pub struct Metrics {
     pub padding: usize,
 }
 
-pub struct Editor {
+pub struct Document {
     path: PathBuf,
     target: PathBuf,
     lines: Vec<String>,
@@ -143,9 +147,10 @@ pub struct Editor {
     saved_at: Option<usize>,
     last_op: Option<Op>,
     stamp: Option<Stamp>,
-    force_overwrite: bool,
-    confirm_close: bool,
-    close_window: bool,
+    // A retry may overwrite only the disk version shown in the warning.
+    overwrite: Option<Option<Stamp>>,
+    language: Language,
+    read_only: bool,
     message: Option<String>,
     status_error: bool,
 }
@@ -159,6 +164,9 @@ pub struct EditorView {
     pub status_row: usize,
     /// Visible cursor as (view row, display cell column, cell width).
     pub cursor: Option<(usize, usize, usize)>,
+    pub chrome: Vec<crate::bedit::Chrome>,
+    pub text_offset: (usize, usize),
+    pub columns: usize,
 }
 
 pub struct EditorRow {
@@ -167,22 +175,29 @@ pub struct EditorRow {
     /// Selected display cells relative to the text area.
     pub selection: Option<(usize, usize)>,
     pub current: bool,
+    pub styles: Vec<(std::ops::Range<usize>, Style)>,
 }
 
-impl Editor {
+impl Document {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, String> {
         let path = path.into();
         let target = target_for(&path);
-        if let Ok(meta) = std::fs::metadata(&path)
-            && !meta.is_file()
+        let (lines, eol, bom, stamp, read_only) = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&target)
         {
-            return Err(format!(
-                "cannot read {}: not a regular file",
-                path.display()
-            ));
-        }
-        let (lines, eol, bom, stamp) = match std::fs::read(&path) {
-            Ok(bytes) => {
+            Ok(mut file) => {
+                let read_error = |e| format!("cannot read {}: {e}", path.display());
+                let meta = file.metadata().map_err(read_error)?;
+                if !meta.is_file() {
+                    return Err(format!(
+                        "cannot read {}: not a regular file",
+                        path.display()
+                    ));
+                }
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).map_err(read_error)?;
                 let (bytes, bom) = match bytes.strip_prefix(b"\xef\xbb\xbf") {
                     Some(rest) => (rest, true),
                     None => (bytes.as_slice(), false),
@@ -191,17 +206,29 @@ impl Editor {
                     .map_err(|e| format!("{}: not valid UTF-8 ({e})", path.display()))?;
                 let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
                 let lines = text
-                    .split('\n')
-                    .map(|line| line.strip_suffix('\r').unwrap_or(line).to_owned())
+                    .split_inclusive('\n')
+                    .map(|line| {
+                        line.strip_suffix("\r\n")
+                            .or_else(|| line.strip_suffix('\n'))
+                            .unwrap_or(line)
+                            .to_owned()
+                    })
+                    .chain((text.is_empty() || text.ends_with('\n')).then(String::new))
                     .collect();
-                let stamp = std::fs::metadata(&path).ok().map(|m| Stamp::of(&m));
-                (lines, eol, bom, stamp)
+                (
+                    lines,
+                    eol,
+                    bom,
+                    Some(Stamp::of(&meta)),
+                    meta.permissions().mode() & 0o222 == 0,
+                )
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                (vec![String::new()], "\n", false, None)
+                (vec![String::new()], "\n", false, None, false)
             }
             Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
         };
+        let language = Language::of(&path);
         Ok(Self {
             path,
             target,
@@ -223,9 +250,9 @@ impl Editor {
             saved_at: Some(0),
             last_op: None,
             stamp,
-            force_overwrite: false,
-            confirm_close: false,
-            close_window: false,
+            overwrite: None,
+            language,
+            read_only,
             message: None,
             status_error: false,
         })
@@ -243,16 +270,24 @@ impl Editor {
         editor
     }
 
-    pub fn display_name(&self) -> String {
-        self.path.display().to_string()
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn target(&self) -> &Path {
+        &self.target
+    }
+
+    pub fn label(&self) -> String {
+        self.path
+            .file_name()
+            .unwrap_or(self.path.as_os_str())
+            .to_string_lossy()
+            .into_owned()
     }
 
     pub fn is_modified(&self) -> bool {
         self.saved_at != Some(self.undo.len())
-    }
-
-    pub fn is_confirming_close(&self) -> bool {
-        self.confirm_close
     }
 
     #[cfg(test)]
@@ -265,6 +300,7 @@ impl Editor {
         self.status_error = error;
     }
 
+    #[cfg(test)]
     pub fn text(&self) -> String {
         self.lines.join(self.eol)
     }
@@ -406,6 +442,9 @@ impl Editor {
     }
 
     fn record(&mut self, op: Op) {
+        if self.saved_at.is_some_and(|saved| saved > self.undo.len()) {
+            self.saved_at = None;
+        }
         let coalesce = self.anchor.is_none()
             && self.last_op == Some(op)
             && matches!(op, Op::Insert | Op::Backspace)
@@ -430,7 +469,7 @@ impl Editor {
         }
         self.redo.clear();
         self.last_op = Some(op);
-        self.force_overwrite = false;
+        self.overwrite = None;
         self.message = None;
         self.status_error = false;
         self.follow_cursor = true;
@@ -445,7 +484,7 @@ impl Editor {
 
     pub fn undo(&mut self) -> bool {
         self.last_op = None;
-        self.confirm_close = false;
+        self.overwrite = None;
         let Some(snapshot) = self.undo.pop() else {
             self.set_message("Nothing to undo", false);
             return false;
@@ -463,7 +502,7 @@ impl Editor {
 
     pub fn redo(&mut self) -> bool {
         self.last_op = None;
-        self.confirm_close = false;
+        self.overwrite = None;
         let Some(snapshot) = self.redo.pop() else {
             self.set_message("Nothing to redo", false);
             return false;
@@ -697,9 +736,6 @@ impl Editor {
         document: bool,
     ) {
         self.last_op = None;
-        if self.confirm_close && !matches!(direction, Direction::Left | Direction::Right) {
-            self.confirm_close = false;
-        }
         let old = self.cursor;
         if !extend
             && matches!(direction, Direction::Left | Direction::Up)
@@ -828,7 +864,6 @@ impl Editor {
         self.last_click = Some((time, position.row, x, y));
         self.goal_visual = None;
         self.last_op = None;
-        self.confirm_close = false;
         self.follow_cursor = true;
         if double_click {
             let (start, end) = self.word_bounds(position.row, position.col);
@@ -936,43 +971,175 @@ impl Editor {
     }
 
     fn status_text(&self) -> String {
-        if self.confirm_close {
-            return "Unsaved changes - Y save, N discard, C or Esc cancel".into();
-        }
-        let mut status = format!(
-            "{}{}   Ln {}, Col {}   UTF-8   Ctrl+S save | Esc terminal",
-            self.display_name(),
-            if self.is_modified() { " [+]" } else { "" },
+        let status = format!(
+            "{}  Ln {}, Col {}  {}{}  {}  |  {}",
+            self.language.name(),
             self.cursor.row + 1,
-            self.cursor.col + 1
+            self.cursor.col + 1,
+            if self.bom { "UTF-8 BOM " } else { "UTF-8 " },
+            if self.eol == "\r\n" { "CRLF" } else { "LF" },
+            if self.read_only {
+                "Read-only"
+            } else if self.stamp.is_none() {
+                "New"
+            } else {
+                "Edit"
+            },
+            self.label(),
         );
-        if let Some(message) = &self.message {
-            status.push_str("   | ");
-            status.push_str(message);
+        match &self.message {
+            Some(message) => format!("{message}  |  {status}"),
+            None => status,
         }
-        status
     }
 
-    fn slice_visual(line: &str, skip: usize, max_cells: usize) -> String {
+    fn slice_visual(
+        &self,
+        line: &str,
+        max_cells: usize,
+    ) -> (String, Vec<(std::ops::Range<usize>, Style)>) {
+        let skip = self.h_scroll;
         let mut visual = 0;
-        let mut out = String::new();
-        let mut used = 0;
-        for ch in line.chars() {
+        let mut start = 0;
+        let mut end = 0;
+        let mut leading_spaces = 0;
+        // Limit output from pathological runs of zero-width code points.
+        let byte_budget = max_cells.saturating_mul(16).saturating_add(128);
+        for (byte, ch) in line.char_indices() {
             let width = Self::char_width(ch);
             if visual < skip {
-                // A wide character that starts before the scroll offset is
-                // skipped completely.
-                visual += width;
-                continue;
-            }
-            if used >= max_cells {
+                start = byte + ch.len_utf8();
+                leading_spaces = (visual + width).saturating_sub(skip);
+            } else if byte - start >= byte_budget
+                || (visual >= skip.saturating_add(max_cells) && width > 0)
+            {
                 break;
             }
-            out.push(ch);
-            used += width;
+            end = byte + ch.len_utf8();
             visual += width;
         }
-        out
+        let styles = if start >= 8192 {
+            Vec::new()
+        } else {
+            self.language
+                .highlight(line, end)
+                .into_iter()
+                .filter(|(range, _)| range.end > start)
+                .map(|(range, style)| {
+                    let from = leading_spaces + range.start.saturating_sub(start);
+                    let to = leading_spaces + range.end - start;
+                    (from..to, style)
+                })
+                .collect()
+        };
+        let mut text = " ".repeat(leading_spaces);
+        text.push_str(&line[start..end]);
+        (text, styles)
+    }
+
+    /// Literal, case-sensitive search. Document positions remain character
+    /// indices, while Rust's substring search returns UTF-8 byte offsets.
+    pub fn find(&mut self, query: &str, backwards: bool) -> bool {
+        if query.is_empty() || query.contains('\n') {
+            return false;
+        }
+        let position = if backwards {
+            self.selection().map_or(self.cursor, |(start, _)| start)
+        } else {
+            self.cursor
+        };
+        let line = self.line(position.row);
+        let byte = byte_at(line, position.col);
+        let found = if backwards {
+            line[..byte]
+                .rfind(query)
+                .map(|i| (position.row, i))
+                .or_else(|| {
+                    (0..position.row)
+                        .rev()
+                        .find_map(|row| self.line(row).rfind(query).map(|i| (row, i)))
+                })
+                .or_else(|| {
+                    (position.row + 1..self.lines.len())
+                        .rev()
+                        .find_map(|row| self.line(row).rfind(query).map(|i| (row, i)))
+                })
+                .or_else(|| line[byte..].rfind(query).map(|i| (position.row, byte + i)))
+        } else {
+            line[byte..]
+                .find(query)
+                .map(|i| (position.row, byte + i))
+                .or_else(|| {
+                    (position.row + 1..self.lines.len())
+                        .find_map(|row| self.line(row).find(query).map(|i| (row, i)))
+                })
+                .or_else(|| {
+                    (0..position.row).find_map(|row| self.line(row).find(query).map(|i| (row, i)))
+                })
+                .or_else(|| line[..byte].find(query).map(|i| (position.row, i)))
+        };
+        let Some((row, byte)) = found else {
+            self.set_message("No match", false);
+            return false;
+        };
+        let col = self.line(row)[..byte].chars().count();
+        self.anchor = Some(Position { row, col });
+        self.cursor = Position {
+            row,
+            col: col + query.chars().count(),
+        };
+        self.last_op = None;
+        self.follow_cursor = true;
+        self.message = None;
+        self.status_error = false;
+        true
+    }
+
+    pub fn replace_match(&mut self, query: &str, replacement: &str) {
+        if query.is_empty() {
+            return;
+        }
+        if !self.selection_is(query) && !self.find(query, false) {
+            return;
+        }
+        self.record(Op::Other);
+        self.delete_selection();
+        self.insert_at_cursor(replacement);
+        self.set_message("Replaced 1 match", false);
+    }
+
+    fn selection_is(&self, query: &str) -> bool {
+        self.selection().is_some_and(|(start, end)| {
+            if start.row != end.row {
+                return false;
+            }
+            let line = self.line(start.row);
+            &line[byte_at(line, start.col)..byte_at(line, end.col)] == query
+        })
+    }
+
+    pub fn replace_all(&mut self, query: &str, replacement: &str) {
+        if query.is_empty() || query == replacement {
+            return;
+        }
+        let matches = self
+            .lines
+            .iter()
+            .map(|line| line.matches(query).count())
+            .sum::<usize>();
+        if matches == 0 {
+            self.set_message("No match", false);
+            return;
+        }
+        self.record(Op::Other);
+        for line in &mut self.lines {
+            if line.contains(query) {
+                *line = line.replace(query, replacement);
+            }
+        }
+        self.anchor = None;
+        self.clamp_cursor();
+        self.set_message(format!("Replaced {matches} matches"), false);
     }
 
     /// Layout the visible text rows. This mutates only viewport state.
@@ -1011,7 +1178,7 @@ impl Editor {
                 break;
             }
             let line = self.line(row);
-            let text = Self::slice_visual(line, self.h_scroll, text_columns);
+            let (text, styles) = self.slice_visual(line, text_columns);
             let selection_cells = selection.and_then(|(start, end)| {
                 if row < start.row || row > end.row {
                     return None;
@@ -1041,6 +1208,7 @@ impl Editor {
                 text,
                 selection: selection_cells,
                 current: row == self.cursor.row,
+                styles,
             });
         }
         let cursor = if self.cursor.row >= self.scroll && self.cursor.row < self.scroll + view_rows
@@ -1062,43 +1230,40 @@ impl Editor {
         EditorView {
             rows: view_rows_out,
             status: self.status_text(),
-            status_error: self.confirm_close || self.status_error,
+            status_error: self.status_error,
             gutter_cells,
             text_columns,
             status_row: view_rows,
             cursor,
+            chrome: Vec::new(),
+            text_offset: (0, 0),
+            columns,
         }
     }
 
+    pub fn save_for_close(&mut self) -> Result<(), String> {
+        self.overwrite = None;
+        self.save()
+    }
+
     pub fn save(&mut self) -> Result<(), String> {
-        self.confirm_close = false;
-        let exists = std::fs::metadata(&self.target).ok();
-        if let Some(meta) = &exists
-            && !meta.is_file()
-        {
-            return self.save_error(format!(
-                "cannot save {}: not a regular file",
-                self.path.display()
-            ));
-        }
-        if let Some(meta) = &exists {
-            use std::os::unix::fs::PermissionsExt;
-            if meta.permissions().mode() & 0o222 == 0 && !self.force_overwrite {
-                self.force_overwrite = true;
-                return self.save_error(format!(
-                    "{} is read-only; Ctrl+S again to overwrite",
-                    self.path.display()
-                ));
-            }
-        }
-        let changed = match self.stamp {
-            Some(stamp) => exists.as_ref().map(Stamp::of) != Some(stamp),
-            None => exists.is_some(),
+        let existing = match self.disk_metadata() {
+            Ok(existing) => existing,
+            Err(error) => return self.save_error(error),
         };
-        if changed && !self.force_overwrite {
-            self.force_overwrite = true;
+        let disk = existing.as_ref().map(Stamp::of);
+        let read_only = existing
+            .as_ref()
+            .is_some_and(|meta| meta.permissions().mode() & 0o222 == 0);
+        if (disk != self.stamp || read_only) && self.overwrite != Some(disk) {
+            self.overwrite = Some(disk);
+            let reason = if disk != self.stamp {
+                "changed on disk"
+            } else {
+                "is read-only"
+            };
             return self.save_error(format!(
-                "{} changed on disk; Ctrl+S again to overwrite",
+                "{} {reason}; Ctrl+S again to overwrite",
                 self.path.display()
             ));
         }
@@ -1107,46 +1272,82 @@ impl Editor {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let mut bytes = Vec::new();
-        if self.bom {
-            bytes.extend_from_slice(b"\xef\xbb\xbf");
-        }
-        bytes.extend_from_slice(self.text().as_bytes());
-        let result = (|| -> Result<(), String> {
+        let result = (|| -> Result<Stamp, String> {
             let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| {
                 format!("cannot create temporary file in {}: {e}", parent.display())
             })?;
-            temp.write_all(&bytes)
+            {
+                let mut writer = std::io::BufWriter::new(temp.as_file_mut());
+                let mut write = || -> std::io::Result<()> {
+                    if self.bom {
+                        writer.write_all(b"\xef\xbb\xbf")?;
+                    }
+                    for (index, line) in self.lines.iter().enumerate() {
+                        if index != 0 {
+                            writer.write_all(self.eol.as_bytes())?;
+                        }
+                        writer.write_all(line.as_bytes())?;
+                    }
+                    writer.flush()
+                };
+                write().map_err(|e| format!("cannot write {}: {e}", self.path.display()))?;
+            }
+            let permissions = existing.as_ref().map_or_else(
+                || std::fs::Permissions::from_mode(0o644),
+                |meta| meta.permissions(),
+            );
+            temp.as_file()
+                .set_permissions(permissions)
                 .and_then(|()| temp.as_file().sync_all())
-                .map_err(|e| format!("cannot write {}: {e}", self.path.display()))?;
-            let permissions = exists
-                .as_ref()
-                .map(|meta| meta.permissions())
-                .unwrap_or_else(|| {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::Permissions::from_mode(0o644)
-                });
-            std::fs::set_permissions(temp.path(), permissions)
-                .map_err(|e| format!("cannot set permissions: {e}"))?;
-            temp.persist(&self.target)
-                .map_err(|e| format!("cannot replace {}: {}", self.path.display(), e.error))?;
+                .map_err(|e| format!("cannot sync {}: {e}", self.path.display()))?;
+            if self.disk_metadata()?.as_ref().map(Stamp::of) != disk {
+                return Err(format!(
+                    "{} changed during save; try Ctrl+S again",
+                    self.path.display()
+                ));
+            }
+            let persisted = if disk.is_some() {
+                temp.persist(&self.target)
+            } else {
+                temp.persist_noclobber(&self.target)
+            }
+            .map_err(|e| format!("cannot replace {}: {}", self.path.display(), e.error))?;
             if let Ok(directory) = std::fs::File::open(parent) {
                 let _ = directory.sync_all();
             }
-            Ok(())
+            persisted
+                .metadata()
+                .map(|meta| Stamp::of(&meta))
+                .map_err(|error| {
+                    format!("saved but cannot verify {}: {error}", self.path.display())
+                })
         })();
         match result {
-            Ok(()) => {
-                self.stamp = std::fs::metadata(&self.target)
-                    .ok()
-                    .map(|meta| Stamp::of(&meta));
+            Ok(stamp) => {
+                self.stamp = Some(stamp);
+                self.read_only = read_only;
                 self.saved_at = Some(self.undo.len());
                 self.last_op = None;
-                self.force_overwrite = false;
+                self.overwrite = None;
                 self.set_message("Saved", false);
                 Ok(())
             }
-            Err(error) => self.save_error(error),
+            Err(error) => {
+                self.overwrite = None;
+                self.save_error(error)
+            }
+        }
+    }
+
+    fn disk_metadata(&self) -> Result<Option<std::fs::Metadata>, String> {
+        match std::fs::symlink_metadata(&self.target) {
+            Ok(meta) if meta.is_file() => Ok(Some(meta)),
+            Ok(_) => Err(format!(
+                "cannot save {}: not a regular file",
+                self.path.display()
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("cannot inspect {}: {error}", self.path.display())),
         }
     }
 
@@ -1156,39 +1357,6 @@ impl Editor {
     }
 
     pub fn handle(&mut self, command: Command) -> Effect {
-        if self.confirm_close {
-            return match command {
-                Command::ConfirmCancel | Command::Escape => {
-                    self.confirm_close = false;
-                    self.close_window = false;
-                    self.message = None;
-                    self.status_error = false;
-                    Effect::Changed
-                }
-                Command::ConfirmDiscard => {
-                    self.confirm_close = false;
-                    if self.close_window {
-                        Effect::CloseWindow
-                    } else {
-                        Effect::Close
-                    }
-                }
-                Command::ConfirmSave => match self.save() {
-                    Ok(()) => {
-                        if self.close_window {
-                            Effect::CloseWindow
-                        } else {
-                            Effect::Close
-                        }
-                    }
-                    Err(_) => {
-                        self.confirm_close = false;
-                        Effect::Changed
-                    }
-                },
-                _ => Effect::None,
-            };
-        }
         match command {
             Command::Insert(text) => {
                 if self.insert_text(&text) {
@@ -1239,32 +1407,11 @@ impl Editor {
                 }
             },
             Command::PasteRequest => Effect::PasteRequest,
-            Command::Escape => {
-                if self.is_modified() {
-                    self.confirm_close = true;
-                    self.close_window = false;
-                    self.message = None;
-                    self.status_error = true;
-                    Effect::Changed
-                } else {
-                    Effect::Close
-                }
-            }
             Command::Enter => changed(self.enter()),
-            Command::ConfirmCancel | Command::ConfirmDiscard | Command::ConfirmSave => Effect::None,
-        }
-    }
-
-    /// Handle window-close requests. Returns true when the window may close.
-    pub fn request_close(&mut self) -> bool {
-        if self.is_modified() {
-            self.confirm_close = true;
-            self.close_window = true;
-            self.message = None;
-            self.status_error = true;
-            false
-        } else {
-            true
+            Command::Escape
+            | Command::ConfirmCancel
+            | Command::ConfirmDiscard
+            | Command::ConfirmSave => Effect::None,
         }
     }
 }
@@ -1275,6 +1422,12 @@ fn changed(changed: bool) -> Effect {
     } else {
         Effect::None
     }
+}
+
+fn byte_at(line: &str, col: usize) -> usize {
+    line.char_indices()
+        .nth(col)
+        .map_or(line.len(), |(byte, _)| byte)
 }
 
 fn chars_slice(line: &str, from: usize, to: usize) -> String {
@@ -1290,24 +1443,98 @@ fn sanitize(text: &str) -> String {
         .collect()
 }
 
-fn target_for(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path)
-        .unwrap_or_else(|_| std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()))
+pub fn target_for(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        if let Some((parent, name)) = path.parent().zip(path.file_name())
+            && let Ok(parent) = std::fs::canonicalize(if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            })
+        {
+            return parent.join(name);
+        }
+        std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn editor(text: &str) -> Editor {
-        let mut editor = Editor::from_text("<test>", text);
+    fn editor(text: &str) -> Document {
+        let mut editor = Document::from_text("<test>", text);
         editor.lines = text.split('\n').map(str::to_owned).collect();
         editor
     }
 
-    fn set_cursor(editor: &mut Editor, row: usize, col: usize) {
+    fn set_cursor(editor: &mut Document, row: usize, col: usize) {
         editor.cursor = Position { row, col };
         editor.follow_cursor = true;
+    }
+
+    #[test]
+    fn edit_after_undo_invalidates_the_saved_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.txt");
+        let mut doc = Document::open(&path).unwrap();
+        doc.insert_text("original");
+        doc.save().unwrap();
+        doc.undo();
+        assert!(doc.is_modified());
+        doc.insert_text("new text");
+        assert!(doc.is_modified());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+    }
+
+    #[test]
+    fn overwrite_confirmation_expires_on_a_second_external_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conflict.txt");
+        std::fs::write(&path, "initial").unwrap();
+        let mut doc = Document::open(&path).unwrap();
+        doc.insert_text("ours ");
+        std::fs::write(&path, "theirs").unwrap();
+        assert!(doc.save().is_err());
+        std::fs::write(&path, "theirs once more").unwrap();
+        assert!(doc.save().is_err());
+        assert!(doc.is_modified());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs once more");
+        doc.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ours initial");
+    }
+
+    #[test]
+    fn literal_unicode_search_wraps_and_replace_all_is_one_undo() {
+        let mut doc = editor("a 世界 b 世界\nслово 世界");
+        assert!(doc.find("世界", false));
+        assert_eq!(doc.cursor(), Position { row: 0, col: 4 });
+        assert!(doc.find("世界", true));
+        assert_eq!(doc.cursor(), Position { row: 1, col: 8 });
+        doc.replace_all("世界", "мир");
+        assert_eq!(doc.text(), "a мир b мир\nслово мир");
+        assert!(doc.undo());
+        assert_eq!(doc.text(), "a 世界 b 世界\nслово 世界");
+    }
+
+    #[test]
+    fn large_document_layout_only_returns_visible_rows_and_styles() {
+        let text = format!(
+            "{}\n{}",
+            "let β = 42;\n".repeat(100_000),
+            "x".repeat(1_000_000)
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.rs");
+        std::fs::write(&path, &text).unwrap();
+        let mut doc = Document::open(&path).unwrap();
+        set_cursor(&mut doc, 99_999, 0);
+        let view = doc.view(70, 30);
+        assert_eq!(view.rows.len(), 29);
+        assert_eq!(view.rows.last().unwrap().styles.len(), 2);
+        set_cursor(&mut doc, 100_001, 0);
+        let view = doc.view(70, 30);
+        assert!(view.rows.last().unwrap().text.len() < 70);
     }
 
     #[test]
@@ -1552,92 +1779,6 @@ mod tests {
     }
 
     #[test]
-    fn escape_opens_warning_and_c_or_esc_cancel_it() {
-        let mut editor = editor("text");
-        editor.insert_char('x');
-        assert_eq!(editor.handle(Command::Escape), Effect::Changed);
-        assert!(editor.is_confirming_close());
-        assert_eq!(editor.handle(Command::ConfirmCancel), Effect::Changed);
-        assert!(!editor.is_confirming_close());
-        assert_eq!(editor.handle(Command::Escape), Effect::Changed);
-        assert_eq!(editor.handle(Command::Escape), Effect::Changed);
-        assert!(!editor.is_confirming_close());
-        assert_eq!(editor.handle(Command::Escape), Effect::Changed);
-        assert_eq!(editor.handle(Command::ConfirmDiscard), Effect::Close);
-    }
-
-    #[test]
-    fn warning_keys_are_not_typed_while_confirmation_is_open() {
-        let mut editor = editor("text");
-        editor.insert_char('x');
-        assert_eq!(editor.handle(Command::Escape), Effect::Changed);
-        assert_eq!(editor.handle(Command::Insert("y".into())), Effect::None);
-        assert_eq!(editor.text(), "xtext");
-        assert!(editor.is_confirming_close());
-    }
-
-    #[test]
-    fn confirm_save_exits_and_reports_save_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.txt");
-        std::fs::write(&path, "text").unwrap();
-        let mut editor = Editor::open(&path).unwrap();
-        editor.insert_text("changed");
-        assert_eq!(editor.handle(Command::Escape), Effect::Changed);
-        assert_eq!(editor.handle(Command::ConfirmSave), Effect::Close);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "changedtext");
-
-        editor.insert_text("!");
-        assert_eq!(editor.handle(Command::Escape), Effect::Changed);
-        editor.target = dir.path().join("missing").join("file.txt");
-        assert_eq!(editor.handle(Command::ConfirmSave), Effect::Changed);
-        assert!(!editor.is_confirming_close());
-        assert!(editor.message().is_some());
-    }
-
-    #[test]
-    fn clean_editor_closes_immediately() {
-        let mut editor = editor("text");
-        assert_eq!(editor.handle(Command::Escape), Effect::Close);
-        assert!(editor.request_close());
-    }
-
-    #[test]
-    fn window_close_is_refused_until_confirmed() {
-        let mut editor = editor("text");
-        editor.insert_char('x');
-        assert!(!editor.request_close());
-        assert!(editor.is_confirming_close());
-        assert_eq!(editor.handle(Command::ConfirmDiscard), Effect::CloseWindow);
-    }
-
-    #[test]
-    fn window_close_confirm_save_writes_and_closes_window() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.txt");
-        std::fs::write(&path, "text").unwrap();
-        let mut editor = Editor::open(&path).unwrap();
-        editor.insert_text("changed");
-        assert!(!editor.request_close());
-        assert_eq!(editor.handle(Command::ConfirmSave), Effect::CloseWindow);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "changedtext");
-    }
-
-    #[test]
-    fn window_close_save_error_keeps_window_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file.txt");
-        std::fs::write(&path, "text").unwrap();
-        let mut editor = Editor::open(&path).unwrap();
-        editor.insert_text("changed");
-        assert!(!editor.request_close());
-        editor.target = dir.path().join("missing").join("file.txt");
-        assert_eq!(editor.handle(Command::ConfirmSave), Effect::Changed);
-        assert!(!editor.is_confirming_close());
-        assert!(editor.message().is_some());
-    }
-
-    #[test]
     fn cut_and_copy_report_selected_text() {
         let mut editor = editor("alpha beta");
         set_cursor(&mut editor, 0, 6);
@@ -1659,7 +1800,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file.txt");
         std::fs::write(&path, b"\xef\xbb\xbfone\r\ntwo\r\n").unwrap();
-        let mut editor = Editor::open(&path).unwrap();
+        let mut editor = Document::open(&path).unwrap();
         assert_eq!(editor.text(), "one\r\ntwo\r\n");
         set_cursor(&mut editor, 2, 0);
         assert!(editor.insert_text("three"));
@@ -1673,7 +1814,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.txt");
         std::fs::write(&path, b"\xff\xfe").unwrap();
-        let error = Editor::open(&path).err().unwrap();
+        let error = Document::open(&path).err().unwrap();
         assert!(error.contains("not valid UTF-8"), "{error}");
     }
 
@@ -1681,7 +1822,7 @@ mod tests {
     fn creates_missing_file_on_save() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("new.txt");
-        let mut editor = Editor::open(&path).unwrap();
+        let mut editor = Document::open(&path).unwrap();
         editor.insert_text("hello");
         editor.save().unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
@@ -1693,7 +1834,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file.txt");
         std::fs::write(&path, "original").unwrap();
-        let mut editor = Editor::open(&path).unwrap();
+        let mut editor = Document::open(&path).unwrap();
         editor.insert_text("edited");
         std::fs::write(&path, "external").unwrap();
         let error = editor.save().unwrap_err();
@@ -1710,7 +1851,7 @@ mod tests {
         let path = dir.path().join("readonly.txt");
         std::fs::write(&path, "original").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
-        let mut editor = Editor::open(&path).unwrap();
+        let mut editor = Document::open(&path).unwrap();
         editor.insert_text("new");
         let error = editor.save().unwrap_err();
         assert!(error.contains("read-only"), "{error}");
@@ -1726,7 +1867,7 @@ mod tests {
         let path = dir.path().join("script.sh");
         std::fs::write(&path, "echo hi\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
-        let mut editor = Editor::open(&path).unwrap();
+        let mut editor = Document::open(&path).unwrap();
         editor.insert_text("# changed\n");
         editor.save().unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -1738,7 +1879,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("file.txt");
         std::fs::write(&path, "original").unwrap();
-        let mut editor = Editor::open(&path).unwrap();
+        let mut editor = Document::open(&path).unwrap();
         editor.insert_text("new");
         // Replacing a file inside a non-existent parent fails after loading.
         editor.target = dir.path().join("missing").join("file.txt");
@@ -1749,7 +1890,7 @@ mod tests {
     #[test]
     fn saving_a_directory_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let error = Editor::open(dir.path()).err().unwrap();
+        let error = Document::open(dir.path()).err().unwrap();
         assert!(error.contains("cannot read"), "{error}");
         let mut editor = editor("x");
         editor.path = dir.path().to_path_buf();

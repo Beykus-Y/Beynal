@@ -166,3 +166,71 @@ fn cli_edit_validates_arguments_and_files() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("cannot read"));
 }
+
+#[test]
+fn bedit_launcher_and_symlink_dispatch_identically() {
+    let dir = tempfile::tempdir().unwrap();
+    let alias = dir.path().join("bedit");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_beyrix"), &alias).unwrap();
+    for path in [std::path::PathBuf::from(env!("CARGO_BIN_EXE_bedit")), alias] {
+        let help = Command::new(&path)
+            .arg("--help")
+            .env("BEYRIX_CONTROL_SOCKET", "/unavailable")
+            .output()
+            .unwrap();
+        assert!(help.status.success());
+        assert!(String::from_utf8_lossy(&help.stdout).contains("Usage: bedit"));
+        assert!(
+            !Command::new(path)
+                .arg("--bad-option")
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+}
+
+#[test]
+fn bedit_sends_project_and_multiple_native_paths_to_current_window() {
+    use std::{
+        ffi::OsString,
+        os::unix::{ffi::OsStringExt, net::UnixDatagram},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("control.sock");
+    let server = UnixDatagram::bind(&socket).unwrap();
+    server
+        .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .unwrap();
+    let raw = OsString::from_vec(b"native-\xff.rs".to_vec());
+    for args in [
+        vec![],
+        vec![OsString::from(".")],
+        vec![
+            OsString::from("."),
+            raw.clone(),
+            OsString::from("second.rs"),
+        ],
+        vec![raw.clone()],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_bedit"))
+            .current_dir(dir.path())
+            .env("BEYRIX_CONTROL_SOCKET", &socket)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        let mut packet = [0; 4096];
+        let bytes = server.recv(&mut packet).unwrap();
+        let mut expected = b"bedit:".to_vec();
+        if args.is_empty() || args[0] == "." {
+            expected.extend_from_slice(dir.path().as_os_str().as_encoded_bytes());
+        }
+        for arg in args.into_iter().filter(|arg| arg != ".") {
+            expected.push(0);
+            expected.extend_from_slice(dir.path().join(arg).as_os_str().as_encoded_bytes());
+        }
+        assert_eq!(&packet[..bytes], expected);
+    }
+}

@@ -13,15 +13,32 @@ use std::{
     path::PathBuf,
 };
 
-pub const MAX_MESSAGE: usize = 4096;
+use crate::bedit::OpenRequest;
+
+pub const MAX_MESSAGE: usize = 65536;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Message {
     Theme(String),
     Open(PathBuf),
+    Workspace(OpenRequest),
 }
 
 fn parse(bytes: &[u8]) -> Option<Message> {
+    if let Some(rest) = bytes.strip_prefix(b"bedit:") {
+        let mut fields = rest.split(|byte| *byte == 0);
+        let absolute = |bytes: &[u8]| {
+            let path = PathBuf::from(OsString::from_vec(bytes.to_vec()));
+            path.is_absolute().then_some(path)
+        };
+        let root = match fields.next()? {
+            [] => None,
+            name => Some(absolute(name)?),
+        };
+        let files: Vec<_> = fields.map(absolute).collect::<Option<_>>()?;
+        return (root.is_some() || !files.is_empty())
+            .then_some(Message::Workspace(OpenRequest { root, files }));
+    }
     if let Some(rest) = bytes.strip_prefix(b"open:") {
         if rest.is_empty() {
             return None;
@@ -67,9 +84,10 @@ impl Control {
     }
 
     pub fn receive(&self) -> io::Result<Option<Message>> {
-        let mut bytes = [0u8; MAX_MESSAGE];
+        let mut bytes = [0u8; MAX_MESSAGE + 1];
         match self.socket.recv(&mut bytes) {
-            Ok(n) => Ok(parse(&bytes[..n])),
+            Ok(n) if n <= MAX_MESSAGE => Ok(parse(&bytes[..n])),
+            Ok(_) => Err(io::Error::other("control message is too long")),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(e),
         }
@@ -96,6 +114,24 @@ pub fn notify_open(path: &std::path::Path, file: &std::path::Path) -> io::Result
     message.extend_from_slice(file.as_os_str().as_bytes());
     if message.len() > MAX_MESSAGE {
         return Err(io::Error::other("path is too long"));
+    }
+    UnixDatagram::unbound()?.send_to(&message, path)?;
+    Ok(())
+}
+
+pub fn notify_workspace(path: &std::path::Path, request: &OpenRequest) -> io::Result<()> {
+    let mut message = b"bedit:".to_vec();
+    if let Some(root) = &request.root {
+        message.extend_from_slice(root.as_os_str().as_bytes());
+    }
+    for file in &request.files {
+        message.push(0);
+        message.extend_from_slice(file.as_os_str().as_bytes());
+    }
+    if message.len() > MAX_MESSAGE {
+        return Err(io::Error::other(
+            "too many or too long paths for the running window",
+        ));
     }
     UnixDatagram::unbound()?.send_to(&message, path)?;
     Ok(())

@@ -2,6 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+mod bedit;
 mod compat;
 mod control;
 mod editor;
@@ -9,10 +10,12 @@ mod gl;
 mod gpu;
 mod keyboard;
 mod mouse;
+mod project;
 mod prompt;
 mod pty;
 mod render;
 mod selection;
+mod syntax;
 mod terminal;
 mod theme;
 mod wayland;
@@ -57,7 +60,29 @@ impl Drop for RawMode {
 }
 
 fn main() -> std::process::ExitCode {
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let mut args = std::env::args_os();
+    let is_bedit = args.next().is_some_and(|name| {
+        std::path::Path::new(&name).file_name() == Some(std::ffi::OsStr::new("bedit"))
+    });
+    let args: Vec<_> = args.collect();
+    if is_bedit {
+        return match run_bedit(&args) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("bedit: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+    if args.len() == 2 && args[0] == "edit" {
+        return match edit_file(std::path::Path::new(&args[1])) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("beyrix: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     let Some(args) = args
         .iter()
         .map(|arg| arg.to_str())
@@ -113,7 +138,6 @@ fn run(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
         [] if crate::compat::env("BEYRIX_CONTROL_SOCKET").is_some() => print_help(),
         [] | ["open"] => wayland::run()?,
         ["--pty"] => run_pty()?,
-        ["edit", file] => edit_file(file)?,
         ["edit", ..] => return Err("usage: beyrix edit FILE".into()),
         ["theme"] => {
             let active = crate::compat::env("BEYRIX_PROMPT_THEME")
@@ -183,23 +207,66 @@ fn run(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn edit_file(file: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::path::PathBuf::from(file);
-    // Validate before creating a window or talking to a running one, so CLI
-    // errors (missing permissions, invalid UTF-8, directories) are immediate.
-    editor::Editor::open(&path)?;
-    if let Some(socket) = crate::compat::env("BEYRIX_CONTROL_SOCKET") {
-        match control::notify_open(std::path::Path::new(&socket), &path) {
-            Ok(()) => {
-                println!("Opened {} in the running Beyrix window", path.display());
-                return Ok(());
+fn run_bedit(args: &[std::ffi::OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut options = true;
+    let mut paths = Vec::new();
+    for arg in args {
+        if options {
+            match arg.to_str() {
+                Some("-h" | "--help") => {
+                    println!(
+                        "BEdit · Beyrix code editor\n\nUsage: bedit [--] [DIRECTORY] [FILE ...]\n\nWithout arguments, opens the current directory. Files open in tabs.\nIn Beyrix, opens in the current window.\n\nCtrl+P Open   Ctrl+Tab Switch tab   Ctrl+B Explorer\nCtrl+F Find   Ctrl+H Replace       Ctrl+S Save   Ctrl+W Close tab"
+                    );
+                    return Ok(());
+                }
+                Some("--") => {
+                    options = false;
+                    continue;
+                }
+                Some(flag) if flag.starts_with('-') => {
+                    return Err(format!("unknown option {flag:?}. See bedit --help").into());
+                }
+                _ => {}
             }
+        }
+        paths.push(std::path::PathBuf::from(arg));
+    }
+    let request = bedit::OpenRequest::from_paths(&paths)?;
+    launch_editor(request, false)
+}
+
+fn edit_file(file: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let file = std::path::absolute(file)?;
+    launch_editor(
+        bedit::OpenRequest {
+            root: None,
+            files: vec![file],
+        },
+        true,
+    )
+}
+
+fn launch_editor(
+    request: bedit::OpenRequest,
+    legacy: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(socket) = crate::compat::env("BEYRIX_CONTROL_SOCKET") {
+        let socket = std::path::Path::new(&socket);
+        // Preserve immediate CLI validation for the one-file legacy command.
+        let sent = if legacy {
+            editor::Document::open(&request.files[0])?;
+            control::notify_open(socket, &request.files[0])
+        } else {
+            control::notify_workspace(socket, &request)
+        };
+        match sent {
+            Ok(()) => return Ok(()),
             Err(error) => {
-                eprintln!("beyrix: running window unavailable ({error}); starting a new window")
+                eprintln!("BEdit: running window unavailable ({error}); starting a new window")
             }
         }
     }
-    wayland::run_editor(path)?;
+    wayland::run_editor(bedit::BEdit::open(request)?)?;
     Ok(())
 }
 

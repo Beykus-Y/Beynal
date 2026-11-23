@@ -460,6 +460,7 @@ impl Renderer {
         clip: (isize, isize),
         foreground: [u8; 3],
         selection: Option<(usize, usize)>,
+        styles: &[(std::ops::Range<usize>, crate::syntax::Style)],
         selection_foreground: [u8; 3],
         pixels: &mut [u8],
         width: usize,
@@ -468,15 +469,27 @@ impl Renderer {
     ) {
         let mut cell = 0isize;
         let mut last_left = x;
-        for ch in text.chars() {
+        let mut styles = styles.iter().peekable();
+        for (byte, ch) in text.char_indices() {
             let advance = cell_advance(ch) as isize;
             let cell_left = x + cell * cell_width as isize;
-            let color = if selection
-                .is_some_and(|(start, end)| cell >= start as isize && cell < end as isize)
-            {
+            while styles.peek().is_some_and(|(range, _)| range.end <= byte) {
+                styles.next();
+            }
+            let selection_cell = if advance == 0 {
+                (last_left - x) / cell_width as isize
+            } else {
+                cell
+            };
+            let color = if selection.is_some_and(|(start, end)| {
+                selection_cell >= start as isize && selection_cell < end as isize
+            }) {
                 selection_foreground
             } else {
-                foreground
+                styles
+                    .peek()
+                    .filter(|(range, _)| range.contains(&byte))
+                    .map_or(foreground, |(_, style)| syntax_color(&self.theme, *style))
             };
             if advance == 0 {
                 self.blit_glyph(
@@ -555,15 +568,51 @@ impl Renderer {
         ];
         let foreground = self.theme.foreground;
         let dim = self.theme.ansi[8];
-        let text_x = padding as isize + (view.gutter_cells * cell_width) as isize;
+        let (offset_x, offset_y) = view.text_offset;
+        let body_left = (padding + offset_x * cell_width).min(width) as isize;
+        let body_top = (padding + offset_y * cell_height) as isize;
+        let window_right = width.saturating_sub(padding) as isize;
+        let text_x = (body_left + (view.gutter_cells * cell_width) as isize).min(window_right);
+        let bar_right =
+            (padding + view.columns * cell_width).min(width.saturating_sub(padding)) as isize;
         let text_right = (text_x + (view.text_columns * cell_width) as isize)
             .min(width.saturating_sub(padding) as isize);
         pixels.resize(width * height * 4, 0);
         for pixel in pixels.as_chunks_mut::<4>().0.iter_mut() {
             pixel.copy_from_slice(&bg);
         }
+        for item in &view.chrome {
+            let left = (padding + item.col * cell_width) as isize;
+            let top = (padding + item.row * cell_height) as isize;
+            let right = (left + (item.width * cell_width) as isize).min(window_right);
+            let (background, foreground) = chrome_colors(&self.theme, item.tone);
+            let bg = [background[2], background[1], background[0], 255];
+            for y in top..(top + cell_height as isize).min(height as isize) {
+                for x in left..right {
+                    let offset = (y as usize * width + x as usize) * 4;
+                    pixels[offset..offset + 4].copy_from_slice(&bg);
+                }
+            }
+            self.draw_text(
+                &item.text,
+                left,
+                top,
+                cell_width,
+                cell_height,
+                baseline,
+                (left, right),
+                foreground,
+                None,
+                &[],
+                foreground,
+                pixels,
+                width,
+                height,
+                padding,
+            );
+        }
         for (index, row) in view.rows.iter().enumerate() {
-            let top = padding as isize + (index * cell_height) as isize;
+            let top = body_top + (index * cell_height) as isize;
             if top >= (height.saturating_sub(padding)) as isize {
                 break;
             }
@@ -585,14 +634,15 @@ impl Renderer {
             let gutter_fg = if row.current { foreground } else { dim };
             self.draw_text(
                 &row.gutter,
-                padding as isize,
+                body_left,
                 top,
                 cell_width,
                 cell_height,
                 baseline,
-                (padding as isize, text_x),
+                (body_left, text_x),
                 gutter_fg,
                 None,
+                &[],
                 self.theme.selection_foreground,
                 pixels,
                 width,
@@ -609,6 +659,7 @@ impl Renderer {
                 (text_x, text_right),
                 foreground,
                 row.selection,
+                &row.styles,
                 self.theme.selection_foreground,
                 pixels,
                 width,
@@ -629,7 +680,7 @@ impl Renderer {
                 selected_bg
             };
             for py in bar_top..(bar_top + cell_height as isize).min(height as isize) {
-                for px in padding as isize..text_right {
+                for px in padding as isize..bar_right {
                     if px >= 0 && py >= 0 {
                         pixels[(py as usize * width + px as usize) * 4
                             ..(py as usize * width + px as usize) * 4 + 4]
@@ -644,9 +695,10 @@ impl Renderer {
                 cell_width,
                 cell_height,
                 baseline,
-                (padding as isize, text_right),
+                (padding as isize, bar_right),
                 self.theme.selection_foreground,
                 None,
+                &[],
                 self.theme.selection_foreground,
                 pixels,
                 width,
@@ -659,7 +711,7 @@ impl Renderer {
             && (!self.theme.cursor_blink || blink_on)
         {
             let left = text_x + column as isize * cell_width as isize;
-            let top = padding as isize + row as isize * cell_height as isize;
+            let top = body_top + row as isize * cell_height as isize;
             let right = (left + cells.max(1) as isize * cell_width as isize).min(text_right);
             for py in top..(top + cell_height as isize).min(height.saturating_sub(padding) as isize)
             {
@@ -1004,7 +1056,12 @@ impl Renderer {
         let padding = base.padding as f32 * scale;
         let baseline = base.baseline as f32 * scale;
         let px_size = (self.theme.font_size * scale).max(1.0);
-        let text_x = padding + view.gutter_cells as f32 * cell_w;
+        let (offset_x, offset_y) = view.text_offset;
+        let body_left = padding + offset_x as f32 * cell_w;
+        let body_top = padding + offset_y as f32 * cell_h;
+        let window_right = width - padding;
+        let text_x = (body_left + view.gutter_cells as f32 * cell_w).min(window_right);
+        let bar_right = (padding + view.columns as f32 * cell_w).min(window_right);
         let text_right = (text_x + view.text_columns as f32 * cell_w).min(width - padding);
         let background = rgba(self.theme.background);
         let cursor_color = rgba(self.theme.cursor);
@@ -1016,8 +1073,41 @@ impl Renderer {
             background,
             ..Default::default()
         };
+        for item in &view.chrome {
+            let left = padding + item.col as f32 * cell_w;
+            let top = padding + item.row as f32 * cell_h;
+            let right = (left + item.width as f32 * cell_w).min(window_right);
+            let bottom = (top + cell_h).min(height);
+            if right <= left || bottom <= top {
+                continue;
+            }
+            let (background, foreground) = chrome_colors(&self.theme, item.tone);
+            scene.rects.push(SceneRect {
+                x: left,
+                y: top,
+                w: right - left,
+                h: bottom - top,
+                color: rgba(background),
+            });
+            self.push_text_scene(
+                &mut scene,
+                &item.text,
+                left,
+                top,
+                cell_w,
+                cell_h,
+                baseline,
+                left,
+                right,
+                rgba(foreground),
+                None,
+                &[],
+                rgba(foreground),
+                px_size,
+            );
+        }
         for (index, row) in view.rows.iter().enumerate() {
-            let top = padding + index as f32 * cell_h;
+            let top = body_top + index as f32 * cell_h;
             if top >= (height - padding) {
                 break;
             }
@@ -1039,15 +1129,16 @@ impl Renderer {
             self.push_text_scene(
                 &mut scene,
                 &row.gutter,
-                padding,
+                body_left,
                 top,
                 cell_w,
                 cell_h,
                 baseline,
-                padding,
+                body_left,
                 text_x,
                 gutter_fg,
                 None,
+                &[],
                 selection_foreground,
                 px_size,
             );
@@ -1063,6 +1154,7 @@ impl Renderer {
                 text_right,
                 foreground,
                 row.selection,
+                &row.styles,
                 selection_foreground,
                 px_size,
             );
@@ -1078,7 +1170,7 @@ impl Renderer {
             scene.rects.push(SceneRect {
                 x: padding,
                 y: bar_top,
-                w: (text_right - padding).max(0.0),
+                w: (bar_right - padding).max(0.0),
                 h: bar_bottom - bar_top,
                 color: bar_bg,
             });
@@ -1091,9 +1183,10 @@ impl Renderer {
                 cell_h,
                 baseline,
                 padding,
-                text_right,
+                bar_right,
                 selection_foreground,
                 None,
+                &[],
                 selection_foreground,
                 px_size,
             );
@@ -1103,7 +1196,7 @@ impl Renderer {
             && (!self.theme.cursor_blink || blink_on)
         {
             let left = text_x + column as f32 * cell_w;
-            let top = padding + row as f32 * cell_h;
+            let top = body_top + row as f32 * cell_h;
             let right = (left + cells.max(1) as f32 * cell_w).min(text_right);
             let bottom = (top + cell_h).min(height - padding);
             match self.theme.cursor_shape {
@@ -1160,21 +1253,36 @@ impl Renderer {
         clip_right: f32,
         foreground: [f32; 4],
         selection: Option<(usize, usize)>,
+        styles: &[(std::ops::Range<usize>, crate::syntax::Style)],
         selection_foreground: [f32; 4],
         px_size: f32,
     ) {
         let mut cell = 0isize;
         let mut last_left = x;
         let bottom = top + cell_h;
-        for ch in text.chars() {
+        let mut styles = styles.iter().peekable();
+        for (byte, ch) in text.char_indices() {
             let advance = cell_advance(ch) as isize;
             let cell_left = x + cell as f32 * cell_w;
-            let color = if selection
-                .is_some_and(|(start, end)| cell >= start as isize && cell < end as isize)
-            {
+            while styles.peek().is_some_and(|(range, _)| range.end <= byte) {
+                styles.next();
+            }
+            let selection_cell = if advance == 0 {
+                ((last_left - x) / cell_w).round() as isize
+            } else {
+                cell
+            };
+            let color = if selection.is_some_and(|(start, end)| {
+                selection_cell >= start as isize && selection_cell < end as isize
+            }) {
                 selection_foreground
             } else {
-                foreground
+                styles
+                    .peek()
+                    .filter(|(range, _)| range.contains(&byte))
+                    .map_or(foreground, |(_, style)| {
+                        rgba(syntax_color(&self.theme, *style))
+                    })
             };
             if advance == 0 {
                 self.push_scene_glyph(
@@ -1205,6 +1313,33 @@ impl Renderer {
             }
             cell += advance;
         }
+    }
+}
+
+fn syntax_color(theme: &crate::theme::Theme, style: crate::syntax::Style) -> [u8; 3] {
+    use crate::syntax::Style;
+    theme.ansi[match style {
+        Style::Comment => 8,
+        Style::Keyword => 12,
+        Style::String => 10,
+        Style::Number => 11,
+    }]
+}
+
+fn chrome_colors(theme: &crate::theme::Theme, tone: crate::bedit::Tone) -> ([u8; 3], [u8; 3]) {
+    use crate::bedit::Tone;
+    let blend = |weight: u16| {
+        std::array::from_fn(|i| {
+            ((u16::from(theme.background[i]) * (100 - weight)
+                + u16::from(theme.foreground[i]) * weight)
+                / 100) as u8
+        })
+    };
+    match tone {
+        Tone::Panel => (blend(11), theme.foreground),
+        Tone::Active => (theme.selection, theme.selection_foreground),
+        Tone::Muted => (blend(6), theme.foreground),
+        Tone::Accent => (blend(16), theme.ansi[14]),
     }
 }
 
@@ -1406,7 +1541,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("demo.txt");
         std::fs::write(&path, "hello\n世界").unwrap();
-        let mut editor = crate::editor::Editor::open(&path).unwrap();
+        let mut editor = crate::editor::Document::open(&path).unwrap();
         editor.insert_char('!');
         let view = editor.view(40, 6);
         let mut renderer = Renderer::new().unwrap();
@@ -1576,7 +1711,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("scene.txt");
         std::fs::write(&path, "first line\n世界 second\nthird").unwrap();
-        let mut editor = crate::editor::Editor::open(&path).unwrap();
+        let mut editor = crate::editor::Document::open(&path).unwrap();
         editor.insert_char('!');
         let mut renderer = Renderer::new().unwrap();
         let view = editor.view(40, 6);

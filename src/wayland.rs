@@ -11,7 +11,8 @@ use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::editor::{Command as EditorCommand, Direction, Editor, Metrics};
+use crate::bedit::{Action as EditorAction, BEdit, OpenRequest, PasteTarget};
+use crate::editor::{Command as EditorCommand, Direction, Metrics};
 use crate::gl::{GlBackend, PixelRect};
 use crate::gpu::{self, ActiveBackend, RendererChoice};
 use crate::pty::Pty;
@@ -39,7 +40,7 @@ const HEIGHT: i32 = 500;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Destination {
     Terminal,
-    Editor,
+    Editor(PasteTarget),
 }
 
 struct Transfer {
@@ -251,7 +252,8 @@ struct State {
     frame_pending: bool,
     pixels: Vec<u8>,
     terminal: Option<Terminal>,
-    editor: Option<Editor>,
+    editor: Option<BEdit>,
+    standalone_editor: bool,
     renderer: Option<render::Renderer>,
     backend: ActiveBackend,
     gl: Option<GlBackend>,
@@ -272,11 +274,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     run_with(None)
 }
 
-pub fn run_editor(path: std::path::PathBuf) -> Result<(), Box<dyn Error>> {
-    run_with(Some(path))
+pub fn run_editor(editor: BEdit) -> Result<(), Box<dyn Error>> {
+    run_with(Some(editor))
 }
 
-fn run_with(editor_path: Option<std::path::PathBuf>) -> Result<(), Box<dyn Error>> {
+fn run_with(editor: Option<BEdit>) -> Result<(), Box<dyn Error>> {
     let connection =
         Connection::connect_to_env().map_err(|e| format!("connect to Wayland: {e}"))?;
     let mut event_queue = connection.new_event_queue();
@@ -287,6 +289,8 @@ fn run_with(editor_path: Option<std::path::PathBuf>) -> Result<(), Box<dyn Error
 
     let mut state = State {
         running: true,
+        standalone_editor: editor.is_some(),
+        editor,
         control: Some(crate::control::Control::new().map_err(|e| format!("control socket: {e}"))?),
         blink_epoch: Some(std::time::Instant::now()),
         blink_on: true,
@@ -313,11 +317,6 @@ fn run_with(editor_path: Option<std::path::PathBuf>) -> Result<(), Box<dyn Error
     state
         .create_window(&qh, display_ptr)
         .map_err(|e| format!("create window and PTY: {e}"))?;
-    if let Some(path) = editor_path {
-        state
-            .open_editor(path)
-            .map_err(|e| format!("open editor: {e}"))?;
-    }
     connection
         .flush()
         .map_err(|e| format!("flush Wayland requests: {e}"))?;
@@ -338,12 +337,22 @@ fn run_with(editor_path: Option<std::path::PathBuf>) -> Result<(), Box<dyn Error
                     }
                 }
                 Ok(Some(crate::control::Message::Open(path))) => {
-                    if let Err(e) = state.open_editor(path) {
-                        eprintln!("open file: {e}");
-                    }
+                    state.open_editor(OpenRequest {
+                        root: None,
+                        files: vec![path],
+                    });
                 }
+                Ok(Some(crate::control::Message::Workspace(request))) => state.open_editor(request),
                 Ok(None) => {}
                 Err(e) => eprintln!("control socket: {e}"),
+            }
+        }
+        if let Some(editor) = &mut state.editor
+            && editor.poll()
+        {
+            state.dirty = true;
+            if let Some(toplevel) = &state.toplevel {
+                toplevel.set_title(editor.title());
             }
         }
         let blink_on = state
@@ -733,7 +742,11 @@ impl State {
         let xdg_surface = wm_base.get_xdg_surface(&surface, qh, ());
         let toplevel = xdg_surface.get_toplevel(qh, ());
 
-        toplevel.set_title("Beyrix".to_string());
+        toplevel.set_title(
+            self.editor
+                .as_ref()
+                .map_or_else(|| "Beyrix".into(), BEdit::title),
+        );
         toplevel.set_app_id("beyrix".to_string());
         toplevel.set_min_size(320, 200);
 
@@ -822,6 +835,9 @@ impl State {
         self.toplevel = Some(toplevel);
         self.terminal = Some(terminal);
         self.renderer = Some(renderer);
+        if self.standalone_editor {
+            return Ok(());
+        }
         let pty = Pty::spawn_with_prompt(
             Some((columns as u16, rows as u16)),
             Some(&theme_name),
@@ -932,29 +948,34 @@ impl State {
         Ok(())
     }
 
-    fn open_editor(&mut self, path: std::path::PathBuf) -> Result<(), Box<dyn Error>> {
-        if let Some(editor) = &self.editor
-            && editor.is_modified()
-        {
-            let message = "Save or discard the current file before opening another one";
-            if let Some(editor) = &mut self.editor {
-                editor.set_message(message, true);
+    fn open_editor(&mut self, request: OpenRequest) {
+        if self.editor.is_none() {
+            match BEdit::new(&request) {
+                Ok(editor) => self.editor = Some(editor),
+                Err(error) => {
+                    if let Some(terminal) = &mut self.terminal {
+                        let message: String = error.chars().filter(|ch| !ch.is_control()).collect();
+                        terminal.process(format!("\r\nBEdit: {message}\r\n").as_bytes());
+                    }
+                }
             }
-            self.dirty = true;
-            return Err(message.into());
         }
-        let editor = Editor::open(path)?;
-        if let Some(toplevel) = &self.toplevel {
-            toplevel.set_title(format!("Beyrix - {}", editor.display_name()));
+        if let Some(editor) = &mut self.editor {
+            editor.open_request(request);
         }
-        self.editor = Some(editor);
-        self.selection.clear();
+        if let Some((toplevel, editor)) = self.toplevel.as_ref().zip(self.editor.as_ref()) {
+            toplevel.set_title(editor.title());
+            self.selection.clear();
+        }
         self.damage_full = true;
         self.dirty = true;
-        Ok(())
     }
 
     fn close_editor(&mut self) {
+        if self.standalone_editor {
+            self.running = false;
+            return;
+        }
         self.editor = None;
         if let Some(toplevel) = &self.toplevel {
             toplevel.set_title("Beyrix".to_string());
@@ -1191,7 +1212,16 @@ impl State {
                     && let Some(geometry) = geometry
                 {
                     let (x, y) = self.pointer_position;
-                    editor.mouse_press(x, y, metrics(geometry), time);
+                    let metrics = metrics(geometry);
+                    if let Some(effect) = editor.mouse_confirmation(x, y, metrics) {
+                        match effect {
+                            crate::editor::Effect::Close => self.close_editor(),
+                            crate::editor::Effect::CloseWindow => self.running = false,
+                            _ => {}
+                        }
+                    } else {
+                        editor.mouse_press(x, y, metrics, time);
+                    }
                     self.dirty = true;
                 }
             } else {
@@ -1258,7 +1288,13 @@ impl State {
         if let Some(editor) = &mut self.editor {
             let (rows, remainder) = wheel_rows(self.wheel_remainder, steps, 3);
             self.wheel_remainder = remainder;
-            self.dirty |= editor.scroll_lines(-rows);
+            if let Some(renderer) = &self.renderer {
+                let geometry = renderer
+                    .geometry
+                    .for_window(self.width as usize, self.height as usize);
+                let (x, y) = self.pointer_position;
+                self.dirty |= editor.scroll(-rows, x, y, metrics(geometry));
+            }
         } else if self.mouse_reporting() {
             // Report whole wheel notches and keep the fractional remainder so
             // high-resolution touchpad scrolling does not lose events.
@@ -1287,23 +1323,14 @@ impl State {
             let (Some(renderer), Some(editor)) = (&self.renderer, &mut self.editor) else {
                 return;
             };
-            if !self.pointer_focus || !editor.is_mouse_dragging() {
+            if !self.pointer_focus {
                 return;
             }
             let geometry = renderer
                 .geometry
                 .for_window(self.width as usize, self.height as usize);
             let (x, y) = self.pointer_position;
-            if tick {
-                let top = geometry.padding as f64;
-                let bottom = top + (editor.view_rows() * geometry.cell_height) as f64;
-                if y < top {
-                    self.dirty |= editor.scroll_lines(-1);
-                } else if y >= bottom {
-                    self.dirty |= editor.scroll_lines(1);
-                }
-            }
-            self.dirty |= editor.mouse_drag(x, y, metrics(geometry));
+            self.dirty |= editor.mouse_drag(x, y, metrics(geometry), tick);
             return;
         }
         if !self.selection.is_dragging() || !self.pointer_focus {
@@ -1423,8 +1450,8 @@ impl State {
             return;
         }
         offer.receive(mime.into(), write.as_fd());
-        let destination = if self.editor.is_some() {
-            Destination::Editor
+        let destination = if let Some(editor) = &self.editor {
+            Destination::Editor(editor.paste_target())
         } else {
             Destination::Terminal
         };
@@ -1494,10 +1521,9 @@ impl State {
                                 );
                             }
                             match transfer.destination {
-                                Destination::Editor => {
+                                Destination::Editor(target) => {
                                     if let Some(editor) = &mut self.editor {
-                                        editor.insert_text(text);
-                                        self.dirty = true;
+                                        self.dirty |= editor.paste(target, text);
                                     }
                                 }
                                 Destination::Terminal => {
@@ -1640,16 +1666,36 @@ impl State {
             alt: keyboard.alt(),
             text,
         };
-        let confirming = self
-            .editor
-            .as_ref()
-            .is_some_and(|editor| editor.is_confirming_close());
-        let Some(command) = editor_command(&press, confirming) else {
+        let Some(editor) = &mut self.editor else {
             return;
         };
-        let effect = match &mut self.editor {
-            Some(editor) => editor.handle(command),
-            None => return,
+        let confirming = editor.is_confirming_close();
+        let action = if press.control && !press.alt && !confirming {
+            match press.key {
+                15 => Some(EditorAction::NextTab(press.shift)),
+                17 if press.shift => Some(EditorAction::Leave),
+                17 => Some(EditorAction::CloseTab),
+                48 => Some(EditorAction::ToggleExplorer),
+                25 => Some(EditorAction::QuickOpen),
+                33 => Some(EditorAction::Find),
+                35 => Some(EditorAction::Replace),
+                19 if press.shift => Some(EditorAction::Refresh),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let effect = if let Some(action) = action {
+            editor.action(action)
+        } else if !press.alt
+            && matches!(press.sym, 0xff0d | 0xff8d)
+            && let Some(effect) = editor.panel_enter(press.shift, press.control)
+        {
+            effect
+        } else if let Some(command) = editor_command(&press, confirming) {
+            editor.handle(command)
+        } else {
+            return;
         };
         self.apply_editor_effect(effect, serial, qh);
     }
@@ -2071,7 +2117,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
         match event {
             xdg_toplevel::Event::Close => {
                 if let Some(editor) = &mut state.editor {
-                    if editor.request_close() {
+                    if editor.request_window_close() {
                         state.running = false;
                     } else {
                         state.dirty = true;
@@ -2851,7 +2897,13 @@ mod input_tests {
         let mut write = File::from(unsafe { OwnedFd::from_raw_fd(fds[1]) });
         set_nonblocking(&read).unwrap();
         let mut state = State {
-            editor: Some(Editor::open(dir.path().join("paste.txt")).unwrap()),
+            editor: Some(
+                BEdit::open(OpenRequest {
+                    root: Some(dir.path().to_path_buf()),
+                    files: vec![dir.path().join("paste.txt")],
+                })
+                .unwrap(),
+            ),
             ..Default::default()
         };
         state.transfers.push(Transfer {
@@ -2860,19 +2912,22 @@ mod input_tests {
             offset: 0,
             writing: false,
             bracketed: false,
-            destination: Destination::Editor,
+            destination: Destination::Editor(state.editor.as_ref().unwrap().paste_target()),
         });
         let text = "первая строка\nsecond line\n\n世界";
         write.write_all(text.as_bytes()).unwrap();
         drop(write);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while state.editor.as_ref().is_some_and(|e| e.text().is_empty())
+        while state
+            .editor
+            .as_ref()
+            .is_some_and(|e| e.test_text().is_empty())
             && std::time::Instant::now() < deadline
         {
             state.pump_clipboard();
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(state.editor.as_ref().unwrap().text(), text);
+        assert_eq!(state.editor.as_ref().unwrap().test_text(), text);
         assert!(state.input.is_empty());
     }
 

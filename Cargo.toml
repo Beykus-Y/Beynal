@@ -1,5 +1,6 @@
 [package]
 name = "beyrix"
+default-run = "beyrix"
 description = "Experimental Rust terminal emulator for Linux/Wayland with OpenGL rendering, customizable layouts and TUI support."
 repository = "https://github.com/Beykus-Y/Beyrix"
 homepage = "https://github.com/Beykus-Y/Beyrix"
