@@ -665,6 +665,41 @@ fn physical_size(logical: (i32, i32), scale: f32) -> (i32, i32) {
     )
 }
 
+/// Sizes for one surface commit. `logical` is the size the compositor assigned
+/// to the xdg surface; `physical` is the backing buffer size in pixels. The
+/// viewport destination must always be logical, even when the buffer is scaled
+/// for fractional output scaling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SurfaceSizes {
+    logical: (i32, i32),
+    physical: (i32, i32),
+}
+
+impl SurfaceSizes {
+    fn new(logical: (i32, i32), scale: f32) -> Self {
+        let logical = (logical.0.max(1), logical.1.max(1));
+        Self {
+            logical,
+            physical: physical_size(logical, scale),
+        }
+    }
+
+    fn viewport_destination(self) -> (i32, i32) {
+        self.logical
+    }
+}
+
+/// Apply one xdg_toplevel configure. A zero dimension means "no preference";
+/// keep the previous value for that axis instead of collapsing the surface to
+/// zero or mixing a fresh width with a stale height.
+fn resolve_toplevel_configure(previous: (i32, i32), width: i32, height: i32) -> (i32, i32) {
+    let previous = (previous.0.max(1), previous.1.max(1));
+    (
+        if width > 0 { width } else { previous.0 },
+        if height > 0 { height } else { previous.1 },
+    )
+}
+
 fn row_pixel_rect(
     geometry: render::Geometry,
     logical: (usize, usize),
@@ -710,7 +745,8 @@ impl State {
         }
         if let Some(viewporter) = &self.viewporter {
             let viewport = viewporter.get_viewport(&surface, qh, ());
-            viewport.set_destination(WIDTH, HEIGHT);
+            let destination = SurfaceSizes::new((WIDTH, HEIGHT), self.scale).viewport_destination();
+            viewport.set_destination(destination.0, destination.1);
             self.viewport = Some(viewport);
             if surface.version() >= 3 {
                 surface.set_buffer_scale(1);
@@ -819,21 +855,40 @@ impl State {
         self.apply_scale(factor, qh);
     }
 
+    fn set_viewport_destination(&self, logical: (i32, i32)) {
+        if let Some(viewport) = &self.viewport {
+            // The destination is surface-local (logical) size. The backing
+            // buffer may be larger for fractional scaling; it must never
+            // become the viewport destination or the compositor will scale the
+            // window back to the size used at startup.
+            let destination = SurfaceSizes::new(logical, self.scale).viewport_destination();
+            viewport.set_destination(destination.0, destination.1);
+        }
+    }
+
     fn apply_scale(&mut self, scale: f32, qh: &QueueHandle<Self>) {
         if !scale.is_finite() || (scale - self.scale).abs() < 0.001 {
             return;
         }
         self.scale = scale;
-        if self.viewport.is_none()
-            && self.gl.is_some()
-            && let Some(surface) = &self.surface
+        if let Some(surface) = &self.surface
             && surface.version() >= 3
         {
-            surface.set_buffer_scale(scale.round().clamp(1.0, 4.0) as i32);
+            if self.viewport.is_some() {
+                // With wp_viewport the buffer is scaled into the logical
+                // destination, so the surface itself keeps buffer scale 1.
+                surface.set_buffer_scale(1);
+            } else if self.gl.is_some() {
+                surface.set_buffer_scale(scale.round().clamp(1.0, 4.0) as i32);
+            }
         }
+        self.set_viewport_destination((self.width, self.height));
         if self.gl.is_some() {
-            let (width, height) = physical_size((self.width, self.height), scale);
-            let result = self.gl.as_mut().map(|gl| gl.resize(width, height));
+            let sizes = SurfaceSizes::new((self.width, self.height), scale);
+            let result = self
+                .gl
+                .as_mut()
+                .map(|gl| gl.resize(sizes.physical.0, sizes.physical.1));
             if let Some(Err(error)) = result {
                 eprintln!("beyrix: OpenGL resize failed ({error}); using software");
                 self.gl = None;
@@ -973,7 +1028,12 @@ impl State {
         height: i32,
         qh: &QueueHandle<Self>,
     ) -> Result<(), Box<dyn Error>> {
+        let sizes = SurfaceSizes::new((width, height), self.scale);
+        let (width, height) = sizes.logical;
         if (width, height) == (self.width, self.height) {
+            // Scale changes and the first configure can keep the same logical
+            // size while the viewport is still on its startup destination.
+            self.set_viewport_destination(sizes.logical);
             return Ok(());
         }
         let (columns, rows) = self
@@ -982,10 +1042,9 @@ impl State {
             .ok_or("renderer unavailable")?
             .geometry
             .grid_size(width as usize, height as usize);
-        let physical = physical_size((width, height), self.scale);
         let mut gl_error = None;
         if let Some(gl) = &mut self.gl
-            && let Err(error) = gl.resize(physical.0, physical.1)
+            && let Err(error) = gl.resize(sizes.physical.0, sizes.physical.1)
         {
             gl_error = Some(error);
         }
@@ -1009,6 +1068,7 @@ impl State {
         }
         self.width = width;
         self.height = height;
+        self.set_viewport_destination(sizes.logical);
         self.buffers.retain(|frame| {
             if frame.generation != self.generation && !frame.busy {
                 frame.buffer.destroy();
@@ -1745,9 +1805,10 @@ impl State {
         damage: &RowDamage,
         qh: &QueueHandle<Self>,
     ) -> Result<(), String> {
-        let logical = (self.width as usize, self.height as usize);
+        let sizes = SurfaceSizes::new((self.width, self.height), self.scale);
+        let logical = (sizes.logical.0 as usize, sizes.logical.1 as usize);
         let scale = self.scale;
-        let physical = physical_size((self.width, self.height), scale);
+        let physical = sizes.physical;
         let geometry = self
             .renderer
             .as_ref()
@@ -2024,10 +2085,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
                     .proposed_size
                     .or(state.pending_size)
                     .unwrap_or((state.width, state.height));
-                state.proposed_size = Some((
-                    if width > 0 { width } else { previous.0 },
-                    if height > 0 { height } else { previous.1 },
-                ));
+                state.proposed_size = Some(resolve_toplevel_configure(previous, width, height));
             }
             _ => {}
         }
@@ -2446,6 +2504,70 @@ mod input_tests {
         assert_eq!(damage.ranges, vec![(1, 5), (7, 10)]);
         damage.merge(&RowDamage::full());
         assert!(damage.full);
+    }
+
+    #[test]
+    fn surface_sizes_keep_logical_dimensions_out_of_the_buffer() {
+        let sizes = SurfaceSizes::new((1528, 812), 1.25);
+        assert_eq!(sizes.viewport_destination(), (1528, 812));
+        assert_eq!(sizes.physical, (1910, 1015));
+        assert_ne!(
+            sizes.viewport_destination(),
+            sizes.physical,
+            "the viewport destination must stay in surface-local coordinates"
+        );
+
+        let minimum = SurfaceSizes::new((0, 0), 2.0);
+        assert_eq!(minimum.logical, (1, 1));
+        assert_eq!(minimum.viewport_destination(), (1, 1));
+        assert_eq!(minimum.physical, (2, 2));
+    }
+
+    #[test]
+    fn viewport_destination_tracks_resize_and_restore() {
+        for (logical, physical) in [
+            ((800, 500), (1000, 625)),
+            ((1528, 812), (1910, 1015)),
+            ((1536, 864), (1920, 1080)),
+            ((1528, 812), (1910, 1015)),
+            ((800, 500), (1000, 625)),
+        ] {
+            let sizes = SurfaceSizes::new(logical, 1.25);
+            assert_eq!(sizes.viewport_destination(), logical);
+            assert_eq!(sizes.physical, physical);
+        }
+    }
+
+    #[test]
+    fn toplevel_configure_zero_axis_keeps_previous_dimension() {
+        assert_eq!(
+            resolve_toplevel_configure((800, 500), 1528, 812),
+            (1528, 812)
+        );
+        assert_eq!(resolve_toplevel_configure((1528, 812), 0, 0), (1528, 812));
+        assert_eq!(
+            resolve_toplevel_configure((1528, 812), 1600, 0),
+            (1600, 812)
+        );
+        assert_eq!(resolve_toplevel_configure((1528, 812), 0, 900), (1528, 900));
+        assert_eq!(resolve_toplevel_configure((1528, 812), -1, -1), (1528, 812));
+    }
+
+    #[test]
+    fn configure_sequence_handles_maximize_fullscreen_and_restore() {
+        let mut committed = (800, 500);
+        let mut pending = committed;
+        let mut configure = |width, height| {
+            pending = resolve_toplevel_configure(pending, width, height);
+            committed = pending;
+            committed
+        };
+        assert_eq!(configure(1528, 812), (1528, 812));
+        assert_eq!(configure(1536, 864), (1536, 864));
+        assert_eq!(configure(1528, 812), (1528, 812));
+        assert_eq!(configure(800, 500), (800, 500));
+        // A compositor may leave the choice to the client while restoring.
+        assert_eq!(configure(0, 0), (800, 500));
     }
 
     #[test]
