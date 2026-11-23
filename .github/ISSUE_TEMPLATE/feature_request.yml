@@ -1,0 +1,26 @@
+name: Feature request
+description: Propose an improvement to Beyrix
+title: "[Feature] "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: What cannot be done today, or what is frustrating?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the expected user-facing result, not just a technical implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and trade-offs
+  - type: textarea
+    id: testing
+    attributes:
+      label: How would we verify it works?
