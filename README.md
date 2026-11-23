@@ -41,7 +41,7 @@ If you already installed a `beynal` binary system-wide, update any shell aliases
 
 Contributions, feedback, bug reports, tests on other Linux distributions and documentation improvements are welcome.
 
-- Read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a change.
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) and the [architecture overview](docs/ARCHITECTURE.md) before submitting a change.
 - File bugs and feature suggestions through [Issues](https://github.com/Beykus-Y/Beynal/issues).
 - Smaller changes with a reproducer and tests are especially helpful.
 - Review the [roadmap](ROADMAP.md) for priorities.
