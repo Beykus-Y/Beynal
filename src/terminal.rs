@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 use std::collections::VecDeque;
 use unicode_width::UnicodeWidthChar;
 use vte::{Params, Parser, Perform};
@@ -1307,9 +1311,9 @@ mod tests {
     fn writes_text() {
         let mut terminal = Terminal::new(20, 5);
 
-        terminal.process(b"Hello Beynal");
+        terminal.process(b"Hello Beyrix");
 
-        assert!(terminal.screen().line(0).starts_with("Hello Beynal"));
+        assert!(terminal.screen().line(0).starts_with("Hello Beyrix"));
     }
 
     #[test]
