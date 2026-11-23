@@ -1,5 +1,11 @@
 [package]
-name = "beynal"
+name = "beyrix"
+description = "Experimental open-source terminal emulator for Linux/Wayland"
+repository = "https://github.com/Beykus-Y/Beynal"
+license = "MPL-2.0"
+readme = "README.md"
+keywords = ["terminal", "wayland", "emulator"]
+categories = ["command-line-utilities"]
 version = "0.1.0"
 edition = "2024"
 
