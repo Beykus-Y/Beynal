@@ -1,0 +1,19 @@
+# Build artifacts
+/target
+
+# Cargo / Rust
+**/*.rs.bk
+Cargo.lock.orig
+
+# Editor temp files
+*.save
+*.swp
+*~
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

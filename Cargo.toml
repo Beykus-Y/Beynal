@@ -1,0 +1,16 @@
+[package]
+name = "beynal"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fontdue = "0.9.5"
+libc = "0.2.191"
+serde = { version = "1.0.229", features = ["derive"] }
+tempfile = "3.27.0"
+toml = "1.2.2"
+toml_edit = "0.25.20"
+unicode-width = "0.2.3"
+vte = "0.15.0"
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client"] }
