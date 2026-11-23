@@ -17,3 +17,6 @@ Cargo.lock.orig
 # OS
 .DS_Store
 Thumbs.db
+
+# Release packaging
+/dist

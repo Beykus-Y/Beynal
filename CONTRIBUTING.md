@@ -11,17 +11,23 @@ Thanks for helping make Beyrix a better terminal. We welcome bug reports, compat
 
 ## Local setup
 
-Beyrix is currently a Linux/Wayland Rust project (edition 2024). Read the [architecture overview](docs/ARCHITECTURE.md) for an introduction to the existing modules. You will need a recent stable Rust toolchain, Bash, the Wayland development libraries, and other native dependencies provided by your Linux distribution.
+Beyrix is currently a Linux/Wayland Rust project (edition 2024). Read the [architecture overview](docs/ARCHITECTURE.md) for an introduction to the existing modules and the [English configuration reference](CONFIGURATION.en.md) for user-facing behavior. You will need a recent stable Rust toolchain, Bash, the Wayland development libraries, and other native dependencies provided by your Linux distribution.
 
 ```sh
 cargo fmt --all -- --check
 cargo check --all-targets --locked
-cargo test --locked
-cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
+cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo build --release --locked
 ```
 
 The graphical emulator needs an active Wayland session; tests and command-line help do not require a visible window. Some tests exercise PTYs, Bash and external programs; provide logs if they fail on your environment.
+
+Release archives are produced from version tags by [`.github/workflows/release.yml`](.github/workflows/release.yml). To test packaging locally after a release build:
+
+```sh
+./scripts/package-release.sh v0.1.0-alpha.1
+```
 
 ## Good pull requests
 

@@ -1,5 +1,7 @@
 # Конфигурация Beyrix
 
+> English reference: [CONFIGURATION.en.md](CONFIGURATION.en.md).
+
 Beyrix читает `$XDG_CONFIG_HOME/beyrix/config.toml` при запуске. Если переменная не задана, используется `~/.config/beyrix/config.toml`. Все параметры необязательны.
 
 ## Переход с Beynal

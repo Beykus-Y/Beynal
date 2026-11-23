@@ -25,8 +25,8 @@ jobs:
       - name: Check
         run: cargo check --all-targets --locked
       - name: Clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: Test
-        run: cargo test --locked
+        run: cargo test --all-targets --locked
       - name: Release build
         run: cargo build --release --locked
