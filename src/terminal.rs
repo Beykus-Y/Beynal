@@ -10,8 +10,8 @@ use unicode_width::UnicodeWidthChar;
 use vte::{Params, Parser, Perform};
 
 use crate::terminal_graphics::{
-    GraphicsState, MAX_APC_PAYLOAD_BYTES, MAX_SIXEL_PAYLOAD_BYTES, TerminalImage, base64_decode,
-    base64_encode, compute_cell_span, decode_sixel,
+    GraphicsState, MAX_APC_PAYLOAD_BYTES, MAX_SIXEL_PAYLOAD_BYTES, TerminalImage,
+    base64_decode_capped, base64_encode, compute_cell_span, decode_sixel,
 };
 
 /// Vertical placement of the terminal grid inside the window.
@@ -190,6 +190,15 @@ pub const SYNC_OUTPUT_TIMEOUT: Duration = Duration::from_millis(200);
 const MAX_HYPERLINKS: usize = 4096;
 const MAX_OSC52_BYTES: usize = 1024 * 1024;
 const MAX_KITTY_STACK: usize = 32;
+/// Kitty Keyboard Protocol flags genuinely implemented by Beyrix:
+/// - Bit 0 (1): Disambiguate escape codes
+/// - Bit 1 (2): Report event types (press / repeat / release)
+/// - Bit 3 (8): Report all keys as escape codes
+/// - Bit 4 (16): Report associated text
+///
+/// Note: Bit 2 (4, Report alternate keys) is NOT implemented and therefore masked off
+/// so `CSI ? u` never advertises unsupported capabilities.
+pub const SUPPORTED_KITTY_KEYBOARD_FLAGS: u8 = 0x01 | 0x02 | 0x08 | 0x10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CursorStyle {
@@ -1742,7 +1751,8 @@ impl Screen {
 
     fn handle_sixel(&mut self, payload: &[u8]) {
         if let Some((w, h, rgba)) = decode_sixel(payload) {
-            let (cols, rows) = compute_cell_span(w, h, 0, 0, self.cell_pixel_size, self.columns);
+            let (cols, rows) =
+                compute_cell_span(w, h, 0, 0, self.cell_pixel_size, self.columns, self.rows);
             let abs_row = self.history_base + self.history.len() + self.cursor_y;
             let internal_id = self.graphics.next_id();
             self.graphics.add_placement(TerminalImage {
@@ -1757,7 +1767,7 @@ impl Screen {
                 rgba: Arc::new(rgba),
                 alternate: self.alternate.is_some(),
             });
-            for _ in 0..rows {
+            for _ in 0..rows.min(self.rows) {
                 self.line_feed();
             }
             self.cursor_x = self.effective_left_margin();
@@ -1768,21 +1778,25 @@ impl Screen {
     fn handle_kitty_apc(&mut self, body: &[u8]) {
         let abs_row = self.history_base + self.history.len() + self.cursor_y;
         let col = self.cursor_x.min(self.columns.saturating_sub(1));
+        let prev_gfx_rev = self.graphics.revision;
         let (reply, advance_rows) = self.graphics.handle_kitty_apc(
             body,
             abs_row,
             col,
             self.cell_pixel_size,
             self.columns,
+            self.rows,
             self.alternate.is_some(),
         );
         if !reply.is_empty() {
             self.responses.extend_from_slice(&reply);
         }
         if advance_rows > 0 {
-            for _ in 0..advance_rows {
+            for _ in 0..advance_rows.min(self.rows) {
                 self.line_feed();
             }
+            self.revision += 1;
+        } else if self.graphics.revision != prev_gfx_rev {
             self.revision += 1;
         }
     }
@@ -2124,13 +2138,13 @@ impl Perform for Screen {
                         .extend_from_slice(format!("\x1b[?{flags}u").as_bytes());
                 }
                 b">" => {
-                    let flags = params
+                    let flags = (params
                         .iter()
                         .next()
                         .and_then(|p| p.first())
                         .copied()
-                        .unwrap_or(0) as u8
-                        & 0x1f;
+                        .unwrap_or(0) as u8)
+                        & SUPPORTED_KITTY_KEYBOARD_FLAGS;
                     if self.kitty_keyboard_stack.len() >= MAX_KITTY_STACK {
                         self.kitty_keyboard_stack.remove(0);
                     }
@@ -2149,8 +2163,8 @@ impl Perform for Screen {
                 }
                 b"=" => {
                     let mut it = params.iter();
-                    let flags =
-                        it.next().and_then(|p| p.first()).copied().unwrap_or(0) as u8 & 0x1f;
+                    let flags = (it.next().and_then(|p| p.first()).copied().unwrap_or(0) as u8)
+                        & SUPPORTED_KITTY_KEYBOARD_FLAGS;
                     let mode = it.next().and_then(|p| p.first()).copied().unwrap_or(1);
                     if self.kitty_keyboard_stack.is_empty() {
                         self.kitty_keyboard_stack.push(0);
@@ -2158,7 +2172,7 @@ impl Perform for Screen {
                     if let Some(top) = self.kitty_keyboard_stack.last_mut() {
                         match mode {
                             1 => *top = flags,
-                            2 => *top |= flags,
+                            2 => *top = (*top | flags) & SUPPORTED_KITTY_KEYBOARD_FLAGS,
                             3 => *top &= !flags,
                             _ => {}
                         }
@@ -2791,9 +2805,7 @@ impl Perform for Screen {
                         self.responses
                             .extend_from_slice(format!("\x1b]52;c;{b64}{end}").as_bytes());
                     }
-                } else if payload.len() <= MAX_OSC52_BYTES * 2
-                    && let Some(decoded) = base64_decode(payload)
-                    && decoded.len() <= MAX_OSC52_BYTES
+                } else if let Some(decoded) = base64_decode_capped(payload, MAX_OSC52_BYTES)
                     && let Ok(text) = String::from_utf8(decoded)
                 {
                     self.pending_clipboard_write = Some(text);
@@ -3155,8 +3167,12 @@ mod tests {
     #[test]
     fn kitty_keyboard_stack_and_dcs_queries_work() {
         let mut t = Terminal::new(80, 24);
-        t.process(b"\x1b[?u\x1b[>5u\x1b[?u\x1b[<1u\x1b[?u");
-        assert_eq!(t.take_responses(), b"\x1b[?0u\x1b[?5u\x1b[?0u");
+        // Requesting flags=5 (1 | 4): bit 4 (alternate keys) is unsupported, so only 1 is active.
+        t.process(b"\x1b[?u\x1b[>5u\x1b[?u\x1b[>3u\x1b[?u\x1b[<1u\x1b[?u\x1b[<1u\x1b[?u");
+        assert_eq!(
+            t.take_responses(),
+            b"\x1b[?0u\x1b[?1u\x1b[?3u\x1b[?1u\x1b[?0u"
+        );
 
         t.process(b"\x1b[>c\x1b[18t");
         let resp = String::from_utf8(t.take_responses()).unwrap();

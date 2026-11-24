@@ -290,6 +290,8 @@ struct State {
     wheel_h_mouse_remainder: f64,
     last_serial: u32,
     default_font_size: f32,
+    pending_osc52_clipboard: Option<String>,
+    suppressed_release_key: Option<u32>,
     mouse_button: Option<crate::mouse::Button>,
     drag_scroll_at: Option<std::time::Instant>,
     selection: crate::selection::Selection,
@@ -458,6 +460,9 @@ fn run_with(editor: Option<BEdit>) -> Result<(), Box<dyn Error>> {
         }
         state.pump_key_repeat(Some(&qh));
         state.pump_clipboard();
+        if let Some(osc52_text) = state.pending_osc52_clipboard.take() {
+            state.set_clipboard(osc52_text, state.last_serial, &qh);
+        }
         let size = state.pending_size.take();
         let scale = state.pending_scale.take();
         if size.is_some() || scale.is_some() {
@@ -554,6 +559,8 @@ struct TerminalSignature {
     visible_start: usize,
     layout_offset: usize,
     view_offset: usize,
+    graphics_revision: u64,
+    progress: Option<(u8, u8)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -727,6 +734,8 @@ fn terminal_damage(
         visible_start: screen.visible_start(),
         layout_offset: screen.layout_offset(),
         view_offset: screen.view_offset(),
+        graphics_revision: screen.graphics.revision,
+        progress: screen.progress,
     };
     let cursor = cursor_state(screen, focused, blink_on);
     if force_full || signature.as_ref() != Some(&current) || hashes.len() != screen.rows {
@@ -2167,7 +2176,7 @@ impl State {
                     {
                         self.test_clipboard = Some(clip_text.clone());
                     }
-                    let _ = clip_text;
+                    self.pending_osc52_clipboard = Some(clip_text);
                 }
                 let shell_events = terminal.screen_mut().drain_shell_events();
                 if !shell_events.is_empty()
@@ -3105,11 +3114,14 @@ struct VisibleState {
     start: usize,
     offset: usize,
     revision: u64,
+    graphics_revision: u64,
+    progress: Option<(u8, u8)>,
     cursor: Option<(usize, usize, Option<crate::terminal::CursorStyle>)>,
 }
 
 fn visible_state(screen: &crate::terminal::Screen) -> VisibleState {
-    // When every visible row is in history, PTY writes cannot change the visible cells.
+    // When every visible row is in history, PTY text writes cannot change visible cells,
+    // but graphics/progress state can still change.
     let revision = if screen.view_offset() >= screen.rows {
         0
     } else {
@@ -3124,6 +3136,8 @@ fn visible_state(screen: &crate::terminal::Screen) -> VisibleState {
         start: screen.visible_start(),
         offset: screen.layout_offset(),
         revision,
+        graphics_revision: screen.graphics.revision,
+        progress: screen.progress,
         cursor,
     }
 }
@@ -3492,11 +3506,13 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 state.pointer_motion();
             }
             wl_pointer::Event::Button {
+                serial,
                 button,
                 state: wayland_client::WEnum::Value(button_state),
                 time,
                 ..
             } => {
+                state.last_serial = serial;
                 if !state.pointer_focus {
                     return;
                 }
@@ -3555,7 +3571,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                     Err(e) => state.input_error = Some(format!("load keyboard keymap: {e}")),
                 }
             }
-            wl_keyboard::Event::Enter { surface, .. } => {
+            wl_keyboard::Event::Enter {
+                serial, surface, ..
+            } => {
+                state.last_serial = serial;
                 let focused = state.surface.as_ref() == Some(&surface);
                 state.keyboard_focus = focused;
                 state.dirty = true;
@@ -3642,6 +3661,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                     if state.repeat_key.as_ref().is_some_and(|r| r.key == key) {
                         state.repeat_key = None;
                     }
+                    if state.suppressed_release_key == Some(key) {
+                        state.suppressed_release_key = None;
+                        return;
+                    }
                     if state.keyboard_focus
                         && state.editor.is_none()
                         && let (Some(xkb), Some(term)) = (&state.xkb, &state.terminal)
@@ -3666,7 +3689,13 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                         state.editor_key(key, serial, qh);
                         true
                     } else {
-                        state.dispatch_terminal_key_press(key, serial, Some(qh))
+                        let forwarded = state.dispatch_terminal_key_press(key, serial, Some(qh));
+                        if !forwarded {
+                            state.suppressed_release_key = Some(key);
+                        } else if state.suppressed_release_key == Some(key) {
+                            state.suppressed_release_key = None;
+                        }
+                        forwarded
                     };
                     if should_repeat
                         && state.repeat_rate > 0
@@ -4938,8 +4967,8 @@ mod input_tests {
         state.dispatch_terminal_key_press(46, 4, None);
         state.write_input().unwrap();
         wait_for(&mut state, "RAW_GOT=03");
-
-        state.input.extend(b"exit\n");
+        std::thread::sleep(Duration::from_millis(80));
+        state.input.extend(b"\nexit\n");
         state.write_input().unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while state.pty.is_some() && std::time::Instant::now() < deadline {

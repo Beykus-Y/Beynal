@@ -79,7 +79,7 @@ Status values:
 | Smart Ctrl+C / Ctrl+V | Beyrix UX requirement | Supported | Preserved (intentional selection, TUI-aware Ctrl+V, guaranteed fallbacks) | Supported |
 | Application Cursor (`DECCKM`) & Keypad (`DECKPAM`/`DECKPNM`) | VT100 / XTerm | Unsupported | `TerminalInputModes` passed to `Keyboard::key_with_modes` | Supported |
 | XTerm `modifyOtherKeys` (`CSI > 4 ; m`) | XTerm | Unsupported | Mode 0/1/2 encoding (`CSI 27 ; mod ; code ~`) | Supported |
-| Kitty Keyboard Protocol (`CSI > / < / ? / = u`) | Kitty KKP spec | Unsupported | Per-screen stack (main/alt), progressive enhancement flags (1..31), press/repeat/release | Supported |
+| Kitty Keyboard Protocol (`CSI > / < / ? / = u`) | Kitty KKP spec | Unsupported | Per-screen stack (main/alt), flags `1|2|8|16` (bit 4 alternate keys honestly masked off & not advertised), press/repeat/release | Partial |
 | Wayland Autorepeat | `wl_keyboard::repeat_info` | Supported | Preserved + KKP repeat event type (`:2`) | Supported |
 | Non-Latin Ctrl Chords (RU/DE/etc.) | Beyrix UX | Supported | Evdev fallback preserved | Supported |
 | AltGr / Compose / Dead keys / IME | XKB / Wayland | Partial (XKB state only) | XKB dead-key/AltGr preservation; Wayland text-input IME noted | Partial |
@@ -108,7 +108,7 @@ Status values:
 | `OSC 8` Hyperlinks | OSC 8 | Unsupported | Per-cell hyperlink ID, hover underline, Ctrl+Click safe open (`http/https/file`) | Supported |
 | `OSC 9;4` Progress Indicator | ConEmu / Windows Terminal | Unsupported | Parsed state/progress + subtle top bar indicator | Supported |
 | `OSC 10/11/12` & `110/111/112` Dynamic Colors | XTerm | Query 10/11 only | Query/set/reset FG, BG, Cursor | Supported |
-| `OSC 52` Clipboard Integration | XTerm | Unsupported | Base64 write (size-capped); read disabled by default for security | Supported |
+| `OSC 52` Clipboard Integration | XTerm | Unsupported | Base64 write wired to Wayland clipboard (1 MiB cap); read disabled by default for security | Supported |
 | `OSC 133` Shell Integration | FinalTerm / Contour | Partial (A/C anchors only) | Full A/B/C/D lifecycle + exit code + X-Ray integration | Supported |
 | Kitty Graphics Protocol (`APC G`) | Kitty Graphics | Unsupported | Chunked RGBA/RGB/PNG transmit, placement, delete, scroll/alt-screen, memory cap (file/shm disabled safely) | Supported |
 | SIXEL Graphics (`DCS ... q`) | VT340 | Unsupported | SIXEL decoder to inline `TerminalImage` with palette & memory limits | Supported |
