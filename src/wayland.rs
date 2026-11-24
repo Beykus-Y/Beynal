@@ -256,6 +256,12 @@ impl Drop for FrameBuffer {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PressedKeyRoute {
+    sent_to_pty: bool,
+    kitty_report_release: bool,
+}
+
 #[derive(Default)]
 struct State {
     running: bool,
@@ -291,7 +297,7 @@ struct State {
     last_serial: u32,
     default_font_size: f32,
     pending_osc52_clipboard: Option<String>,
-    suppressed_release_key: Option<u32>,
+    pressed_keys: std::collections::HashMap<u32, PressedKeyRoute>,
     mouse_button: Option<crate::mouse::Button>,
     drag_scroll_at: Option<std::time::Instant>,
     selection: crate::selection::Selection,
@@ -1872,7 +1878,40 @@ impl State {
         serial: u32,
         qh: Option<&QueueHandle<Self>>,
     ) -> bool {
-        self.dispatch_terminal_key_event(key, serial, qh, crate::keyboard::KeyEventType::Press)
+        let kitty_release = self
+            .terminal
+            .as_ref()
+            .is_some_and(|t| (t.screen().kitty_keyboard_flags() & 2) != 0);
+        let forwarded =
+            self.dispatch_terminal_key_event(key, serial, qh, crate::keyboard::KeyEventType::Press);
+        self.pressed_keys.insert(
+            key,
+            PressedKeyRoute {
+                sent_to_pty: forwarded,
+                kitty_report_release: forwarded && kitty_release,
+            },
+        );
+        forwarded
+    }
+
+    fn dispatch_terminal_key_release(&mut self, key: u32) {
+        let Some(route) = self.pressed_keys.remove(&key) else {
+            return;
+        };
+        if !route.sent_to_pty || !route.kitty_report_release {
+            return;
+        }
+        if self.keyboard_focus
+            && self.editor.is_none()
+            && let (Some(xkb), Some(term)) = (&self.xkb, &self.terminal)
+        {
+            let modes = term.screen().input_modes();
+            // Only emit release if Kitty report-events flag (bit 2) is still active.
+            if (modes.kitty_flags & 2) != 0 {
+                let bytes = xkb.key_with_modes(key, modes, crate::keyboard::KeyEventType::Release);
+                self.input.extend(bytes);
+            }
+        }
     }
 
     /// Route a terminal key press/repeat (from live Wayland or E2E input tests) through
@@ -3412,6 +3451,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
                 }
                 state.keyboard_focus = false;
                 state.repeat_key = None;
+                state.pressed_keys.clear();
                 state.xkb = None;
             }
         }
@@ -3594,6 +3634,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             wl_keyboard::Event::Leave { .. } => {
                 state.keyboard_focus = false;
                 state.repeat_key = None;
+                state.pressed_keys.clear();
                 state.dirty = true;
                 if state.editor.is_none()
                     && state
@@ -3661,24 +3702,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                     if state.repeat_key.as_ref().is_some_and(|r| r.key == key) {
                         state.repeat_key = None;
                     }
-                    if state.suppressed_release_key == Some(key) {
-                        state.suppressed_release_key = None;
-                        return;
-                    }
-                    if state.keyboard_focus
-                        && state.editor.is_none()
-                        && let (Some(xkb), Some(term)) = (&state.xkb, &state.terminal)
-                    {
-                        let modes = term.screen().input_modes();
-                        if (modes.kitty_flags & 2) != 0 {
-                            let bytes = xkb.key_with_modes(
-                                key,
-                                modes,
-                                crate::keyboard::KeyEventType::Release,
-                            );
-                            state.input.extend(bytes);
-                        }
-                    }
+                    state.dispatch_terminal_key_release(key);
                     return;
                 }
                 if state.keyboard_focus
@@ -3686,16 +3710,17 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                     && state.xkb.is_some()
                 {
                     let should_repeat = if state.editor.is_some() {
+                        state.pressed_keys.insert(
+                            key,
+                            PressedKeyRoute {
+                                sent_to_pty: false,
+                                kitty_report_release: false,
+                            },
+                        );
                         state.editor_key(key, serial, qh);
                         true
                     } else {
-                        let forwarded = state.dispatch_terminal_key_press(key, serial, Some(qh));
-                        if !forwarded {
-                            state.suppressed_release_key = Some(key);
-                        } else if state.suppressed_release_key == Some(key) {
-                            state.suppressed_release_key = None;
-                        }
-                        forwarded
+                        state.dispatch_terminal_key_press(key, serial, Some(qh))
                     };
                     if should_repeat
                         && state.repeat_rate > 0
@@ -4976,6 +5001,53 @@ mod input_tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(state.pty.is_none());
+    }
+
+    #[test]
+    fn per_key_press_routing_handles_concurrent_hotkeys_focus_loss_and_protocol_switch() {
+        let mut state = State {
+            terminal: Some(Terminal::new(80, 24)),
+            xkb: Some(make_test_xkb()),
+            keyboard_focus: true,
+            ..Default::default()
+        };
+        // Enable Kitty Keyboard flags=3 (disambiguate + report events).
+        state.terminal.as_mut().unwrap().process(b"\x1b[>3u");
+
+        // 1. Hold 'a' (evdev 30, routed to PTY), while simultaneously pressing Settings hotkey (Ctrl+, evdev 51).
+        state.xkb.as_mut().unwrap().modifiers(0, 0, 0, 0);
+        assert!(state.dispatch_terminal_key_press(30, 1, None));
+        state.input.clear();
+
+        state.xkb.as_mut().unwrap().modifiers(1 << 2, 0, 0, 0);
+        assert!(!state.dispatch_terminal_key_press(51, 2, None));
+        assert!(state.settings_overlay.open);
+
+        // Releasing Settings hotkey (51) must NOT emit an orphan release to PTY.
+        state.dispatch_terminal_key_release(51);
+        assert!(state.input.is_empty());
+
+        // Releasing 'a' (30) STILL emits Kitty release because 'a' was routed to PTY!
+        state.xkb.as_mut().unwrap().modifiers(0, 0, 0, 0);
+        state.dispatch_terminal_key_release(30);
+        assert_eq!(state.input.make_contiguous(), b"\x1b[97;1:3u");
+        state.input.clear();
+
+        // 2. Protocol switch while key is held: press 'b' (48) under Kitty flags=3,
+        //    pop protocol back to legacy (<1u), then release -> no release emitted!
+        assert!(state.dispatch_terminal_key_press(48, 3, None));
+        state.input.clear();
+        state.terminal.as_mut().unwrap().process(b"\x1b[<1u");
+        state.dispatch_terminal_key_release(48);
+        assert!(state.input.is_empty());
+
+        // 3. Focus loss clears all tracked pressed keys so no stale release fires later.
+        state.terminal.as_mut().unwrap().process(b"\x1b[>3u");
+        assert!(state.dispatch_terminal_key_press(30, 4, None));
+        state.input.clear();
+        state.pressed_keys.clear();
+        state.dispatch_terminal_key_release(30);
+        assert!(state.input.is_empty());
     }
 
     #[test]

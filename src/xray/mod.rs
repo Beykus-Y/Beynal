@@ -220,13 +220,19 @@ struct ActiveCommand {
 }
 
 impl ActiveCommand {
-    fn new(source_osc133: bool, pgid: Option<i32>, name: String) -> Self {
+    fn new(
+        source_osc133: bool,
+        pgid: Option<i32>,
+        name: String,
+        started_at: Instant,
+        started_wall: SystemTime,
+    ) -> Self {
         Self {
             source_osc133,
             pgid,
             name,
-            started_at: Instant::now(),
-            started_wall: SystemTime::now(),
+            started_at,
+            started_wall,
             peak_rss: 0,
             peak_procs: 0,
             io_acc: IoAccumulator::default(),
@@ -266,8 +272,15 @@ impl ActiveCommand {
         }
     }
 
-    fn finish(self, command_id: u64, exit_code: Option<i32>) -> CommandReport {
-        let signal = exit_code.and_then(|c| (c > 128 && c <= 192).then_some(c - 128));
+    fn finish(
+        self,
+        command_id: u64,
+        exit_code: Option<i32>,
+        finished_at: Instant,
+    ) -> CommandReport {
+        // OSC 133;D only reports the shell's `$?` exit status, which cannot
+        // reliably distinguish `exit 130` from a real SIGINT termination.
+        // Leave `signal: None` unless obtained from a trustworthy OS signal source.
         let label = if !self.name.is_empty() {
             self.name
         } else if self.source_osc133 {
@@ -281,9 +294,11 @@ impl ActiveCommand {
             command_id,
             command: label,
             exit_code,
-            signal,
+            signal: None,
             started_at: self.started_wall,
-            duration_ms: self.started_at.elapsed().as_millis() as u64,
+            duration_ms: finished_at
+                .saturating_duration_since(self.started_at)
+                .as_millis() as u64,
             peak_rss_bytes: self.peak_rss,
             peak_process_count: self.peak_procs.max(usize::from(self.source_osc133)),
             physical_read_bytes: self.io_acc.totals.0,
@@ -297,6 +312,8 @@ impl ActiveCommand {
     }
 }
 
+type TimestampedShellEvent = (crate::terminal::ShellEvent, Instant, SystemTime);
+
 pub struct XRayEngine {
     pub config: XRayConfig,
     pub panel_open: bool,
@@ -307,7 +324,7 @@ pub struct XRayEngine {
     pub action_feedback: Option<String>,
     snapshot: Arc<Mutex<XRaySnapshot>>,
     last_output_at: Arc<Mutex<Instant>>,
-    shell_events: Arc<Mutex<Vec<crate::terminal::ShellEvent>>>,
+    shell_events: Arc<Mutex<Vec<TimestampedShellEvent>>>,
     level: Arc<Mutex<XRayLevel>>,
     dirty: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
@@ -368,13 +385,15 @@ impl XRayEngine {
         }
     }
 
-    /// Feed an OSC 133 semantic shell lifecycle event into X-Ray so command
-    /// reports capture exact exit codes, short commands, and shell builtins.
+    /// Feed an OSC 133 semantic shell lifecycle event into X-Ray with the exact
+    /// arrival timestamp so command durations are independent of worker polling.
     pub fn notify_shell_event(&self, event: crate::terminal::ShellEvent) {
         if self.config.enabled {
+            let now = Instant::now();
+            let wall = SystemTime::now();
             let mut q = self.shell_events.lock().unwrap_or_else(|e| e.into_inner());
             if q.len() < 64 {
-                q.push(event);
+                q.push((event, now, wall));
             }
         }
     }
@@ -414,31 +433,56 @@ impl XRayEngine {
 
                 let mut reports = ReportStore::new(history_limit, privacy);
                 let mut active: Option<ActiveCommand> = None;
-                let mut osc133_seen = false;
                 let mut cmd_seq = 1u64;
 
                 while !shutdown.load(Ordering::Relaxed) {
-                    let pending_shell: Vec<crate::terminal::ShellEvent> = {
+                    let pending_shell: Vec<TimestampedShellEvent> = {
                         let mut q = shell_events.lock().unwrap_or_else(|e| e.into_inner());
                         std::mem::take(&mut *q)
                     };
-                    for ev in pending_shell {
-                        osc133_seen = true;
+                    for (ev, ev_instant, ev_wall) in pending_shell {
                         match ev {
                             crate::terminal::ShellEvent::CommandExecuted { .. } => {
                                 if let Some(prev) = active.take() {
-                                    reports.push(prev.finish(cmd_seq, None));
+                                    if !prev.source_osc133
+                                        && ev_instant.saturating_duration_since(prev.started_at)
+                                            < Duration::from_millis(500)
+                                    {
+                                        // Upgrade an in-flight PGID-detected command to OSC 133
+                                        // without duplicating its report.
+                                        let mut upgraded = prev;
+                                        upgraded.source_osc133 = true;
+                                        upgraded.started_at = ev_instant;
+                                        upgraded.started_wall = ev_wall;
+                                        active = Some(upgraded);
+                                        continue;
+                                    }
+                                    reports.push(prev.finish(cmd_seq, None, ev_instant));
                                     cmd_seq += 1;
                                 }
-                                active = Some(ActiveCommand::new(true, None, String::new()));
+                                active = Some(ActiveCommand::new(
+                                    true,
+                                    None,
+                                    String::new(),
+                                    ev_instant,
+                                    ev_wall,
+                                ));
                             }
                             crate::terminal::ShellEvent::CommandFinished { exit_code, .. } => {
                                 if let Some(cur) = active.take() {
-                                    reports.push(cur.finish(cmd_seq, exit_code));
+                                    reports.push(cur.finish(cmd_seq, exit_code, ev_instant));
                                     cmd_seq += 1;
                                 }
                             }
-                            _ => {}
+                            crate::terminal::ShellEvent::PromptStart { .. } => {
+                                if active.as_ref().is_some_and(|c| c.source_osc133)
+                                    && let Some(cur) = active.take()
+                                {
+                                    reports.push(cur.finish(cmd_seq, None, ev_instant));
+                                    cmd_seq += 1;
+                                }
+                            }
+                            crate::terminal::ShellEvent::CommandInputStart { .. } => {}
                         }
                     }
                     let lvl = *level_shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -457,6 +501,8 @@ impl XRayEngine {
                     let nodes = sampler.collect_tree(root_pid, fg_pgid, inspect, secs_since_out);
                     let total_cpu: f32 = nodes.iter().map(|n| n.cpu_percent).sum();
                     let total_rss: u64 = nodes.iter().map(|n| n.rss_bytes).sum();
+                    let sample_now = Instant::now();
+                    let sample_wall = SystemTime::now();
 
                     if let Some(fg) = fg_pgid {
                         if fg != root_pid {
@@ -475,28 +521,39 @@ impl XRayEngine {
                                 }
                                 Some(_) => {
                                     if let Some(prev) = active.take() {
-                                        reports.push(prev.finish(cmd_seq, None));
+                                        reports.push(prev.finish(cmd_seq, None, sample_now));
                                         cmd_seq += 1;
                                     }
-                                    let mut next =
-                                        ActiveCommand::new(false, Some(fg), String::new());
+                                    let mut next = ActiveCommand::new(
+                                        false,
+                                        Some(fg),
+                                        String::new(),
+                                        sample_now,
+                                        sample_wall,
+                                    );
                                     next.update_from_nodes(&cmd_nodes);
                                     active = Some(next);
                                 }
-                                None if !osc133_seen => {
-                                    let mut next =
-                                        ActiveCommand::new(false, Some(fg), String::new());
+                                None => {
+                                    // PGID fallback always stays active when no OSC 133 command
+                                    // is in flight (e.g. inside nested shells without OSC 133).
+                                    let mut next = ActiveCommand::new(
+                                        false,
+                                        Some(fg),
+                                        String::new(),
+                                        sample_now,
+                                        sample_wall,
+                                    );
                                     next.update_from_nodes(&cmd_nodes);
                                     active = Some(next);
                                 }
-                                None => {}
                             }
                         } else if let Some(cur) = &active
                             && !cur.source_osc133
                             && let Some(finished) = active.take()
                         {
                             // Fallback PGID-only mode: command returned to root shell.
-                            reports.push(finished.finish(cmd_seq, None));
+                            reports.push(finished.finish(cmd_seq, None, sample_now));
                             cmd_seq += 1;
                         }
                     }

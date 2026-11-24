@@ -336,11 +336,13 @@ fn xray_unified_osc133_lifecycle_has_no_duplicates_and_tracks_exit_codes() {
 
     // 1. Fast builtin command (exit 0)
     xray.notify_shell_event(ShellEvent::CommandExecuted { abs_row: 0 });
+    std::thread::sleep(Duration::from_millis(15));
     xray.notify_shell_event(ShellEvent::CommandFinished {
         abs_row: 1,
         exit_code: Some(0),
     });
-    // 2. Failing / Ctrl+C interrupted command (exit 130 -> SIGINT = 2)
+    // 2. Non-zero command returning 130 (e.g. `bash -c 'exit 130'`):
+    // must record exit_code=Some(130) and signal=None (never guess SIGINT from $? > 128!).
     xray.notify_shell_event(ShellEvent::CommandExecuted { abs_row: 2 });
     xray.notify_shell_event(ShellEvent::CommandFinished {
         abs_row: 3,
@@ -356,8 +358,16 @@ fn xray_unified_osc133_lifecycle_has_no_duplicates_and_tracks_exit_codes() {
     );
     assert_eq!(snap.reports[0].exit_code, Some(0));
     assert_eq!(snap.reports[0].signal, None);
+    assert!(
+        snap.reports[0].duration_ms >= 10,
+        "arrival-timestamped duration must reflect actual elapsed time (got {} ms)",
+        snap.reports[0].duration_ms
+    );
     assert_eq!(snap.reports[1].exit_code, Some(130));
-    assert_eq!(snap.reports[1].signal, Some(2));
+    assert_eq!(
+        snap.reports[1].signal, None,
+        "must not fabricate a signal from exit_code > 128"
+    );
 }
 
 #[test]
@@ -495,25 +505,28 @@ fn real_interactive_tui_apps_less_nano_btop_and_tmux_work_end_to_end() {
         assert!(!h.terminal.screen().is_alternate_screen());
     }
 
-    // 3. Interactive `btop` (launch -> alt screen -> resize -> quit 'q' -> return to shell)
+    // 3. Interactive `btop` (launch -> MUST enter alt screen -> resize -> quit 'q' -> return to shell)
     if Command::new("which")
         .arg("btop")
         .output()
         .is_ok_and(|o| o.status.success())
     {
         let mut h = HeadlessPtyHarness::spawn(100, 30);
-        h.send(b"btop --utf-force; printf 'BTOP_%s\\n' CLEAN\n");
-        if h.wait_for_alt_screen(true, Duration::from_secs(5)) {
-            h.resize(110, 32);
-            std::thread::sleep(Duration::from_millis(150));
-            h.send(b"q");
-            assert!(
-                h.wait_for_output_line("BTOP_CLEAN", Duration::from_secs(5)),
-                "btop did not exit cleanly:\n{}",
-                h.screen_text()
-            );
-            assert!(!h.terminal.screen().is_alternate_screen());
-        }
+        h.send(b"LC_ALL=C.UTF-8 btop; printf 'BTOP_%s\\n' CLEAN\n");
+        assert!(
+            h.wait_for_alt_screen(true, Duration::from_secs(5)),
+            "btop did not enter alternate screen:\n{}",
+            h.screen_text()
+        );
+        h.resize(110, 32);
+        std::thread::sleep(Duration::from_millis(150));
+        h.send(b"q");
+        assert!(
+            h.wait_for_output_line("BTOP_CLEAN", Duration::from_secs(5)),
+            "btop did not exit cleanly:\n{}",
+            h.screen_text()
+        );
+        assert!(!h.terminal.screen().is_alternate_screen());
     }
 
     // 4. Interactive `nano` (launch -> alt screen -> type -> Ctrl+X -> 'n' -> return to shell)
