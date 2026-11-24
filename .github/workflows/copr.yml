@@ -60,6 +60,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # GitHub mounts the host-owned checkout into the Fedora job container.
+      - name: Trust the checked-out workspace in the container
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Submit or watch the existing COPR build
         env:
           COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
