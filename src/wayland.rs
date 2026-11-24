@@ -330,6 +330,7 @@ struct State {
 
     bus: crate::events::EventBus,
     platform_config: crate::config::PlatformConfig,
+    settings_overlay: crate::widgets::editor_ui::SettingsOverlay,
     widgets: Option<crate::widgets::WidgetManager>,
     media: Option<crate::media::MediaManager>,
     background: Option<crate::background::BackgroundEngine>,
@@ -1287,6 +1288,25 @@ impl State {
             return;
         }
         if pressed {
+            if self.settings_overlay.open {
+                let (consumed, changed) = self
+                    .settings_overlay
+                    .handle_click((x as f32, y as f32), &mut self.platform_config);
+                if consumed {
+                    if changed {
+                        if let Some(bg) = &mut self.background {
+                            bg.config = self.platform_config.background.clone();
+                        }
+                        if let Some(xr) = &mut self.xray {
+                            xr.set_level(self.platform_config.xray.level);
+                            xr.config = self.platform_config.xray.clone();
+                        }
+                    }
+                    self.platform_dirty = true;
+                    self.dirty = true;
+                    return;
+                }
+            }
             for hit in &self.xray_hits {
                 let (px, py) = (x as f32, y as f32);
                 if px >= hit.x && px <= hit.x + hit.w && py >= hit.y && py <= hit.y + hit.h {
@@ -1784,6 +1804,16 @@ impl State {
                 self.dirty |= t.screen_mut().scroll_view(delta);
             }
             return true;
+        }
+
+        // Unified Settings Overlay hotkey (works even when Widgets JS VM is disabled).
+        if crate::config::Hotkey::parse(&self.platform_config.keyboard.settings_hotkey)
+            .is_some_and(|hk| hk.matches(ctrl, shift, alt, key))
+        {
+            self.settings_overlay.toggle();
+            self.platform_dirty = true;
+            self.dirty = true;
+            return false;
         }
 
         // Visual Layout Editor hotkey — ONLY intercept when Widgets subsystem is enabled!
@@ -2700,19 +2730,26 @@ impl State {
             self.xray_hits.clear();
             xray.emit_to_scene(win_size, scale, theme, renderer, scene, &mut self.xray_hits);
         }
+        if self.settings_overlay.open {
+            self.settings_overlay.emit_to_scene(
+                &self.platform_config,
+                win_size,
+                scale,
+                pointer_px,
+                theme,
+                renderer,
+                scene,
+            );
+        }
     }
 }
 
 fn load_platform_config() -> crate::config::PlatformConfig {
-    let path = std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|p| !p.is_empty() && std::path::Path::new(p).is_absolute())
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|p| std::path::PathBuf::from(p).join(".config")))
-        .map(|p| p.join("beyrix/platform.toml"));
-    if let Some(path) = path
-        && let Ok(text) = std::fs::read_to_string(path)
-        && let Ok(cfg) = crate::config::PlatformConfig::parse_toml(&text)
-    {
+    if let Some(path) = crate::config::PlatformConfig::config_path() {
+        let (cfg, err) = crate::config::PlatformConfig::load_with_diagnostics(&path);
+        if let Some(e) = err {
+            eprintln!("beyrix platform config: {e}");
+        }
         return cfg;
     }
     crate::config::PlatformConfig::default()

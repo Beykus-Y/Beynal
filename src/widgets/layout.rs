@@ -224,6 +224,165 @@ pub struct LayoutProfile {
     pub widgets: BTreeMap<String, WidgetPlacementConfig>,
 }
 
+/// Manages built-in and user layout profiles (create, rename, copy, delete,
+/// switch, import, export).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ProfileStore {
+    pub active: String,
+    pub profiles: BTreeMap<String, LayoutProfile>,
+}
+
+impl Default for ProfileStore {
+    fn default() -> Self {
+        let mut profiles = BTreeMap::new();
+        for (name, widgets) in [
+            ("Minimal", BTreeMap::new()),
+            ("Development", Self::development_preset()),
+            ("Music", Self::music_preset()),
+            ("Diagnostics", Self::diagnostics_preset()),
+        ] {
+            profiles.insert(
+                name.to_string(),
+                LayoutProfile {
+                    name: name.to_string(),
+                    widgets,
+                },
+            );
+        }
+        Self {
+            active: "Development".to_string(),
+            profiles,
+        }
+    }
+}
+
+impl ProfileStore {
+    fn development_preset() -> BTreeMap<String, WidgetPlacementConfig> {
+        let mut m = BTreeMap::new();
+        m.insert(
+            "beyrix.official.keyboard-layout".into(),
+            WidgetPlacementConfig {
+                mode: PlacementMode::Overlay,
+                anchor: Anchor::TopRight,
+                x: -12.0,
+                y: 10.0,
+                width: 84.0,
+                height: 30.0,
+                min_width: 56.0,
+                min_height: 26.0,
+                priority: 30,
+                click_through: true,
+                ..Default::default()
+            },
+        );
+        m
+    }
+
+    fn music_preset() -> BTreeMap<String, WidgetPlacementConfig> {
+        let mut m = Self::development_preset();
+        m.insert(
+            "beyrix.official.media-player".into(),
+            WidgetPlacementConfig {
+                mode: PlacementMode::Overlay,
+                anchor: Anchor::BottomRight,
+                x: -14.0,
+                y: -14.0,
+                width: 280.0,
+                height: 112.0,
+                min_width: 170.0,
+                min_height: 44.0,
+                priority: 20,
+                ..Default::default()
+            },
+        );
+        m
+    }
+
+    fn diagnostics_preset() -> BTreeMap<String, WidgetPlacementConfig> {
+        Self::development_preset()
+    }
+
+    pub fn create(&mut self, name: &str, widgets: BTreeMap<String, WidgetPlacementConfig>) -> bool {
+        let name = name.trim();
+        if name.is_empty() || self.profiles.contains_key(name) {
+            return false;
+        }
+        self.profiles.insert(
+            name.to_string(),
+            LayoutProfile {
+                name: name.to_string(),
+                widgets,
+            },
+        );
+        true
+    }
+
+    pub fn rename(&mut self, old: &str, new: &str) -> bool {
+        let new = new.trim();
+        if new.is_empty() || self.profiles.contains_key(new) {
+            return false;
+        }
+        if let Some(mut p) = self.profiles.remove(old) {
+            p.name = new.to_string();
+            self.profiles.insert(new.to_string(), p);
+            if self.active == old {
+                self.active = new.to_string();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn duplicate(&mut self, source: &str, dest: &str) -> bool {
+        let Some(p) = self.profiles.get(source).cloned() else {
+            return false;
+        };
+        self.create(dest, p.widgets)
+    }
+
+    pub fn delete(&mut self, name: &str) -> bool {
+        if self.profiles.len() <= 1 || !self.profiles.contains_key(name) {
+            return false;
+        }
+        self.profiles.remove(name);
+        if self.active == name
+            && let Some(first) = self.profiles.keys().next().cloned()
+        {
+            self.active = first;
+        }
+        true
+    }
+
+    pub fn switch(&mut self, name: &str) -> Option<&LayoutProfile> {
+        if self.profiles.contains_key(name) {
+            self.active = name.to_string();
+            self.profiles.get(name)
+        } else {
+            None
+        }
+    }
+
+    pub fn export_toml(&self, name: &str) -> Result<String, String> {
+        let profile = self
+            .profiles
+            .get(name)
+            .ok_or_else(|| format!("profile {name:?} not found"))?;
+        toml::to_string_pretty(profile).map_err(|e| format!("export profile: {e}"))
+    }
+
+    pub fn import_toml(&mut self, text: &str) -> Result<String, String> {
+        let profile: LayoutProfile =
+            toml::from_str(text).map_err(|e| format!("import profile: {e}"))?;
+        if profile.name.trim().is_empty() {
+            return Err("imported profile has empty name".to_string());
+        }
+        let name = profile.name.clone();
+        self.profiles.insert(name.clone(), profile);
+        Ok(name)
+    }
+}
+
 /// Multi-signal fullscreen TUI detector.
 ///
 /// Alternate screen alone is not treated as the sole signal; we combine
@@ -535,15 +694,39 @@ fn anchor_origin(
     }
 }
 
-/// Interactive visual layout editor state (Drag & Drop, resize, snapping).
+/// Alignment guide line emitted during interactive Drag & Drop snapping.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnapGuide {
+    pub vertical: bool,
+    pub position_px: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EditorTab {
+    #[default]
+    Catalog,
+    Properties,
+    Layers,
+    Profiles,
+    Background,
+    XRay,
+}
+
+/// Interactive visual layout editor state (Drag & Drop, resize, snapping,
+/// Undo/Redo, alignment guides, and sidebar tabs).
 #[derive(Clone, Debug, Default)]
 pub struct VisualLayoutEditor {
     pub active: bool,
+    pub active_tab: EditorTab,
     pub selected_widget: Option<String>,
     pub drag_mode: Option<DragOperation>,
     pub drag_start_pointer: (f32, f32),
     pub drag_start_rect: (f32, f32, f32, f32),
     pub snap_threshold_px: f32,
+    pub active_guides: Vec<SnapGuide>,
+    pub undo_stack: Vec<BTreeMap<String, WidgetPlacementConfig>>,
+    pub redo_stack: Vec<BTreeMap<String, WidgetPlacementConfig>>,
+    pub confirm_reset_profile: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -552,17 +735,52 @@ pub enum DragOperation {
     ResizeBottomRight,
     ResizeRight,
     ResizeBottom,
+    ResizeLeft,
+    ResizeTop,
 }
 
 impl VisualLayoutEditor {
     pub fn new() -> Self {
         Self {
             active: false,
+            active_tab: EditorTab::Catalog,
             selected_widget: None,
             drag_mode: None,
             drag_start_pointer: (0.0, 0.0),
             drag_start_rect: (0.0, 0.0, 0.0, 0.0),
             snap_threshold_px: 12.0,
+            active_guides: Vec::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            confirm_reset_profile: false,
+        }
+    }
+
+    pub fn push_undo(&mut self, snapshot: BTreeMap<String, WidgetPlacementConfig>) {
+        if self.undo_stack.len() >= 64 {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(snapshot);
+        self.redo_stack.clear();
+    }
+
+    pub fn undo(&mut self, current: &mut BTreeMap<String, WidgetPlacementConfig>) -> bool {
+        if let Some(prev) = self.undo_stack.pop() {
+            self.redo_stack.push(current.clone());
+            *current = prev;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn redo(&mut self, current: &mut BTreeMap<String, WidgetPlacementConfig>) -> bool {
+        if let Some(next) = self.redo_stack.pop() {
+            self.undo_stack.push(current.clone());
+            *current = next;
+            true
+        } else {
+            false
         }
     }
 
@@ -570,6 +788,8 @@ impl VisualLayoutEditor {
         self.active = !self.active;
         if !self.active {
             self.drag_mode = None;
+            self.active_guides.clear();
+            self.confirm_reset_profile = false;
         }
     }
 
@@ -584,11 +804,12 @@ impl VisualLayoutEditor {
         self.drag_mode = Some(op);
         self.drag_start_pointer = pointer_px;
         self.drag_start_rect = current_rect;
+        self.active_guides.clear();
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn update_drag(
-        &self,
+        &mut self,
         cfg: &mut WidgetPlacementConfig,
         pointer_px: (f32, f32),
         win_w: f32,
@@ -597,9 +818,28 @@ impl VisualLayoutEditor {
         cell_w: f32,
         cell_h: f32,
     ) {
+        self.update_drag_with_neighbors(cfg, pointer_px, win_w, win_h, scale, cell_w, cell_h, &[]);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_drag_with_neighbors(
+        &mut self,
+        cfg: &mut WidgetPlacementConfig,
+        pointer_px: (f32, f32),
+        win_w: f32,
+        win_h: f32,
+        scale: f32,
+        cell_w: f32,
+        cell_h: f32,
+        neighbors: &[(f32, f32, f32, f32)],
+    ) {
+        if cfg.locked {
+            return;
+        }
         let Some(op) = self.drag_mode else {
             return;
         };
+        self.active_guides.clear();
         let dx = pointer_px.0 - self.drag_start_pointer.0;
         let dy = pointer_px.1 - self.drag_start_pointer.1;
         let (sx, sy, sw, sh) = self.drag_start_rect;
@@ -609,46 +849,115 @@ impl VisualLayoutEditor {
             DragOperation::Move => {
                 let mut nx = (sx + dx).clamp(0.0, (win_w - sw).max(0.0));
                 let mut ny = (sy + dy).clamp(0.0, (win_h - sh).max(0.0));
-                // Snap to edges & center
+                // Snap to window edges & center
                 if nx < snap {
                     nx = 0.0;
+                    self.active_guides.push(SnapGuide {
+                        vertical: true,
+                        position_px: 0.0,
+                    });
                 } else if (win_w - (nx + sw)).abs() < snap {
                     nx = win_w - sw;
+                    self.active_guides.push(SnapGuide {
+                        vertical: true,
+                        position_px: win_w,
+                    });
                 } else if ((nx + sw * 0.5) - win_w * 0.5).abs() < snap {
                     nx = (win_w - sw) * 0.5;
+                    self.active_guides.push(SnapGuide {
+                        vertical: true,
+                        position_px: win_w * 0.5,
+                    });
                 }
                 if ny < snap {
                     ny = 0.0;
+                    self.active_guides.push(SnapGuide {
+                        vertical: false,
+                        position_px: 0.0,
+                    });
                 } else if (win_h - (ny + sh)).abs() < snap {
                     ny = win_h - sh;
+                    self.active_guides.push(SnapGuide {
+                        vertical: false,
+                        position_px: win_h,
+                    });
                 } else if ((ny + sh * 0.5) - win_h * 0.5).abs() < snap {
                     ny = (win_h - sh) * 0.5;
+                    self.active_guides.push(SnapGuide {
+                        vertical: false,
+                        position_px: win_h * 0.5,
+                    });
+                }
+                // Snap to neighbor widget edges
+                for &(ox, oy, ow, oh) in neighbors {
+                    if (nx - ox).abs() < snap {
+                        nx = ox;
+                        self.active_guides.push(SnapGuide {
+                            vertical: true,
+                            position_px: ox,
+                        });
+                    } else if (nx - (ox + ow)).abs() < snap {
+                        nx = ox + ow;
+                        self.active_guides.push(SnapGuide {
+                            vertical: true,
+                            position_px: ox + ow,
+                        });
+                    }
+                    if (ny - oy).abs() < snap {
+                        ny = oy;
+                        self.active_guides.push(SnapGuide {
+                            vertical: false,
+                            position_px: oy,
+                        });
+                    } else if (ny - (oy + oh)).abs() < snap {
+                        ny = oy + oh;
+                        self.active_guides.push(SnapGuide {
+                            vertical: false,
+                            position_px: oy + oh,
+                        });
+                    }
                 }
                 if cfg.snap_to_grid && cell_w > 0.0 && cell_h > 0.0 {
                     nx = (nx / cell_w).round() * cell_w;
                     ny = (ny / cell_h).round() * cell_h;
                 }
-                // Express relative to TopLeft with 0 margin for predictable visual drag
                 cfg.anchor = Anchor::TopLeft;
                 cfg.margin = 0.0;
                 cfg.x = nx / scale;
                 cfg.y = ny / scale;
             }
             DragOperation::ResizeBottomRight => {
-                cfg.width = ((sw + dx) / (cfg.scale * scale)).clamp(48.0, win_w / scale);
-                cfg.height = ((sh + dy) / (cfg.scale * scale)).clamp(28.0, win_h / scale);
+                cfg.width = ((sw + dx) / (cfg.scale * scale)).clamp(cfg.min_width, win_w / scale);
+                cfg.height = ((sh + dy) / (cfg.scale * scale)).clamp(cfg.min_height, win_h / scale);
             }
             DragOperation::ResizeRight => {
-                cfg.width = ((sw + dx) / (cfg.scale * scale)).clamp(48.0, win_w / scale);
+                cfg.width = ((sw + dx) / (cfg.scale * scale)).clamp(cfg.min_width, win_w / scale);
             }
             DragOperation::ResizeBottom => {
-                cfg.height = ((sh + dy) / (cfg.scale * scale)).clamp(28.0, win_h / scale);
+                cfg.height = ((sh + dy) / (cfg.scale * scale)).clamp(cfg.min_height, win_h / scale);
+            }
+            DragOperation::ResizeLeft => {
+                let new_w = ((sw - dx) / (cfg.scale * scale)).clamp(cfg.min_width, win_w / scale);
+                let actual_dx = sw - new_w * cfg.scale * scale;
+                cfg.anchor = Anchor::TopLeft;
+                cfg.margin = 0.0;
+                cfg.x = (sx + actual_dx).max(0.0) / scale;
+                cfg.width = new_w;
+            }
+            DragOperation::ResizeTop => {
+                let new_h = ((sh - dy) / (cfg.scale * scale)).clamp(cfg.min_height, win_h / scale);
+                let actual_dy = sh - new_h * cfg.scale * scale;
+                cfg.anchor = Anchor::TopLeft;
+                cfg.margin = 0.0;
+                cfg.y = (sy + actual_dy).max(0.0) / scale;
+                cfg.height = new_h;
             }
         }
     }
 
     pub fn end_drag(&mut self) {
         self.drag_mode = None;
+        self.active_guides.clear();
     }
 }
 
@@ -808,5 +1117,32 @@ mod tests {
         };
         let bounded = compute_dock_insets_bounded(&[&huge_dock], false, 1.0, Some((800.0, 500.0)));
         assert!(bounded.top <= 500.0 * 0.40 + 0.01);
+    }
+
+    #[test]
+    fn profile_store_crud_export_import_and_editor_undo_redo() {
+        let mut store = ProfileStore::default();
+        assert!(store.profiles.contains_key("Minimal"));
+        assert!(store.profiles.contains_key("Development"));
+        assert!(store.profiles.contains_key("Music"));
+        assert!(store.profiles.contains_key("Diagnostics"));
+
+        assert!(store.duplicate("Music", "MyMusic"));
+        assert!(store.rename("MyMusic", "FocusMusic"));
+        assert!(store.switch("FocusMusic").is_some());
+        let exported = store.export_toml("FocusMusic").unwrap();
+        assert!(store.delete("FocusMusic"));
+        let imported = store.import_toml(&exported).unwrap();
+        assert_eq!(imported, "FocusMusic");
+
+        let mut ed = VisualLayoutEditor::new();
+        let mut placements = BTreeMap::new();
+        placements.insert("w1".into(), WidgetPlacementConfig::default());
+        ed.push_undo(placements.clone());
+        placements.get_mut("w1").unwrap().x = 123.0;
+        assert!(ed.undo(&mut placements));
+        assert_ne!(placements.get("w1").unwrap().x, 123.0);
+        assert!(ed.redo(&mut placements));
+        assert_eq!(placements.get("w1").unwrap().x, 123.0);
     }
 }

@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+pub mod editor_ui;
 pub mod layout;
 pub mod manifest;
 pub mod permissions;
@@ -49,8 +50,10 @@ pub struct WidgetManager {
     pub trust_levels: BTreeMap<String, ExtensionTrust>,
     pub granted_permissions: BTreeMap<String, PermissionSet>,
     pub placements: BTreeMap<String, WidgetPlacementConfig>,
+    pub profiles: layout::ProfileStore,
     pub extension_settings: BTreeMap<String, serde_json::Value>,
     pub editor: VisualLayoutEditor,
+    pub editor_hits: Vec<UiHitTarget>,
     pub hit_targets: Vec<UiHitTarget>,
     pub resolved_rects: BTreeMap<String, ResolvedWidgetRect>,
     generations: BTreeMap<String, u64>,
@@ -66,8 +69,10 @@ impl WidgetManager {
             trust_levels: BTreeMap::new(),
             granted_permissions: BTreeMap::new(),
             placements: BTreeMap::new(),
+            profiles: layout::ProfileStore::default(),
             extension_settings: BTreeMap::new(),
             editor: VisualLayoutEditor::new(),
+            editor_hits: Vec::new(),
             hit_targets: Vec::new(),
             resolved_rects: BTreeMap::new(),
             generations: BTreeMap::new(),
@@ -290,6 +295,7 @@ impl WidgetManager {
         scene: &mut Scene,
     ) {
         self.hit_targets.clear();
+        self.editor_hits.clear();
         self.resolved_rects.clear();
         if !self.config.enabled {
             return;
@@ -377,6 +383,20 @@ impl WidgetManager {
                 );
             }
         }
+        if self.editor.active {
+            let mut ed_hits = Vec::new();
+            editor_ui::emit_visual_editor_panel(
+                self,
+                win_size,
+                scale,
+                pointer_px,
+                theme,
+                renderer,
+                scene,
+                &mut ed_hits,
+            );
+            self.editor_hits = ed_hits;
+        }
     }
 
     /// Handle pointer press; returns `true` if a widget or the layout editor consumed it.
@@ -385,6 +405,146 @@ impl WidgetManager {
             return false;
         }
         if self.editor.active {
+            // 1. Check Visual Layout Editor panel controls first.
+            let hit_opt = self
+                .editor_hits
+                .iter()
+                .rev()
+                .find(|h| {
+                    pointer_px.0 >= h.x
+                        && pointer_px.0 <= h.x + h.w
+                        && pointer_px.1 >= h.y
+                        && pointer_px.1 <= h.y + h.h
+                })
+                .cloned();
+            if let Some(hit) = hit_opt {
+                match (hit.node_id.as_str(), hit.kind) {
+                    ("ed.tabs", HitKind::Tab(idx)) => {
+                        self.editor.active_tab = match idx {
+                            0 => layout::EditorTab::Catalog,
+                            1 => layout::EditorTab::Properties,
+                            2 => layout::EditorTab::Layers,
+                            _ => layout::EditorTab::Profiles,
+                        };
+                    }
+                    ("ed.close", _) => self.editor.toggle(),
+                    ("ed.undo", _) => {
+                        self.editor.undo(&mut self.placements);
+                    }
+                    ("ed.redo", _) => {
+                        self.editor.redo(&mut self.placements);
+                    }
+                    ("ed.prop.mode", _) => {
+                        if let Some(id) = self.editor.selected_widget.clone() {
+                            self.editor.push_undo(self.placements.clone());
+                            if let Some(cfg) = self.placements.get_mut(&id) {
+                                cfg.mode = editor_ui::cycle_placement_mode(cfg.mode);
+                            }
+                        }
+                    }
+                    ("ed.prop.anchor", _) => {
+                        if let Some(id) = self.editor.selected_widget.clone() {
+                            self.editor.push_undo(self.placements.clone());
+                            if let Some(cfg) = self.placements.get_mut(&id) {
+                                cfg.anchor = editor_ui::cycle_anchor(cfg.anchor);
+                            }
+                        }
+                    }
+                    ("ed.prop.tui", _) => {
+                        if let Some(id) = self.editor.selected_widget.clone() {
+                            self.editor.push_undo(self.placements.clone());
+                            if let Some(cfg) = self.placements.get_mut(&id) {
+                                cfg.tui_behavior = editor_ui::cycle_tui_behavior(cfg.tui_behavior);
+                            }
+                        }
+                    }
+                    ("ed.prop.narrow", _) => {
+                        if let Some(id) = self.editor.selected_widget.clone() {
+                            self.editor.push_undo(self.placements.clone());
+                            if let Some(cfg) = self.placements.get_mut(&id) {
+                                cfg.narrow_behavior =
+                                    editor_ui::cycle_narrow_behavior(cfg.narrow_behavior);
+                            }
+                        }
+                    }
+                    ("ed.prop.lock", _) => {
+                        if let Some(id) = self.editor.selected_widget.clone() {
+                            self.editor.push_undo(self.placements.clone());
+                            if let Some(cfg) = self.placements.get_mut(&id) {
+                                cfg.locked = !cfg.locked;
+                            }
+                        }
+                    }
+                    ("ed.prop.click_through", _) => {
+                        if let Some(id) = self.editor.selected_widget.clone() {
+                            self.editor.push_undo(self.placements.clone());
+                            if let Some(cfg) = self.placements.get_mut(&id) {
+                                cfg.click_through = !cfg.click_through;
+                            }
+                        }
+                    }
+                    ("ed.prop.hover", _) => {
+                        if let Some(id) = self.editor.selected_widget.clone() {
+                            self.editor.push_undo(self.placements.clone());
+                            if let Some(cfg) = self.placements.get_mut(&id) {
+                                cfg.show_on_hover = !cfg.show_on_hover;
+                            }
+                        }
+                    }
+                    ("ed.prop.snap", _) => {
+                        if let Some(id) = self.editor.selected_widget.clone() {
+                            self.editor.push_undo(self.placements.clone());
+                            if let Some(cfg) = self.placements.get_mut(&id) {
+                                cfg.snap_to_grid = !cfg.snap_to_grid;
+                            }
+                        }
+                    }
+                    ("ed.prop.avoid", _) => {
+                        if let Some(id) = self.editor.selected_widget.clone() {
+                            self.editor.push_undo(self.placements.clone());
+                            if let Some(cfg) = self.placements.get_mut(&id) {
+                                cfg.avoid_overlap = !cfg.avoid_overlap;
+                            }
+                        }
+                    }
+                    (id_str, _) if id_str.starts_with("ed.select.") => {
+                        let wid = id_str.trim_start_matches("ed.select.").to_string();
+                        self.editor.selected_widget = Some(wid);
+                        self.editor.active_tab = layout::EditorTab::Properties;
+                    }
+                    (id_str, _) if id_str.starts_with("ed.reload.") => {
+                        let wid = id_str.trim_start_matches("ed.reload.");
+                        let _ = self.reload_extension(wid);
+                    }
+                    (id_str, _) if id_str.starts_with("ed.zup.") => {
+                        let wid = id_str.trim_start_matches("ed.zup.").to_string();
+                        self.editor.push_undo(self.placements.clone());
+                        if let Some(cfg) = self.placements.get_mut(&wid) {
+                            cfg.z_index += 1;
+                        }
+                    }
+                    (id_str, _) if id_str.starts_with("ed.zdn.") => {
+                        let wid = id_str.trim_start_matches("ed.zdn.").to_string();
+                        self.editor.push_undo(self.placements.clone());
+                        if let Some(cfg) = self.placements.get_mut(&wid) {
+                            cfg.z_index -= 1;
+                        }
+                    }
+                    (id_str, _) if id_str.starts_with("ed.profile.") => {
+                        let name = id_str.trim_start_matches("ed.profile.").to_string();
+                        self.editor.push_undo(self.placements.clone());
+                        if let Some(profile) = self.profiles.switch(&name) {
+                            for (wid, pcfg) in &profile.widgets {
+                                self.placements.insert(wid.clone(), pcfg.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                return true;
+            }
+
+            // 2. Otherwise check widget canvas for Drag & Drop / Resize handles.
             for (id, rect) in &self.resolved_rects {
                 if pointer_px.0 >= rect.x
                     && pointer_px.0 <= rect.x + rect.w
@@ -396,9 +556,18 @@ impl WidgetManager {
                         && pointer_px.1 >= rect.y + rect.h - handle
                     {
                         DragOperation::ResizeBottomRight
+                    } else if pointer_px.0 >= rect.x + rect.w - handle {
+                        DragOperation::ResizeRight
+                    } else if pointer_px.1 >= rect.y + rect.h - handle {
+                        DragOperation::ResizeBottom
+                    } else if pointer_px.0 <= rect.x + handle {
+                        DragOperation::ResizeLeft
+                    } else if pointer_px.1 <= rect.y + handle {
+                        DragOperation::ResizeTop
                     } else {
                         DragOperation::Move
                     };
+                    self.editor.push_undo(self.placements.clone());
                     self.editor.begin_drag(
                         id.clone(),
                         op,
@@ -457,10 +626,16 @@ impl WidgetManager {
         if !self.editor.active || self.editor.drag_mode.is_none() {
             return false;
         }
-        if let Some(id) = &self.editor.selected_widget
-            && let Some(cfg) = self.placements.get_mut(id)
+        if let Some(id) = self.editor.selected_widget.clone()
+            && let Some(cfg) = self.placements.get_mut(&id)
         {
-            self.editor.update_drag(
+            let neighbors: Vec<(f32, f32, f32, f32)> = self
+                .resolved_rects
+                .iter()
+                .filter(|(k, r)| *k != &id && r.visible)
+                .map(|(_, r)| (r.x, r.y, r.w, r.h))
+                .collect();
+            self.editor.update_drag_with_neighbors(
                 cfg,
                 pointer_px,
                 win_size.0,
@@ -468,6 +643,7 @@ impl WidgetManager {
                 scale,
                 cell_size.0,
                 cell_size.1,
+                &neighbors,
             );
             return true;
         }

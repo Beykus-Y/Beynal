@@ -377,6 +377,50 @@ impl PlatformConfig {
         Ok(cfg)
     }
 
+    pub fn config_path() -> Option<PathBuf> {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|p| !p.is_empty() && std::path::Path::new(p).is_absolute())
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
+            .map(|p| p.join("beyrix/platform.toml"))
+    }
+
+    /// Load configuration from `path`, returning `(config, optional_error)`.
+    /// Never overwrites or deletes a broken user file on parse error.
+    pub fn load_with_diagnostics(path: &std::path::Path) -> (Self, Option<String>) {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return (Self::default(), None);
+        };
+        match Self::parse_toml(&text) {
+            Ok(cfg) => (cfg, None),
+            Err(err) => (
+                Self::default(),
+                Some(format!("Failed to parse {}: {err}", path.display())),
+            ),
+        }
+    }
+
+    /// Atomically write configuration to `path`, creating a `.bak` backup of any
+    /// existing file first so user settings are never lost on crash or error.
+    pub fn save_atomic(&self, path: &std::path::Path) -> Result<(), String> {
+        let toml_text =
+            toml::to_string_pretty(self).map_err(|e| format!("serialize platform config: {e}"))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create config dir {}: {e}", parent.display()))?;
+        }
+        if path.is_file() {
+            let backup = path.with_extension("toml.bak");
+            let _ = std::fs::copy(path, backup);
+        }
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, toml_text.as_bytes())
+            .map_err(|e| format!("write temp config {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .map_err(|e| format!("commit config {}: {e}", path.display()))?;
+        Ok(())
+    }
+
     pub fn default_extensions_dir() -> Option<PathBuf> {
         std::env::var_os("XDG_DATA_HOME")
             .filter(|p| !p.is_empty() && std::path::Path::new(p).is_absolute())
@@ -425,5 +469,31 @@ poll_interval_ms = 200
         assert_eq!(cfg.background.preset, BackgroundPreset::AudioReactive);
         assert_eq!(cfg.background.fps, 60);
         assert_eq!(cfg.xray.level, XRayLevel::Inspect);
+    }
+
+    #[test]
+    fn atomic_save_creates_backup_and_parse_error_preserves_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("platform.toml");
+        let mut cfg = PlatformConfig::default();
+        cfg.widgets.enabled = true;
+        cfg.keyboard.clear_selection_after_copy = false;
+        cfg.save_atomic(&path).unwrap();
+
+        let (loaded, err) = PlatformConfig::load_with_diagnostics(&path);
+        assert!(err.is_none());
+        assert_eq!(loaded, cfg);
+
+        // Second save creates .bak backup of previous file.
+        cfg.background.enabled = true;
+        cfg.save_atomic(&path).unwrap();
+        assert!(path.with_extension("toml.bak").is_file());
+
+        // Broken TOML returns diagnostic error without destroying the file.
+        std::fs::write(&path, "not valid = [toml").unwrap();
+        let (fallback, diag) = PlatformConfig::load_with_diagnostics(&path);
+        assert!(diag.is_some());
+        assert_eq!(fallback, PlatformConfig::default());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not valid = [toml");
     }
 }
