@@ -28,11 +28,20 @@ pub struct SceneRect {
     pub color: [f32; 4],
 }
 
+/// Font family category for glyph rasterization.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FontKind {
+    #[default]
+    Mono,
+    Ui,
+}
+
 /// A one-to-one copy from a glyph bitmap into the physical framebuffer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SceneGlyph {
     pub ch: char,
     pub px_size: f32,
+    pub font_kind: FontKind,
     pub x: usize,
     pub y: usize,
     pub w: usize,
@@ -41,7 +50,7 @@ pub struct SceneGlyph {
     pub color: [f32; 4],
 }
 
-/// A rounded rectangle with optional border in physical pixels.
+/// A rounded rectangle with optional border, drop shadow, and clip rect in physical pixels.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SceneRoundedRect {
     pub x: f32,
@@ -52,6 +61,10 @@ pub struct SceneRoundedRect {
     pub color: [f32; 4],
     pub border_width: f32,
     pub border_color: [f32; 4],
+    pub shadow_blur: f32,
+    pub shadow_offset_y: f32,
+    pub shadow_color: [f32; 4],
+    pub clip: Option<[f32; 4]>,
 }
 
 /// An RGBA bitmap image quad in physical pixels.
@@ -67,6 +80,7 @@ pub struct SceneImage {
     pub h: f32,
     pub alpha: f32,
     pub radius: f32,
+    pub clip: Option<[f32; 4]>,
 }
 
 /// Drawing instructions shared by the OpenGL and software backends.
@@ -81,6 +95,9 @@ pub struct Scene {
     pub overlay_rounded: Vec<SceneRoundedRect>,
     pub overlay_images: Vec<SceneImage>,
     pub overlay_glyphs: Vec<SceneGlyph>,
+    pub panel_rounded: Vec<SceneRoundedRect>,
+    pub panel_images: Vec<SceneImage>,
+    pub panel_glyphs: Vec<SceneGlyph>,
     pub background: [f32; 4],
 }
 
@@ -192,8 +209,9 @@ const GLYPH_CACHE_ENTRIES: usize = 4096;
 
 pub struct Renderer {
     fonts: Vec<Font>,
+    ui_fonts: Vec<Font>,
     font_geometry: Cell<Option<(u32, Geometry)>>,
-    cache: HashMap<(char, u32), (Metrics, Vec<u8>)>,
+    cache: HashMap<(char, u32, FontKind), (Metrics, Vec<u8>)>,
     cache_bytes: usize,
     theme: crate::theme::Theme,
 }
@@ -258,9 +276,68 @@ impl Renderer {
                 "no usable system font found (install a monospace font or fontconfig)",
             ));
         }
+
+        // Load a proportional sans-serif UI font stack separately from the monospace terminal font.
+        let mut ui_paths = Vec::new();
+        for pattern in [
+            "Inter,Cantarell,Noto Sans,DejaVu Sans,sans-serif:style=Regular",
+            "sans-serif:style=Regular",
+        ] {
+            if let Ok(output) = Command::new("fc-match")
+                .args(["-s", "-f", "%{file}\\t%{index}\\n", pattern])
+                .output()
+                && output.status.success()
+            {
+                ui_paths.extend(
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .filter_map(|line| {
+                            let (path, index) = line.rsplit_once('\t')?;
+                            Some((path.to_owned(), index.parse::<u32>().ok()? & 0xffff))
+                        }),
+                );
+                if !ui_paths.is_empty() {
+                    break;
+                }
+            }
+        }
+        ui_paths.extend(
+            [
+                "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+                "/usr/share/fonts/cantarell/Cantarell-Regular.otf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+                "/usr/share/fonts/liberation-sans-fonts/LiberationSans-Regular.ttf",
+            ]
+            .iter()
+            .map(|s| (s.to_string(), 0)),
+        );
+        let mut ui_fonts = Vec::new();
+        let mut ui_seen = std::collections::HashSet::new();
+        for (path, collection_index) in ui_paths {
+            if !ui_seen.insert((path.clone(), collection_index)) {
+                continue;
+            }
+            if let Ok(data) = std::fs::read(path)
+                && let Ok(font) = Font::from_bytes(
+                    data,
+                    FontSettings {
+                        collection_index,
+                        ..Default::default()
+                    },
+                )
+            {
+                ui_fonts.push(font);
+                if ui_fonts.len() == 8 {
+                    break;
+                }
+            }
+        }
+
         Ok(Self {
             font_geometry: Cell::default(),
             fonts,
+            ui_fonts,
             cache: HashMap::new(),
             cache_bytes: 0,
             theme,
@@ -317,22 +394,71 @@ impl Renderer {
             .find(|font| font.lookup_glyph_index(ch) != 0)
     }
 
+    fn font_for_kind(&self, ch: char, kind: FontKind) -> Option<&Font> {
+        match kind {
+            FontKind::Mono => self.font_for(ch),
+            FontKind::Ui => self
+                .ui_fonts
+                .iter()
+                .find(|font| font.lookup_glyph_index(ch) != 0)
+                .or_else(|| self.font_for(ch)),
+        }
+    }
+
     fn raster_source(&self, ch: char) -> (&Font, char) {
-        if let Some(font) = self.font_for(ch) {
+        self.raster_source_kind(ch, FontKind::Mono)
+    }
+
+    fn raster_source_kind(&self, ch: char, kind: FontKind) -> (&Font, char) {
+        if let Some(font) = self.font_for_kind(ch, kind) {
             (font, ch)
         } else {
             // Some faces give the missing-glyph slot an empty outline.
             // Use an explicit replacement while keeping the original cell span.
             let replacement = '\u{fffd}';
-            self.font_for(replacement)
-                .map_or((&self.fonts[0], '?'), |font| (font, replacement))
+            let fallback_primary = match kind {
+                FontKind::Ui => self.ui_fonts.first().unwrap_or(&self.fonts[0]),
+                FontKind::Mono => &self.fonts[0],
+            };
+            self.font_for_kind(replacement, kind)
+                .map_or((fallback_primary, '?'), |font| (font, replacement))
         }
     }
 
+    #[cfg(test)]
+    pub fn has_distinct_ui_font(&self) -> bool {
+        !self.ui_fonts.is_empty()
+    }
+
+    /// Measure proportional UI text width and line height in physical pixels.
+    pub fn measure_ui_text(&self, text: &str, px_size: f32) -> (f32, f32) {
+        let mut width = 0.0_f32;
+        for ch in text.chars() {
+            if ch == ' ' {
+                let (font, _) = self.raster_source_kind(' ', FontKind::Ui);
+                let adv = font.metrics(' ', px_size).advance_width;
+                width += if adv > 0.5 { adv } else { px_size * 0.32 };
+            } else {
+                let (font, rc) = self.raster_source_kind(ch, FontKind::Ui);
+                width += font.metrics(rc, px_size).advance_width.max(px_size * 0.25);
+            }
+        }
+        (width, (px_size * 1.35).ceil())
+    }
+
     pub fn glyph_bitmap(&mut self, ch: char, px_size: f32) -> &(Metrics, Vec<u8>) {
-        let key = (ch, px_size.to_bits());
+        self.glyph_bitmap_kind(ch, px_size, FontKind::Mono)
+    }
+
+    pub fn glyph_bitmap_kind(
+        &mut self,
+        ch: char,
+        px_size: f32,
+        kind: FontKind,
+    ) -> &(Metrics, Vec<u8>) {
+        let key = (ch, px_size.to_bits(), kind);
         if !self.cache.contains_key(&key) {
-            let (font, raster_char) = self.raster_source(ch);
+            let (font, raster_char) = self.raster_source_kind(ch, kind);
             let glyph = font.rasterize(raster_char, px_size);
             if self.cache.len() >= GLYPH_CACHE_ENTRIES
                 || self.cache_bytes + glyph.1.len() > GLYPH_CACHE_BYTES
@@ -747,6 +873,7 @@ impl Renderer {
                     h: ih,
                     alpha: 1.0,
                     radius: 0.0,
+                    clip: None,
                 });
             }
         }
@@ -858,7 +985,7 @@ impl Renderer {
         clip_right: f32,
         color: [f32; 4],
     ) {
-        let metrics = if let Some(glyph) = self.cache.get(&(ch, px_size.to_bits())) {
+        let metrics = if let Some(glyph) = self.cache.get(&(ch, px_size.to_bits(), FontKind::Mono)) {
             glyph.0
         } else {
             if combining && self.font_for(ch).is_none() {
@@ -891,6 +1018,7 @@ impl Renderer {
         scene.glyphs.push(SceneGlyph {
             ch,
             px_size,
+            font_kind: FontKind::Mono,
             x: x0 as usize,
             y: y0 as usize,
             w: (x1 - x0) as usize,
@@ -1200,6 +1328,15 @@ impl Renderer {
         if !scene.overlay_glyphs.is_empty() {
             self.paint_glyph_list(pixels, width, height, &scene.overlay_glyphs);
         }
+        if !scene.panel_rounded.is_empty() {
+            paint_rounded_rects(pixels, width, height, &scene.panel_rounded);
+        }
+        if !scene.panel_images.is_empty() {
+            paint_images(pixels, width, height, &scene.panel_images);
+        }
+        if !scene.panel_glyphs.is_empty() {
+            self.paint_glyph_list(pixels, width, height, &scene.panel_glyphs);
+        }
     }
 
     fn paint_glyph_list(
@@ -1210,7 +1347,7 @@ impl Renderer {
         glyphs: &[SceneGlyph],
     ) {
         for glyph in glyphs {
-            let (metrics, bitmap) = self.glyph_bitmap(glyph.ch, glyph.px_size);
+            let (metrics, bitmap) = self.glyph_bitmap_kind(glyph.ch, glyph.px_size, glyph.font_kind);
             let color = to_bgra(glyph.color);
             let glyph_alpha = glyph.color[3].clamp(0.0, 1.0);
             let (sx, sy) = glyph.source;
@@ -1239,6 +1376,19 @@ impl Renderer {
     }
 }
 
+#[inline]
+fn sd_rounded_box_px(px: f32, py: f32, half_w: f32, half_h: f32, r: f32) -> f32 {
+    let qx = px.abs() - half_w + r;
+    let qy = py.abs() - half_h + r;
+    qx.max(qy).min(0.0) + qx.max(0.0).hypot(qy.max(0.0)) - r
+}
+
+#[inline]
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0).max(1e-6)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 fn paint_rounded_rects(
     pixels: &mut [[u8; 4]],
     width: usize,
@@ -1246,46 +1396,97 @@ fn paint_rounded_rects(
     rects: &[SceneRoundedRect],
 ) {
     for rect in rects {
-        let x0 = (rect.x.floor().max(0.0) as usize).min(width);
-        let x1 = ((rect.x + rect.w).ceil().max(0.0) as usize).min(width);
-        let y0 = (rect.y.floor().max(0.0) as usize).min(height);
-        let y1 = ((rect.y + rect.h).ceil().max(0.0) as usize).min(height);
-        if x1 <= x0 || y1 <= y0 {
+        if rect.w <= 0.0 || rect.h <= 0.0 {
             continue;
         }
         let r = rect.radius.min(rect.w * 0.5).min(rect.h * 0.5).max(0.0);
+        let half_w = rect.w * 0.5;
+        let half_h = rect.h * 0.5;
+        let center_x = rect.x + half_w;
+        let center_y = rect.y + half_h;
+
+        let (clip_x0, clip_y0, clip_x1, clip_y1) = if let Some([cx, cy, cw, ch]) = rect.clip {
+            (
+                (cx.floor().max(0.0) as usize).min(width),
+                (cy.floor().max(0.0) as usize).min(height),
+                ((cx + cw).ceil().max(0.0) as usize).min(width),
+                ((cy + ch).ceil().max(0.0) as usize).min(height),
+            )
+        } else {
+            (0, 0, width, height)
+        };
+
+        // 1. Optional soft drop shadow behind the rounded rectangle.
+        let blur = rect.shadow_blur.max(0.0);
+        let sh_a = rect.shadow_color[3].clamp(0.0, 1.0);
+        if blur > 0.5 && sh_a > 0.002 {
+            let sh_bgra = to_bgra(rect.shadow_color);
+            let sy_center = center_y + rect.shadow_offset_y;
+            let sx0 = ((rect.x - blur).floor().max(0.0) as usize).max(clip_x0).min(clip_x1);
+            let sx1 = ((rect.x + rect.w + blur).ceil().max(0.0) as usize).max(clip_x0).min(clip_x1);
+            let sy0 = ((rect.y + rect.shadow_offset_y - blur).floor().max(0.0) as usize)
+                .max(clip_y0)
+                .min(clip_y1);
+            let sy1 = ((rect.y + rect.h + rect.shadow_offset_y + blur).ceil().max(0.0) as usize)
+                .max(clip_y0)
+                .min(clip_y1);
+            for py in sy0..sy1 {
+                let ly = py as f32 + 0.5 - sy_center;
+                for px in sx0..sx1 {
+                    let lx = px as f32 + 0.5 - center_x;
+                    let dist = sd_rounded_box_px(lx, ly, half_w, half_h, r);
+                    let falloff = 1.0 - smoothstep(-blur * 0.25, blur, dist);
+                    let a = sh_a * falloff;
+                    if a > 0.002 {
+                        let dst = &mut pixels[py * width + px];
+                        let inv = 1.0 - a;
+                        for c in 0..3 {
+                            dst[c] = (sh_bgra[c] as f32 * a + dst[c] as f32 * inv).round() as u8;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Main rounded rect fill + anti-aliased inner border.
+        let x0 = (rect.x.floor().max(0.0) as usize).max(clip_x0).min(clip_x1);
+        let x1 = ((rect.x + rect.w).ceil().max(0.0) as usize).max(clip_x0).min(clip_x1);
+        let y0 = (rect.y.floor().max(0.0) as usize).max(clip_y0).min(clip_y1);
+        let y1 = ((rect.y + rect.h).ceil().max(0.0) as usize).max(clip_y0).min(clip_y1);
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
         let bw = rect.border_width.max(0.0);
         let fill = to_bgra(rect.color);
         let fill_a = rect.color[3].clamp(0.0, 1.0);
         let border = to_bgra(rect.border_color);
         let border_a = rect.border_color[3].clamp(0.0, 1.0);
         for py in y0..y1 {
-            let cy = py as f32 + 0.5 - rect.y;
+            let ly = py as f32 + 0.5 - center_y;
             for px in x0..x1 {
-                let cx = px as f32 + 0.5 - rect.x;
-                let dx = (r - cx).max(0.0).max(cx - (rect.w - r));
-                let dy = (r - cy).max(0.0).max(cy - (rect.h - r));
-                let dist = if r > 0.0 && dx > 0.0 && dy > 0.0 {
-                    (dx * dx + dy * dy).sqrt() - r
-                } else {
-                    -cx.min(rect.w - cx).min(cy).min(rect.h - cy)
-                };
+                let lx = px as f32 + 0.5 - center_x;
+                let dist = sd_rounded_box_px(lx, ly, half_w, half_h, r);
                 if dist > 0.5 {
                     continue;
                 }
-                let aa = (0.5 - dist).clamp(0.0, 1.0);
-                let is_border = bw > 0.0 && dist > -bw && border_a > 0.0;
-                let (src, a) = if is_border {
-                    (border, border_a * aa)
-                } else if fill_a > 0.0 {
-                    (fill, fill_a * aa)
-                } else {
-                    continue;
-                };
+                let outer_aa = (0.5 - dist).clamp(0.0, 1.0);
                 let dst = &mut pixels[py * width + px];
-                let inv = 1.0 - a;
-                for c in 0..3 {
-                    dst[c] = (src[c] as f32 * a + dst[c] as f32 * inv).round() as u8;
+                if fill_a > 0.0 {
+                    let a = fill_a * outer_aa;
+                    let inv = 1.0 - a;
+                    for c in 0..3 {
+                        dst[c] = (fill[c] as f32 * a + dst[c] as f32 * inv).round() as u8;
+                    }
+                }
+                if bw > 0.0 && border_a > 0.0 {
+                    let b_mask = (dist + bw + 0.5).clamp(0.0, 1.0) * outer_aa;
+                    if b_mask > 0.002 {
+                        let a = border_a * b_mask;
+                        let inv = 1.0 - a;
+                        for c in 0..3 {
+                            dst[c] = (border[c] as f32 * a + dst[c] as f32 * inv).round() as u8;
+                        }
+                    }
                 }
             }
         }
@@ -1297,21 +1498,49 @@ fn paint_images(pixels: &mut [[u8; 4]], width: usize, height: usize, images: &[S
         if img.src_w == 0 || img.src_h == 0 || img.w <= 0.0 || img.h <= 0.0 {
             continue;
         }
-        let x0 = (img.x.floor().max(0.0) as usize).min(width);
-        let x1 = ((img.x + img.w).ceil().max(0.0) as usize).min(width);
-        let y0 = (img.y.floor().max(0.0) as usize).min(height);
-        let y1 = ((img.y + img.h).ceil().max(0.0) as usize).min(height);
+        let (clip_x0, clip_y0, clip_x1, clip_y1) = if let Some([cx, cy, cw, ch]) = img.clip {
+            (
+                (cx.floor().max(0.0) as usize).min(width),
+                (cy.floor().max(0.0) as usize).min(height),
+                ((cx + cw).ceil().max(0.0) as usize).min(width),
+                ((cy + ch).ceil().max(0.0) as usize).min(height),
+            )
+        } else {
+            (0, 0, width, height)
+        };
+        let x0 = (img.x.floor().max(0.0) as usize).max(clip_x0).min(clip_x1);
+        let x1 = ((img.x + img.w).ceil().max(0.0) as usize).max(clip_x0).min(clip_x1);
+        let y0 = (img.y.floor().max(0.0) as usize).max(clip_y0).min(clip_y1);
+        let y1 = ((img.y + img.h).ceil().max(0.0) as usize).max(clip_y0).min(clip_y1);
+        let r = img.radius.min(img.w * 0.5).min(img.h * 0.5).max(0.0);
+        let half_w = img.w * 0.5;
+        let half_h = img.h * 0.5;
+        let center_x = img.x + half_w;
+        let center_y = img.y + half_h;
         for py in y0..y1 {
-            let v = ((py as f32 - img.y) / img.h).clamp(0.0, 0.9999);
+            let v = ((py as f32 + 0.5 - img.y) / img.h).clamp(0.0, 0.9999);
             let sy = (v * img.src_h as f32) as usize;
+            let ly = py as f32 + 0.5 - center_y;
             for px in x0..x1 {
-                let u = ((px as f32 - img.x) / img.w).clamp(0.0, 0.9999);
+                let mut mask = 1.0_f32;
+                if r > 0.0 {
+                    let lx = px as f32 + 0.5 - center_x;
+                    let dist = sd_rounded_box_px(lx, ly, half_w, half_h, r);
+                    mask = (0.5 - dist).clamp(0.0, 1.0);
+                    if mask <= 0.002 {
+                        continue;
+                    }
+                }
+                let u = ((px as f32 + 0.5 - img.x) / img.w).clamp(0.0, 0.9999);
                 let sx = (u * img.src_w as f32) as usize;
                 let off = (sy * img.src_w as usize + sx) * 4;
                 if off + 3 >= img.rgba.len() {
                     continue;
                 }
-                let a = (img.rgba[off + 3] as f32 / 255.0) * img.alpha.clamp(0.0, 1.0);
+                let a = (img.rgba[off + 3] as f32 / 255.0) * img.alpha.clamp(0.0, 1.0) * mask;
+                if a <= 0.002 {
+                    continue;
+                }
                 let inv = 1.0 - a;
                 let dst = &mut pixels[py * width + px];
                 dst[0] = (img.rgba[off + 2] as f32 * a + dst[0] as f32 * inv).round() as u8;

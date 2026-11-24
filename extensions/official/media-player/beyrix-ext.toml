@@ -8,7 +8,7 @@ author = "Beyrix Team"
 description = "Adaptive MPRIS2 & local media player with Compact/Normal/Expanded modes, capability-aware controls, and audio visualizer."
 license = "MPL-2.0"
 official = true
-permissions = ["ui", "media-control", "audio-analysis", "theme"]
+permissions = ["ui", "media-control", "audio-analysis", "theme", "window"]
 
 [[settings_schema]]
 key = "viewMode"

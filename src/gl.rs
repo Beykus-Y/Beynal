@@ -19,7 +19,7 @@ use std::ffi::{c_int, c_void};
 use glow::HasContext as _;
 use khronos_egl as egl;
 
-use crate::render::{Renderer, Scene, SceneGlyph, SceneRect, SceneRoundedRect};
+use crate::render::{FontKind, Renderer, Scene, SceneGlyph, SceneImage, SceneRect, SceneRoundedRect};
 
 const ATLAS_SIZE: u32 = 1024;
 const ATLAS_ENTRIES: usize = 8192;
@@ -47,7 +47,7 @@ struct Slot {
 
 #[derive(Default)]
 struct GlyphAtlas {
-    map: HashMap<(char, u32), Slot>,
+    map: HashMap<(char, u32, FontKind), Slot>,
     shelf_x: u32,
     shelf_y: u32,
     shelf_h: u32,
@@ -61,7 +61,7 @@ impl GlyphAtlas {
         self.shelf_h = 0;
     }
 
-    fn insert(&mut self, key: (char, u32), w: u32, h: u32) -> Option<Slot> {
+    fn insert(&mut self, key: (char, u32, FontKind), w: u32, h: u32) -> Option<Slot> {
         if !(1..=ATLAS_SIZE).contains(&w) || !(1..=ATLAS_SIZE).contains(&h) {
             return None;
         }
@@ -134,17 +134,26 @@ pub struct GlBackend {
     window_api: EglWindowApi,
     gl: glow::Context,
     rect_program: glow::Program,
+    rounded_program: glow::Program,
     glyph_program: glow::Program,
+    image_program: glow::Program,
     rect_vbo: glow::Buffer,
+    rounded_vbo: glow::Buffer,
     glyph_vbo: glow::Buffer,
+    image_vbo: glow::Buffer,
     atlas_texture: glow::Texture,
+    image_textures: HashMap<u64, (u32, u32, glow::Texture)>,
     rect_pos: u32,
     rect_color: u32,
     glyph_pos: u32,
     glyph_uv: u32,
     glyph_color: u32,
     rect_size: Option<glow::UniformLocation>,
+    rounded_size: Option<glow::UniformLocation>,
     glyph_size: Option<glow::UniformLocation>,
+    image_size: Option<glow::UniformLocation>,
+    image_params: Option<glow::UniformLocation>,
+    image_clip: Option<glow::UniformLocation>,
     atlas: GlyphAtlas,
     width: i32,
     height: i32,
@@ -152,6 +161,7 @@ pub struct GlBackend {
     preserved: bool,
     buffer_age_supported: Option<bool>,
     rect_vertices: Vec<f32>,
+    rounded_vertices: Vec<f32>,
     glyph_vertices: Vec<f32>,
     dump_done: bool,
     dump_at: Option<std::time::Instant>,
@@ -237,8 +247,12 @@ impl GlBackend {
         };
         let (rect_program, rect_pos, rect_color, rect_size) =
             compile_rect_program(&gl).map_err(|error| format!("rect shader: {error}"))?;
+        let (rounded_program, rounded_size) =
+            compile_rounded_program(&gl).map_err(|error| format!("rounded shader: {error}"))?;
         let (glyph_program, glyph_pos, glyph_uv, glyph_color, glyph_size) =
             compile_glyph_program(&gl).map_err(|error| format!("glyph shader: {error}"))?;
+        let (image_program, image_size, image_params, image_clip) =
+            compile_image_program(&gl).map_err(|error| format!("image shader: {error}"))?;
 
         let atlas_texture =
             unsafe { gl.create_texture() }.map_err(|error| format!("glGenTextures: {error}"))?;
@@ -292,7 +306,11 @@ impl GlBackend {
 
         let rect_vbo =
             unsafe { gl.create_buffer() }.map_err(|error| format!("glGenBuffers: {error}"))?;
+        let rounded_vbo =
+            unsafe { gl.create_buffer() }.map_err(|error| format!("glGenBuffers: {error}"))?;
         let glyph_vbo =
+            unsafe { gl.create_buffer() }.map_err(|error| format!("glGenBuffers: {error}"))?;
+        let image_vbo =
             unsafe { gl.create_buffer() }.map_err(|error| format!("glGenBuffers: {error}"))?;
 
         let swap_with_damage =
@@ -320,17 +338,26 @@ impl GlBackend {
             window_api,
             gl,
             rect_program,
+            rounded_program,
             glyph_program,
+            image_program,
             rect_vbo,
+            rounded_vbo,
             glyph_vbo,
+            image_vbo,
             atlas_texture,
+            image_textures: HashMap::new(),
             rect_pos,
             rect_color,
             glyph_pos,
             glyph_uv,
             glyph_color,
             rect_size,
+            rounded_size,
             glyph_size,
+            image_size,
+            image_params,
+            image_clip,
             atlas,
             width,
             height,
@@ -338,6 +365,7 @@ impl GlBackend {
             preserved,
             buffer_age_supported,
             rect_vertices: Vec::new(),
+            rounded_vertices: Vec::new(),
             glyph_vertices: Vec::new(),
             dump_done: false,
             dump_at: crate::compat::env("BEYRIX_GL_DUMP")
@@ -474,6 +502,9 @@ impl GlBackend {
         if !scene.behind_rects.is_empty() {
             self.draw_rounded_rects(&scene.behind_rects);
         }
+        if !scene.behind_images.is_empty() {
+            self.draw_images(&scene.behind_images);
+        }
         if !scene.behind_glyphs.is_empty() {
             let _ = self.draw_glyph_slice(renderer, &scene.behind_glyphs);
         }
@@ -484,8 +515,22 @@ impl GlBackend {
             if !scene.overlay_rounded.is_empty() {
                 self.draw_rounded_rects(&scene.overlay_rounded);
             }
+            if !scene.overlay_images.is_empty() {
+                self.draw_images(&scene.overlay_images);
+            }
             if !scene.overlay_glyphs.is_empty() {
                 result = self.draw_glyph_slice(renderer, &scene.overlay_glyphs);
+            }
+            if result.is_ok() {
+                if !scene.panel_rounded.is_empty() {
+                    self.draw_rounded_rects(&scene.panel_rounded);
+                }
+                if !scene.panel_images.is_empty() {
+                    self.draw_images(&scene.panel_images);
+                }
+                if !scene.panel_glyphs.is_empty() {
+                    result = self.draw_glyph_slice(renderer, &scene.panel_glyphs);
+                }
             }
         }
         unsafe { self.gl.disable(glow::SCISSOR_TEST) };
@@ -644,50 +689,280 @@ impl GlBackend {
         if rects.is_empty() {
             return;
         }
-        let mut expanded = Vec::with_capacity(rects.len() * 5);
-        for r in rects {
-            if r.color[3] > 0.0 {
-                expanded.push(SceneRect {
-                    x: r.x,
-                    y: r.y,
-                    w: r.w,
-                    h: r.h,
-                    color: r.color,
-                });
+        // Each vertex has 22 floats:
+        // pos(2) + local(2) + half(2) + params(4) + fill(4) + border(4) + clip(4)
+        const FLOATS_PER_VERTEX: usize = 22;
+        self.rounded_vertices.clear();
+        self.rounded_vertices
+            .reserve(rects.len() * 12 * FLOATS_PER_VERTEX);
+
+        let push_quad = |verts: &mut Vec<f32>,
+                         qx0: f32,
+                         qy0: f32,
+                         qx1: f32,
+                         qy1: f32,
+                         cx: f32,
+                         cy: f32,
+                         hw: f32,
+                         hh: f32,
+                         params: [f32; 4],
+                         fill: [f32; 4],
+                         border: [f32; 4],
+                         clip: [f32; 4]| {
+            for (px, py) in [
+                (qx0, qy0),
+                (qx1, qy0),
+                (qx1, qy1),
+                (qx0, qy0),
+                (qx1, qy1),
+                (qx0, qy1),
+            ] {
+                verts.extend_from_slice(&[
+                    px,
+                    py,
+                    px - cx,
+                    py - cy,
+                    hw,
+                    hh,
+                    params[0],
+                    params[1],
+                    params[2],
+                    params[3],
+                    fill[0],
+                    fill[1],
+                    fill[2],
+                    fill[3],
+                    border[0],
+                    border[1],
+                    border[2],
+                    border[3],
+                    clip[0],
+                    clip[1],
+                    clip[2],
+                    clip[3],
+                ]);
             }
-            if r.border_width > 0.0 && r.border_color[3] > 0.0 {
-                let bw = r.border_width;
-                expanded.push(SceneRect {
-                    x: r.x,
-                    y: r.y,
-                    w: r.w,
-                    h: bw,
-                    color: r.border_color,
-                });
-                expanded.push(SceneRect {
-                    x: r.x,
-                    y: (r.y + r.h - bw).max(r.y),
-                    w: r.w,
-                    h: bw,
-                    color: r.border_color,
-                });
-                expanded.push(SceneRect {
-                    x: r.x,
-                    y: r.y + bw,
-                    w: bw,
-                    h: (r.h - 2.0 * bw).max(0.0),
-                    color: r.border_color,
-                });
-                expanded.push(SceneRect {
-                    x: (r.x + r.w - bw).max(r.x),
-                    y: r.y + bw,
-                    w: bw,
-                    h: (r.h - 2.0 * bw).max(0.0),
-                    color: r.border_color,
-                });
+        };
+
+        for r in rects {
+            if r.w <= 0.0 || r.h <= 0.0 {
+                continue;
+            }
+            let hw = r.w * 0.5;
+            let hh = r.h * 0.5;
+            let cx = r.x + hw;
+            let cy = r.y + hh;
+            let rad = r.radius.min(hw).min(hh).max(0.0);
+            let clip = match r.clip {
+                Some([x, y, w, h]) => [x, y, x + w, y + h],
+                None => [-1e6, -1e6, 1e6, 1e6],
+            };
+
+            // Optional soft drop shadow emitted directly behind the rect.
+            if r.shadow_blur > 0.5 && r.shadow_color[3] > 0.002 {
+                let b = r.shadow_blur;
+                push_quad(
+                    &mut self.rounded_vertices,
+                    r.x - b,
+                    r.y + r.shadow_offset_y - b,
+                    r.x + r.w + b,
+                    r.y + r.h + r.shadow_offset_y + b,
+                    cx,
+                    cy + r.shadow_offset_y,
+                    hw,
+                    hh,
+                    [rad, 0.0, b, 0.0],
+                    r.shadow_color,
+                    [0.0; 4],
+                    clip,
+                );
+            }
+
+            if r.color[3] > 0.0 || (r.border_width > 0.0 && r.border_color[3] > 0.0) {
+                push_quad(
+                    &mut self.rounded_vertices,
+                    r.x - 1.0,
+                    r.y - 1.0,
+                    r.x + r.w + 1.0,
+                    r.y + r.h + 1.0,
+                    cx,
+                    cy,
+                    hw,
+                    hh,
+                    [rad, r.border_width.max(0.0), 0.0, 0.0],
+                    r.color,
+                    r.border_color,
+                    clip,
+                );
             }
         }
-        self.draw_rects(&expanded);
+
+        if self.rounded_vertices.is_empty() {
+            return;
+        }
+        let stride = (FLOATS_PER_VERTEX * 4) as i32;
+        unsafe {
+            self.gl.use_program(Some(self.rounded_program));
+            if let Some(location) = &self.rounded_size {
+                self.gl
+                    .uniform_2_f32(Some(location), self.width as f32, self.height as f32);
+            }
+            self.gl
+                .bind_buffer(glow::ARRAY_BUFFER, Some(self.rounded_vbo));
+            self.gl.buffer_data_u8_slice(
+                glow::ARRAY_BUFFER,
+                as_bytes(&self.rounded_vertices),
+                glow::STREAM_DRAW,
+            );
+            for loc in 0..7 {
+                self.gl.enable_vertex_attrib_array(loc);
+            }
+            self.gl
+                .vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, stride, 0);
+            self.gl
+                .vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 2 * 4);
+            self.gl
+                .vertex_attrib_pointer_f32(2, 2, glow::FLOAT, false, stride, 4 * 4);
+            self.gl
+                .vertex_attrib_pointer_f32(3, 4, glow::FLOAT, false, stride, 6 * 4);
+            self.gl
+                .vertex_attrib_pointer_f32(4, 4, glow::FLOAT, false, stride, 10 * 4);
+            self.gl
+                .vertex_attrib_pointer_f32(5, 4, glow::FLOAT, false, stride, 14 * 4);
+            self.gl
+                .vertex_attrib_pointer_f32(6, 4, glow::FLOAT, false, stride, 18 * 4);
+            self.gl.draw_arrays(
+                glow::TRIANGLES,
+                0,
+                (self.rounded_vertices.len() / FLOATS_PER_VERTEX) as i32,
+            );
+            for loc in 2..7 {
+                self.gl.disable_vertex_attrib_array(loc);
+            }
+        }
+    }
+
+    fn draw_images(&mut self, images: &[SceneImage]) {
+        if images.is_empty() {
+            return;
+        }
+        unsafe {
+            self.gl.use_program(Some(self.image_program));
+            if let Some(location) = &self.image_size {
+                self.gl
+                    .uniform_2_f32(Some(location), self.width as f32, self.height as f32);
+            }
+            self.gl.active_texture(glow::TEXTURE0);
+            self.gl
+                .bind_buffer(glow::ARRAY_BUFFER, Some(self.image_vbo));
+            self.gl.enable_vertex_attrib_array(0);
+            self.gl.enable_vertex_attrib_array(1);
+            self.gl.disable_vertex_attrib_array(2);
+            self.gl
+                .vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 4 * 4, 0);
+            self.gl
+                .vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, 4 * 4, 2 * 4);
+        }
+        if self.image_textures.len() > 256 {
+            for (_, (_, _, tex)) in self.image_textures.drain() {
+                unsafe { self.gl.delete_texture(tex) };
+            }
+        }
+        for img in images {
+            if img.src_w == 0 || img.src_h == 0 || img.w <= 0.0 || img.h <= 0.0 {
+                continue;
+            }
+            let expected_len = (img.src_w as usize) * (img.src_h as usize) * 4;
+            if img.rgba.len() < expected_len {
+                continue;
+            }
+            let tex = match self.image_textures.get(&img.id) {
+                Some(&(w, h, tex)) if w == img.src_w && h == img.src_h => tex,
+                _ => {
+                    if let Some((_, _, old)) = self.image_textures.remove(&img.id) {
+                        unsafe { self.gl.delete_texture(old) };
+                    }
+                    let Ok(tex) = (unsafe { self.gl.create_texture() }) else {
+                        continue;
+                    };
+                    unsafe {
+                        self.gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                        self.gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_MIN_FILTER,
+                            glow::LINEAR as i32,
+                        );
+                        self.gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_MAG_FILTER,
+                            glow::LINEAR as i32,
+                        );
+                        self.gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_WRAP_S,
+                            glow::CLAMP_TO_EDGE as i32,
+                        );
+                        self.gl.tex_parameter_i32(
+                            glow::TEXTURE_2D,
+                            glow::TEXTURE_WRAP_T,
+                            glow::CLAMP_TO_EDGE as i32,
+                        );
+                        self.gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+                        self.gl.tex_image_2d(
+                            glow::TEXTURE_2D,
+                            0,
+                            glow::RGBA as i32,
+                            img.src_w as i32,
+                            img.src_h as i32,
+                            0,
+                            glow::RGBA,
+                            glow::UNSIGNED_BYTE,
+                            glow::PixelUnpackData::Slice(Some(&img.rgba[..expected_len])),
+                        );
+                    }
+                    self.image_textures.insert(img.id, (img.src_w, img.src_h, tex));
+                    tex
+                }
+            };
+            let x0 = img.x;
+            let y0 = img.y;
+            let x1 = img.x + img.w;
+            let y1 = img.y + img.h;
+            let verts: [f32; 24] = [
+                x0, y0, 0.0, 0.0,
+                x1, y0, 1.0, 0.0,
+                x1, y1, 1.0, 1.0,
+                x0, y0, 0.0, 0.0,
+                x1, y1, 1.0, 1.0,
+                x0, y1, 0.0, 1.0,
+            ];
+            let clip = match img.clip {
+                Some([x, y, w, h]) => [x, y, x + w, y + h],
+                None => [-1e6, -1e6, 1e6, 1e6],
+            };
+            unsafe {
+                self.gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                if let Some(loc) = &self.image_params {
+                    self.gl.uniform_4_f32(
+                        Some(loc),
+                        img.w,
+                        img.h,
+                        img.radius.min(img.w * 0.5).min(img.h * 0.5).max(0.0),
+                        img.alpha.clamp(0.0, 1.0),
+                    );
+                }
+                if let Some(loc) = &self.image_clip {
+                    self.gl
+                        .uniform_4_f32(Some(loc), clip[0], clip[1], clip[2], clip[3]);
+                }
+                self.gl.buffer_data_u8_slice(
+                    glow::ARRAY_BUFFER,
+                    as_bytes(&verts),
+                    glow::STREAM_DRAW,
+                );
+                self.gl.draw_arrays(glow::TRIANGLES, 0, 6);
+            }
+        }
     }
 
     fn draw_glyphs(&mut self, renderer: &mut Renderer, scene: &Scene) -> Result<(), String> {
@@ -733,11 +1008,12 @@ impl GlBackend {
         self.glyph_vertices
             .reserve(glyphs.len().min(GLYPHS_PER_BATCH) * 6 * 8);
         for glyph in glyphs {
-            let key = (glyph.ch, glyph.px_size.to_bits());
+            let key = (glyph.ch, glyph.px_size.to_bits(), glyph.font_kind);
             let slot = match self.atlas.map.get(&key) {
                 Some(&slot) => slot,
                 None => {
-                    let (metrics, bitmap) = renderer.glyph_bitmap(glyph.ch, glyph.px_size);
+                    let (metrics, bitmap) =
+                        renderer.glyph_bitmap_kind(glyph.ch, glyph.px_size, glyph.font_kind);
                     let (w, h) = (metrics.width as u32, metrics.height as u32);
                     let slot = if let Some(slot) = self.atlas.insert(key, w, h) {
                         slot
@@ -954,6 +1230,153 @@ void main() {
     Ok((program, 0, 1, 2, size))
 }
 
+fn compile_rounded_program(
+    gl: &glow::Context,
+) -> Result<(glow::Program, Option<glow::UniformLocation>), String> {
+    const VERTEX: &str = r#"
+attribute vec2 a_pos;
+attribute vec2 a_local;
+attribute vec2 a_half;
+attribute vec4 a_params;
+attribute vec4 a_fill;
+attribute vec4 a_border;
+attribute vec4 a_clip;
+uniform vec2 u_size;
+varying vec2 v_screen;
+varying vec2 v_local;
+varying vec2 v_half;
+varying vec4 v_params;
+varying vec4 v_fill;
+varying vec4 v_border;
+varying vec4 v_clip;
+void main() {
+    vec2 p = a_pos / u_size * 2.0 - 1.0;
+    gl_Position = vec4(p.x, -p.y, 0.0, 1.0);
+    v_screen = a_pos;
+    v_local = a_local;
+    v_half = a_half;
+    v_params = a_params;
+    v_fill = a_fill;
+    v_border = a_border;
+    v_clip = a_clip;
+}
+"#;
+    const FRAGMENT: &str = r#"
+precision mediump float;
+varying vec2 v_screen;
+varying vec2 v_local;
+varying vec2 v_half;
+varying vec4 v_params;
+varying vec4 v_fill;
+varying vec4 v_border;
+varying vec4 v_clip;
+float sdRoundedBox(vec2 p, vec2 b, float r) {
+    vec2 q = abs(p) - b + vec2(r);
+    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+}
+void main() {
+    if (v_screen.x < v_clip.x || v_screen.y < v_clip.y || v_screen.x > v_clip.z || v_screen.y > v_clip.w) {
+        discard;
+    }
+    float r = min(v_params.x, min(v_half.x, v_half.y));
+    float bw = v_params.y;
+    float blur = v_params.z;
+    float d = sdRoundedBox(v_local, v_half, r);
+    if (blur > 0.5) {
+        float a = 1.0 - smoothstep(-blur * 0.25, blur, d);
+        gl_FragColor = vec4(v_fill.rgb, v_fill.a * a);
+        return;
+    }
+    float outer_aa = clamp(0.5 - d, 0.0, 1.0);
+    if (outer_aa <= 0.002) {
+        discard;
+    }
+    vec4 col = vec4(v_fill.rgb, v_fill.a * outer_aa);
+    if (bw > 0.0 && v_border.a > 0.0) {
+        float b_mask = clamp(d + bw + 0.5, 0.0, 1.0) * outer_aa;
+        float b_alpha = v_border.a * b_mask;
+        float out_a = b_alpha + col.a * (1.0 - b_alpha);
+        vec3 out_rgb = out_a > 0.001
+            ? (v_border.rgb * b_alpha + col.rgb * col.a * (1.0 - b_alpha)) / out_a
+            : vec3(0.0);
+        col = vec4(out_rgb, out_a);
+    }
+    gl_FragColor = col;
+}
+"#;
+    let program = compile_program(
+        gl,
+        VERTEX,
+        FRAGMENT,
+        &[
+            (0, "a_pos"),
+            (1, "a_local"),
+            (2, "a_half"),
+            (3, "a_params"),
+            (4, "a_fill"),
+            (5, "a_border"),
+            (6, "a_clip"),
+        ],
+    )?;
+    let size = unsafe { gl.get_uniform_location(program, "u_size") };
+    Ok((program, size))
+}
+
+type ImageProgram = (
+    glow::Program,
+    Option<glow::UniformLocation>,
+    Option<glow::UniformLocation>,
+    Option<glow::UniformLocation>,
+);
+
+fn compile_image_program(gl: &glow::Context) -> Result<ImageProgram, String> {
+    const VERTEX: &str = r#"
+attribute vec2 a_pos;
+attribute vec2 a_uv;
+uniform vec2 u_size;
+varying vec2 v_screen;
+varying vec2 v_uv;
+void main() {
+    vec2 p = a_pos / u_size * 2.0 - 1.0;
+    gl_Position = vec4(p.x, -p.y, 0.0, 1.0);
+    v_screen = a_pos;
+    v_uv = a_uv;
+}
+"#;
+    const FRAGMENT: &str = r#"
+precision mediump float;
+uniform sampler2D u_tex;
+uniform vec4 u_params;
+uniform vec4 u_clip;
+varying vec2 v_screen;
+varying vec2 v_uv;
+float sdRoundedBox(vec2 p, vec2 b, float r) {
+    vec2 q = abs(p) - b + vec2(r);
+    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
+}
+void main() {
+    if (v_screen.x < u_clip.x || v_screen.y < u_clip.y || v_screen.x > u_clip.z || v_screen.y > u_clip.w) {
+        discard;
+    }
+    vec4 texel = texture2D(u_tex, v_uv);
+    float mask = 1.0;
+    if (u_params.z > 0.0) {
+        vec2 half_sz = u_params.xy * 0.5;
+        vec2 local = (v_uv - 0.5) * u_params.xy;
+        float d = sdRoundedBox(local, half_sz, u_params.z);
+        mask = clamp(0.5 - d, 0.0, 1.0);
+        if (mask <= 0.002) discard;
+    }
+    gl_FragColor = vec4(texel.rgb, texel.a * u_params.w * mask);
+}
+"#;
+    let program = compile_program(gl, VERTEX, FRAGMENT, &[(0, "a_pos"), (1, "a_uv")])?;
+    let size = unsafe { gl.get_uniform_location(program, "u_size") };
+    let params = unsafe { gl.get_uniform_location(program, "u_params") };
+    let clip = unsafe { gl.get_uniform_location(program, "u_clip") };
+    Ok((program, size, params, clip))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,10 +1384,10 @@ mod tests {
     #[test]
     fn oversized_glyph_preserves_atlas_slots() {
         let mut atlas = GlyphAtlas::default();
-        let key = ('x', 16.0_f32.to_bits());
+        let key = ('x', 16.0_f32.to_bits(), FontKind::Mono);
         let slot = atlas.insert(key, ATLAS_SIZE, ATLAS_SIZE).unwrap();
-        assert!(atlas.insert(('界', key.1), u32::MAX, 2).is_none());
-        assert!(atlas.insert(('界', key.1), 1, 1).is_none());
+        assert!(atlas.insert(('界', key.1, FontKind::Mono), u32::MAX, 2).is_none());
+        assert!(atlas.insert(('界', key.1, FontKind::Mono), 1, 1).is_none());
         assert_eq!(atlas.map[&key].x, slot.x);
         assert_eq!(atlas.map[&key].y, slot.y);
     }
@@ -980,7 +1403,9 @@ mod tests {
             .map(|n| char::from_u32(n).unwrap())
             .collect();
         let consume =
-            |atlas: &GlyphAtlas, batch: &mut Vec<((char, u32), Slot)>, consumed: &mut Vec<char>| {
+            |atlas: &GlyphAtlas,
+             batch: &mut Vec<((char, u32, FontKind), Slot)>,
+             consumed: &mut Vec<char>| {
                 let mut region = vec![false; (ATLAS_SIZE * ATLAS_SIZE) as usize];
                 for (key, slot) in batch.drain(..) {
                     let actual = atlas.map[&key];
@@ -998,7 +1423,7 @@ mod tests {
                 }
             };
         for (i, &ch) in unique.iter().enumerate() {
-            let key = (ch, px_size.to_bits());
+            let key = (ch, px_size.to_bits(), FontKind::Mono);
             let w = 19 + (i % 23) as u32;
             let h = 24 + (i % 31) as u32;
             let slot = if let Some(slot) = atlas.insert(key, w, h) {
@@ -1021,6 +1446,7 @@ mod tests {
         let glyph = SceneGlyph {
             ch: 'Ж',
             px_size: 20.0,
+            font_kind: FontKind::Mono,
             x: 27,
             y: 18,
             w: 6,
@@ -1049,5 +1475,163 @@ mod tests {
         assert_eq!(vertex(1), (33.0, 18.0, 748.0, 918.0));
         assert_eq!(vertex(2), (33.0, 29.0, 748.0, 929.0));
         assert_eq!(vertex(5), (27.0, 29.0, 742.0, 929.0));
+    }
+
+    #[test]
+    fn offscreen_egl_pbuffer_verifies_rounded_rect_and_image_shaders_when_available() {
+        // Attempt an offscreen EGL PBuffer OpenGL ES 2.0 context to verify our
+        // SDF rounded-rectangle and image shaders compile, link, and actually
+        // round corners on real pixels. Gracefully skips if the test runner has
+        // no EGL/OpenGL driver available.
+        let Ok(egl) = (unsafe { egl::DynamicInstance::<egl::EGL1_5>::load_required() }) else {
+            return;
+        };
+        let Ok(display) = (unsafe { egl.get_display(egl::DEFAULT_DISPLAY) })
+            .ok_or("no default EGL display")
+        else {
+            return;
+        };
+        if egl.initialize(display).is_err() || egl.bind_api(egl::OPENGL_ES_API).is_err() {
+            return;
+        }
+        let attrs = [
+            egl::SURFACE_TYPE,
+            egl::PBUFFER_BIT,
+            egl::RENDERABLE_TYPE,
+            egl::OPENGL_ES2_BIT,
+            egl::RED_SIZE,
+            8,
+            egl::GREEN_SIZE,
+            8,
+            egl::BLUE_SIZE,
+            8,
+            egl::ALPHA_SIZE,
+            8,
+            egl::NONE,
+        ];
+        let Ok(Some(config)) = egl.choose_first_config(display, &attrs) else {
+            let _ = egl.terminate(display);
+            return;
+        };
+        let Ok(context) = egl.create_context(
+            display,
+            config,
+            None,
+            &[
+                egl::CONTEXT_MAJOR_VERSION,
+                2,
+                egl::CONTEXT_MINOR_VERSION,
+                0,
+                egl::NONE,
+            ],
+        ) else {
+            let _ = egl.terminate(display);
+            return;
+        };
+        let (w, h) = (128i32, 128i32);
+        let Ok(surface) = egl.create_pbuffer_surface(
+            display,
+            config,
+            &[egl::WIDTH, w, egl::HEIGHT, h, egl::NONE],
+        ) else {
+            let _ = egl.destroy_context(display, context);
+            let _ = egl.terminate(display);
+            return;
+        };
+        if egl
+            .make_current(display, Some(surface), Some(surface), Some(context))
+            .is_err()
+        {
+            let _ = egl.destroy_surface(display, surface);
+            let _ = egl.destroy_context(display, context);
+            let _ = egl.terminate(display);
+            return;
+        }
+        let gl = unsafe {
+            glow::Context::from_loader_function(|name| {
+                egl.get_proc_address(name)
+                    .map(|f| f as *const c_void)
+                    .unwrap_or(std::ptr::null())
+            })
+        };
+        let (rounded_prog, rounded_size) =
+            compile_rounded_program(&gl).expect("rounded_program must compile and link");
+        let _image_prog = compile_image_program(&gl).expect("image_program must compile and link");
+
+        // Draw a blue rounded rect (radius=24) at (16, 16, 96, 96) over green clear color.
+        let vbo = unsafe { gl.create_buffer() }.unwrap();
+        let (rx, ry, rw, rh, rad) = (16.0_f32, 16.0_f32, 96.0_f32, 96.0_f32, 24.0_f32);
+        let (cx, cy, hw, hh) = (rx + rw * 0.5, ry + rh * 0.5, rw * 0.5, rh * 0.5);
+        let mut verts = Vec::new();
+        for (px, py) in [
+            (rx - 1.0, ry - 1.0),
+            (rx + rw + 1.0, ry - 1.0),
+            (rx + rw + 1.0, ry + rh + 1.0),
+            (rx - 1.0, ry - 1.0),
+            (rx + rw + 1.0, ry + rh + 1.0),
+            (rx - 1.0, ry + rh + 1.0),
+        ] {
+            verts.extend_from_slice(&[
+                px, py, px - cx, py - cy, hw, hh, rad, 0.0, 0.0, 0.0, 0.1, 0.2, 0.95, 1.0, 0.0,
+                0.0, 0.0, 0.0, -1e6, -1e6, 1e6, 1e6,
+            ]);
+        }
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        unsafe {
+            gl.viewport(0, 0, w, h);
+            gl.enable(glow::BLEND);
+            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            gl.clear_color(0.0, 0.9, 0.1, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            gl.use_program(Some(rounded_prog));
+            if let Some(loc) = &rounded_size {
+                gl.uniform_2_f32(Some(loc), w as f32, h as f32);
+            }
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(&verts), glow::STREAM_DRAW);
+            let stride = 22 * 4;
+            for loc in 0..7 {
+                gl.enable_vertex_attrib_array(loc);
+            }
+            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, stride, 0);
+            gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 2 * 4);
+            gl.vertex_attrib_pointer_f32(2, 2, glow::FLOAT, false, stride, 4 * 4);
+            gl.vertex_attrib_pointer_f32(3, 4, glow::FLOAT, false, stride, 6 * 4);
+            gl.vertex_attrib_pointer_f32(4, 4, glow::FLOAT, false, stride, 10 * 4);
+            gl.vertex_attrib_pointer_f32(5, 4, glow::FLOAT, false, stride, 14 * 4);
+            gl.vertex_attrib_pointer_f32(6, 4, glow::FLOAT, false, stride, 18 * 4);
+            gl.draw_arrays(glow::TRIANGLES, 0, 6);
+            gl.finish();
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+            gl.read_pixels(
+                0,
+                0,
+                w,
+                h,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut pixels)),
+            );
+        }
+        // In GL read_pixels, row 0 is bottom; top-left corner (16, 16) is at gl_y = h - 1 - 16.
+        let sample = |x: usize, top_y: usize| -> [u8; 4] {
+            let gl_y = h as usize - 1 - top_y;
+            let off = (gl_y * w as usize + x) * 4;
+            [pixels[off], pixels[off + 1], pixels[off + 2], pixels[off + 3]]
+        };
+        let corner = sample(16, 16);
+        let center = sample(64, 64);
+        assert!(
+            corner[1] > 180 && corner[2] < 60,
+            "GL rounded rect corner (16,16) must be green bg, got RGBA={corner:?}"
+        );
+        assert!(
+            center[2] > 200 && center[1] < 80,
+            "GL rounded rect center (64,64) must be blue fill, got RGBA={center:?}"
+        );
+        let _ = egl.make_current(display, None, None, None);
+        let _ = egl.destroy_surface(display, surface);
+        let _ = egl.destroy_context(display, context);
+        let _ = egl.terminate(display);
     }
 }

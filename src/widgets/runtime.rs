@@ -410,7 +410,32 @@ fn run_vm_loop(
                     height,
                     scale,
                     focused,
-                } => win_state = (width, height, scale, focused),
+                } => {
+                    let changed = win_state.0 != width
+                        || win_state.1 != height
+                        || (win_state.2 - scale).abs() > 0.01
+                        || win_state.3 != focused;
+                    win_state = (width, height, scale, focused);
+                    if changed {
+                        let script = format!(
+                            "if (globalThis.beyrix && globalThis.beyrix.window) {{ \
+                                beyrix.window.width = {width}; \
+                                beyrix.window.height = {height}; \
+                                beyrix.window.scale = {scale}; \
+                                beyrix.window.focused = {focused}; \
+                                if (globalThis.__beyrix_emit) {{ \
+                                    globalThis.__beyrix_emit('windowResize', {{ width: {width}, height: {height}, scale: {scale}, focused: {focused} }}); \
+                                }} \
+                            }}"
+                        );
+                        for ext in extensions.values_mut() {
+                            if ext.permissions.has(Capability::Window) {
+                                eval_with_timeout(ext, &deadline, timeout, &script, &shared);
+                                sync_render_from_vm(ext, &deadline, timeout, &shared);
+                            }
+                        }
+                    }
+                }
                 VmCommand::UiEvent {
                     widget_id,
                     node_id,
@@ -1207,6 +1232,14 @@ globalThis.beyrix = {{
         height: {win_h},
         scale: {win_scale},
         focused: {win_focus},
+        onResize(cb) {{
+            requirePerm({perm_win}, "window");
+            beyrix.events.on("windowResize", cb);
+        }},
+        onFocus(cb) {{
+            requirePerm({perm_win}, "window");
+            beyrix.events.on("windowFocus", cb);
+        }},
     }},
     settings: {{
         _values: {{}},
@@ -1238,6 +1271,7 @@ globalThis.console = {{ log: (...a) => beyrix.log(a.join(" ")), error: (...a) =>
         perm_bg = has(Capability::BackgroundControl),
         perm_xray = has(Capability::XRayRead),
         perm_theme = has(Capability::Theme),
+        perm_win = has(Capability::Window),
         theme_name = serde_json_str(&theme.name),
         win_w = win_state.0,
         win_h = win_state.1,

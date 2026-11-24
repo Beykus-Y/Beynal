@@ -81,4 +81,7 @@ beyrix.settings.onChange(() => {
     renderWidget();
 });
 beyrix.theme.onChange(() => renderWidget());
+if (beyrix.window && typeof beyrix.window.onResize === "function") {
+    beyrix.window.onResize(() => renderWidget());
+}
 renderWidget();

@@ -601,12 +601,14 @@ pub fn resolve_widget_rect_with_cursor(
     let max_h = (cfg.max_height * scale).min(max_avail_h).max(min_h);
 
     let base_w = if compact {
-        (cfg.width * 0.72).max(cfg.min_width)
+        (cfg.width * 0.78).max(cfg.min_width)
     } else {
         cfg.width
     };
     let base_h = if compact {
-        (cfg.height * 0.75).max(cfg.min_height)
+        // In compact mode, adapt cleanly to the widget's compact minimum height
+        // instead of arbitrarily scaling normal height down and squishing children.
+        cfg.min_height.max(44.0).min(cfg.height)
     } else {
         cfg.height
     };
@@ -712,13 +714,33 @@ pub enum EditorTab {
     XRay,
 }
 
-/// Interactive visual layout editor state (Drag & Drop, resize, snapping,
-/// Undo/Redo, alignment guides, and sidebar tabs).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StudioLeftTab {
+    #[default]
+    Catalog,
+    Layers,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NarrowStudioPane {
+    #[default]
+    Preview,
+    Catalog,
+    Inspector,
+}
+
+/// Interactive visual layout editor (Beyrix Studio) state: Drag & Drop, resize,
+/// snapping, Undo/Redo, alignment guides, focused numeric inputs, and panes.
 #[derive(Clone, Debug, Default)]
 pub struct VisualLayoutEditor {
     pub active: bool,
     pub active_tab: EditorTab,
+    pub left_tab: StudioLeftTab,
+    pub narrow_pane: NarrowStudioPane,
     pub selected_widget: Option<String>,
+    pub focused_input: Option<String>,
+    pub input_buffer: String,
+    pub inspector_scroll: f32,
     pub drag_mode: Option<DragOperation>,
     pub drag_start_pointer: (f32, f32),
     pub drag_start_rect: (f32, f32, f32, f32),
@@ -744,7 +766,12 @@ impl VisualLayoutEditor {
         Self {
             active: false,
             active_tab: EditorTab::Catalog,
+            left_tab: StudioLeftTab::Catalog,
+            narrow_pane: NarrowStudioPane::Preview,
             selected_widget: None,
+            focused_input: None,
+            input_buffer: String::new(),
+            inspector_scroll: 0.0,
             drag_mode: None,
             drag_start_pointer: (0.0, 0.0),
             drag_start_rect: (0.0, 0.0, 0.0, 0.0),
@@ -790,6 +817,8 @@ impl VisualLayoutEditor {
             self.drag_mode = None;
             self.active_guides.clear();
             self.confirm_reset_profile = false;
+            self.focused_input = None;
+            self.input_buffer.clear();
         }
     }
 

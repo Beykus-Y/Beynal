@@ -343,6 +343,7 @@ struct State {
 
     bus: crate::events::EventBus,
     platform_config: crate::config::PlatformConfig,
+    ui_compositor: crate::widgets::compositor::UiCompositor,
     settings_overlay: crate::widgets::editor_ui::SettingsOverlay,
     widgets: Option<crate::widgets::WidgetManager>,
     media: Option<crate::media::MediaManager>,
@@ -1340,11 +1341,18 @@ impl State {
             return;
         }
         if pressed {
-            if self.settings_overlay.open {
-                let (consumed, changed) = self
-                    .settings_overlay
-                    .handle_click((x as f32, y as f32), &mut self.platform_config);
-                if consumed {
+            use crate::widgets::compositor::{ActiveSystemPanel, SurfaceOwner};
+            let (px, py) = (x as f32, y as f32);
+            let top_owner = self.ui_compositor.topmost_owner_at(px, py);
+            match top_owner {
+                Some(SurfaceOwner::Settings) => {
+                    let (_, changed) = self
+                        .settings_overlay
+                        .handle_click((px, py), &mut self.platform_config);
+                    if !self.settings_overlay.open {
+                        self.ui_compositor.close_active();
+                        self.sync_active_panel();
+                    }
                     if changed {
                         self.reconcile_platform_subsystems();
                     }
@@ -1352,23 +1360,72 @@ impl State {
                     self.dirty = true;
                     return;
                 }
-            }
-            for hit in &self.xray_hits {
-                let (px, py) = (x as f32, y as f32);
-                if px >= hit.x && px <= hit.x + hit.w && py >= hit.y && py <= hit.y + hit.h {
-                    if let Some(xray) = &mut self.xray {
-                        xray.handle_hit(&hit.node_id, hit.kind);
-                        self.platform_dirty = true;
-                        self.dirty = true;
+                Some(SurfaceOwner::Studio) => {
+                    let mut cfg_changed = false;
+                    if let Some(widgets) = &mut self.widgets {
+                        let (_, changed) = widgets.handle_pointer_press_with_config(
+                            (px, py),
+                            sizes.scale.factor(),
+                            Some(&mut self.platform_config),
+                        );
+                        cfg_changed = changed;
+                        if !widgets.editor.active {
+                            self.ui_compositor.close_active();
+                            self.sync_active_panel();
+                        }
                     }
+                    if cfg_changed {
+                        self.reconcile_platform_subsystems();
+                    }
+                    self.platform_dirty = true;
+                    self.dirty = true;
                     return;
                 }
-            }
-            if let Some(widgets) = &mut self.widgets
-                && widgets.handle_pointer_press((x as f32, y as f32), sizes.scale.factor())
-            {
-                self.dirty = true;
-                return;
+                Some(SurfaceOwner::XRayPanel | SurfaceOwner::XRayIndicator) => {
+                    let hit = self
+                        .xray_hits
+                        .iter()
+                        .rev()
+                        .find(|h| px >= h.x && px <= h.x + h.w && py >= h.y && py <= h.y + h.h)
+                        .cloned();
+                    if let Some(hit) = hit {
+                        if hit.node_id == "xray-toggle" {
+                            self.ui_compositor.toggle_panel(ActiveSystemPanel::XRay);
+                            self.sync_active_panel();
+                        } else if let Some(xray) = &mut self.xray {
+                            xray.handle_hit(&hit.node_id, hit.kind);
+                        }
+                    }
+                    self.platform_dirty = true;
+                    self.dirty = true;
+                    return;
+                }
+                Some(SurfaceOwner::Widget) => {
+                    if let Some(widgets) = &mut self.widgets {
+                        widgets.handle_pointer_press((px, py), sizes.scale.factor());
+                        if self.ui_compositor.is_open(ActiveSystemPanel::Studio)
+                            && !widgets.editor.active
+                        {
+                            self.ui_compositor.close_active();
+                            self.sync_active_panel();
+                        }
+                    }
+                    self.platform_dirty = true;
+                    self.dirty = true;
+                    return;
+                }
+                None => {
+                    // When Studio is active, clicking the preview canvas never
+                    // leaks into terminal text selection or PTY mouse reporting.
+                    if self.ui_compositor.is_open(ActiveSystemPanel::Studio) {
+                        if let Some(widgets) = &mut self.widgets {
+                            widgets.handle_pointer_press((px, py), sizes.scale.factor());
+                        }
+                        self.platform_dirty = true;
+                        self.dirty = true;
+                        return;
+                    }
+                }
             }
             if self.mouse_reporting() && self.report_mouse(Some(button), true, false) {
                 self.mouse_button = Some(button);
@@ -1458,13 +1515,40 @@ impl State {
         let h_steps = if h_steps.is_finite() { h_steps } else { 0.0 };
         let sizes = self.surface_sizes();
         let (px, py) = sizes.physical_point(self.pointer_position);
-        if self.editor.is_none()
-            && steps.abs() > 0.0
-            && let Some(widgets) = &mut self.widgets
-            && widgets.handle_pointer_scroll((px as f32, py as f32), (steps * 24.0) as f32)
-        {
-            self.dirty = true;
-            return;
+        if self.editor.is_none() && steps.abs() > 0.0 {
+            use crate::widgets::compositor::SurfaceOwner;
+            match self.ui_compositor.topmost_owner_at(px as f32, py as f32) {
+                Some(SurfaceOwner::XRayPanel) => {
+                    if let Some(xray) = &mut self.xray {
+                        if steps > 0.0 {
+                            xray.handle_hit("xray-scroll-down", crate::widgets::ui::HitKind::Button);
+                        } else {
+                            xray.handle_hit("xray-scroll-up", crate::widgets::ui::HitKind::Button);
+                        }
+                        self.platform_dirty = true;
+                        self.dirty = true;
+                    }
+                    return;
+                }
+                Some(SurfaceOwner::Settings | SurfaceOwner::Studio) => {
+                    if let Some(widgets) = &mut self.widgets {
+                        widgets.handle_pointer_scroll((px as f32, py as f32), (steps * 24.0) as f32);
+                    }
+                    self.platform_dirty = true;
+                    self.dirty = true;
+                    return;
+                }
+                Some(SurfaceOwner::Widget) => {
+                    if let Some(widgets) = &mut self.widgets
+                        && widgets
+                            .handle_pointer_scroll((px as f32, py as f32), (steps * 24.0) as f32)
+                    {
+                        self.dirty = true;
+                        return;
+                    }
+                }
+                _ => {}
+            }
         }
         if let Some(editor) = &mut self.editor {
             let (rows, remainder) = wheel_rows(self.wheel_remainder, steps, 3);
@@ -1930,18 +2014,40 @@ impl State {
             return false;
         };
 
-        // Escape closes open native Settings Overlay or Visual Layout Editor without leaking to PTY.
-        if key == 1 && !ctrl && !shift && !alt {
-            if self.settings_overlay.open {
-                self.settings_overlay.open = false;
+        // Focused Beyrix Studio text input consumes typing/Backspace/Enter/Escape cleanly.
+        if let Some(w) = &mut self.widgets
+            && w.editor.active
+            && w.editor.focused_input.is_some()
+        {
+            let ch = match key {
+                2 | 79 => Some('1'),
+                3 | 80 => Some('2'),
+                4 | 81 => Some('3'),
+                5 | 75 => Some('4'),
+                6 | 76 => Some('5'),
+                7 | 77 => Some('6'),
+                8 | 71 => Some('7'),
+                9 | 72 => Some('8'),
+                10 | 73 => Some('9'),
+                11 | 82 => Some('0'),
+                12 | 74 => Some('-'),
+                52 | 83 => Some('.'),
+                _ => None,
+            };
+            let backspace = key == 14;
+            let enter = key == 28 || key == 96;
+            let escape = key == 1;
+            if w.handle_editor_key(ch, backspace, enter, escape) {
                 self.platform_dirty = true;
                 self.dirty = true;
                 return false;
             }
-            if let Some(w) = &mut self.widgets
-                && w.editor.active
-            {
-                w.editor.toggle();
+        }
+
+        // Escape closes the topmost open system panel (Settings, Studio, or X-Ray) without leaking to PTY.
+        if key == 1 && !ctrl && !shift && !alt {
+            if self.ui_compositor.close_active() {
+                self.sync_active_panel();
                 self.platform_dirty = true;
                 self.dirty = true;
                 return false;
@@ -2011,22 +2117,24 @@ impl State {
         if crate::config::Hotkey::parse(&self.platform_config.keyboard.settings_hotkey)
             .is_some_and(|hk| hk.matches(ctrl, shift, alt, key))
         {
-            self.settings_overlay.toggle();
+            self.ui_compositor
+                .toggle_panel(crate::widgets::compositor::ActiveSystemPanel::Settings);
+            self.sync_active_panel();
             self.platform_dirty = true;
             self.dirty = true;
             return false;
         }
 
-        // Visual Layout Editor hotkey — ONLY intercept when Widgets subsystem is enabled!
+        // Beyrix Studio (Visual Layout Editor) hotkey — ONLY intercept when Widgets subsystem is enabled!
         if self.widgets.is_some()
             && crate::config::Hotkey::parse(&self.platform_config.widgets.editor_hotkey)
                 .is_some_and(|hk| hk.matches(ctrl, shift, alt, key))
         {
-            if let Some(w) = &mut self.widgets {
-                w.editor.toggle();
-                self.platform_dirty = true;
-                self.dirty = true;
-            }
+            self.ui_compositor
+                .toggle_panel(crate::widgets::compositor::ActiveSystemPanel::Studio);
+            self.sync_active_panel();
+            self.platform_dirty = true;
+            self.dirty = true;
             return false;
         }
 
@@ -2035,11 +2143,11 @@ impl State {
             && crate::config::Hotkey::parse(&self.platform_config.xray.hotkey)
                 .is_some_and(|hk| hk.matches(ctrl, shift, alt, key))
         {
-            if let Some(xray) = &mut self.xray {
-                xray.toggle_panel();
-                self.platform_dirty = true;
-                self.dirty = true;
-            }
+            self.ui_compositor
+                .toggle_panel(crate::widgets::compositor::ActiveSystemPanel::XRay);
+            self.sync_active_panel();
+            self.platform_dirty = true;
+            self.dirty = true;
             return false;
         }
 
@@ -3029,6 +3137,7 @@ impl State {
         pointer_px: (f32, f32),
         theme: &crate::theme::Theme,
     ) {
+        self.sync_active_panel();
         let insets = self.dock_insets_tuple(scale);
         let Some(renderer) = &mut self.renderer else {
             return;
@@ -3064,7 +3173,14 @@ impl State {
                 scene,
             );
         }
+        use crate::widgets::compositor::{ActiveSystemPanel, SurfaceOwner};
+        self.ui_compositor.clear_surfaces();
+        self.xray_hits.clear();
+
         if let Some(widgets) = &mut self.widgets {
+            let logical_w = win_size.0 / scale.max(0.25);
+            let logical_h = win_size.1 / scale.max(0.25);
+            widgets.update_window(logical_w, logical_h, scale, self.keyboard_focus);
             let g = renderer
                 .geometry(scale)
                 .with_insets(insets.0, insets.1, insets.2, insets.3);
@@ -3080,7 +3196,8 @@ impl State {
                     g.cell_height as f32,
                 )
             });
-            widgets.emit_to_scene(
+            widgets.emit_to_scene_with_config(
+                Some(&self.platform_config),
                 win_size,
                 scale,
                 (g.cell_width as f32, g.cell_height as f32),
@@ -3092,10 +3209,30 @@ impl State {
                 renderer,
                 scene,
             );
+            for rect in widgets.resolved_rects.values() {
+                if rect.visible && (rect.interactive || widgets.editor.active) {
+                    self.ui_compositor.register_surface(
+                        rect.x,
+                        rect.y,
+                        rect.w,
+                        rect.h,
+                        SurfaceOwner::Widget,
+                    );
+                }
+            }
+            if widgets.editor.active {
+                for &(ex, ey, ew, eh) in &widgets.editor_panel_rects {
+                    self.ui_compositor
+                        .register_surface(ex, ey, ew, eh, SurfaceOwner::Studio);
+                }
+            }
         }
-        if let Some(xray) = &self.xray {
-            self.xray_hits.clear();
-            xray.emit_to_scene(
+        // Only emit X-Ray when Studio and Settings are not covering the workspace.
+        if !self.ui_compositor.is_open(ActiveSystemPanel::Studio)
+            && !self.ui_compositor.is_open(ActiveSystemPanel::Settings)
+            && let Some(xray) = &self.xray
+        {
+            let rects = xray.emit_to_scene(
                 win_size,
                 scale,
                 pointer_px,
@@ -3104,6 +3241,19 @@ impl State {
                 scene,
                 &mut self.xray_hits,
             );
+            if let Some((ix, iy, iw, ih)) = rects.indicator {
+                self.ui_compositor.register_surface(
+                    ix,
+                    iy,
+                    iw,
+                    ih,
+                    SurfaceOwner::XRayIndicator,
+                );
+            }
+            if let Some((px, py, pw, ph)) = rects.panel {
+                self.ui_compositor
+                    .register_surface(px, py, pw, ph, SurfaceOwner::XRayPanel);
+            }
         }
         if self.settings_overlay.open {
             self.settings_overlay.emit_to_scene(
@@ -3115,6 +3265,38 @@ impl State {
                 renderer,
                 scene,
             );
+            if let Some((sx, sy, sw, sh)) = self.settings_overlay.panel_rect {
+                self.ui_compositor
+                    .register_surface(sx, sy, sw, sh, SurfaceOwner::Settings);
+            }
+        }
+    }
+
+    fn sync_active_panel(&mut self) {
+        use crate::widgets::compositor::ActiveSystemPanel;
+        let active = self.ui_compositor.active_panel;
+        self.settings_overlay.open = active == ActiveSystemPanel::Settings;
+        if !self.settings_overlay.open {
+            self.settings_overlay.status_message = None;
+            self.settings_overlay.hits.clear();
+            self.settings_overlay.panel_rect = None;
+        }
+        if let Some(w) = &mut self.widgets {
+            let want_studio = active == ActiveSystemPanel::Studio;
+            if w.editor.active && !want_studio {
+                let _ = w.persist_profiles();
+                w.editor.toggle();
+                w.editor_hits.clear();
+                w.editor_panel_rects.clear();
+            } else if !w.editor.active && want_studio {
+                w.editor.toggle();
+            }
+        }
+        if let Some(xray) = &mut self.xray {
+            let want_xray = active == ActiveSystemPanel::XRay;
+            if xray.panel_open != want_xray {
+                xray.panel_open = want_xray;
+            }
         }
     }
 }

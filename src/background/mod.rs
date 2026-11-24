@@ -469,6 +469,7 @@ impl BackgroundEngine {
                     self.cached_glyphs.push(SceneGlyph {
                         ch: cell.ch,
                         px_size,
+                        font_kind: crate::render::FontKind::Mono,
                         x,
                         y,
                         w,

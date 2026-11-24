@@ -6,15 +6,17 @@
 
 #![allow(dead_code)]
 
+pub mod compositor;
 pub mod editor_ui;
+pub mod icons;
 pub mod layout;
 pub mod manifest;
 pub mod permissions;
 pub mod runtime;
 pub mod ui;
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use crate::config::WidgetsConfig;
 use crate::events::EventBus;
@@ -41,12 +43,22 @@ pub enum ExtensionTrust {
     HostOfficial,
 }
 
+/// Diagnostic record for an extension that failed to parse, validate, or load.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtensionLoadError {
+    pub dir_name: String,
+    pub path: PathBuf,
+    pub error: String,
+}
+
 /// Top-level coordinator for BeyrixWidgets.
 ///
 /// Lazy-initializes the JS runtime only when `config.enabled` is true.
 pub struct WidgetManager {
     pub config: WidgetsConfig,
     pub extensions: BTreeMap<String, LoadedExtension>,
+    pub load_errors: Vec<ExtensionLoadError>,
+    pub disabled_extensions: BTreeSet<String>,
     pub trust_levels: BTreeMap<String, ExtensionTrust>,
     pub granted_permissions: BTreeMap<String, PermissionSet>,
     pub placements: BTreeMap<String, WidgetPlacementConfig>,
@@ -54,6 +66,7 @@ pub struct WidgetManager {
     pub extension_settings: BTreeMap<String, serde_json::Value>,
     pub editor: VisualLayoutEditor,
     pub editor_hits: Vec<UiHitTarget>,
+    pub editor_panel_rects: Vec<(f32, f32, f32, f32)>,
     pub hit_targets: Vec<UiHitTarget>,
     pub resolved_rects: BTreeMap<String, ResolvedWidgetRect>,
     generations: BTreeMap<String, u64>,
@@ -62,6 +75,7 @@ pub struct WidgetManager {
     active_slider: Option<(String, String, f32, f32)>,
     file_mtimes: BTreeMap<String, std::time::SystemTime>,
     last_reload_poll: Option<std::time::Instant>,
+    last_window_state: (f32, f32, f32, bool),
 }
 
 impl WidgetManager {
@@ -76,6 +90,8 @@ impl WidgetManager {
         Self {
             config,
             extensions: BTreeMap::new(),
+            load_errors: Vec::new(),
+            disabled_extensions: BTreeSet::new(),
             trust_levels: BTreeMap::new(),
             granted_permissions: BTreeMap::new(),
             placements: BTreeMap::new(),
@@ -83,6 +99,7 @@ impl WidgetManager {
             extension_settings: BTreeMap::new(),
             editor: VisualLayoutEditor::new(),
             editor_hits: Vec::new(),
+            editor_panel_rects: Vec::new(),
             hit_targets: Vec::new(),
             resolved_rects: BTreeMap::new(),
             generations: BTreeMap::new(),
@@ -91,6 +108,7 @@ impl WidgetManager {
             active_slider: None,
             file_mtimes: BTreeMap::new(),
             last_reload_poll: None,
+            last_window_state: (0.0, 0.0, 1.0, true),
         }
     }
 
@@ -212,17 +230,73 @@ impl WidgetManager {
     pub fn load_directory(&mut self, dir: &Path, trust: ExtensionTrust) -> Result<usize, String> {
         let entries = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
         let mut count = 0;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir()
-                && path.join("beyrix-ext.toml").is_file()
-                && let Ok(loaded) = ExtensionManifest::load_from_dir(&path)
-                && self.register_extension(loaded, trust).is_ok()
-            {
-                count += 1;
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir() && p.join("beyrix-ext.toml").is_file())
+            .collect();
+        dirs.sort();
+        for path in dirs {
+            let dir_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            self.load_errors.retain(|e| e.path != path);
+            match ExtensionManifest::load_from_dir(&path) {
+                Ok(loaded) => match self.register_extension(loaded, trust) {
+                    Ok(()) => count += 1,
+                    Err(err) => {
+                        eprintln!("beyrix widgets: failed to register {dir_name}: {err}");
+                        self.load_errors.push(ExtensionLoadError {
+                            dir_name,
+                            path,
+                            error: err,
+                        });
+                    }
+                },
+                Err(err) => {
+                    eprintln!("beyrix widgets: failed to load {dir_name}: {err}");
+                    self.load_errors.push(ExtensionLoadError {
+                        dir_name,
+                        path,
+                        error: err,
+                    });
+                }
             }
         }
         Ok(count)
+    }
+
+    pub fn is_extension_enabled(&self, id: &str) -> bool {
+        !self.disabled_extensions.contains(id)
+    }
+
+    pub fn set_extension_enabled(&mut self, id: &str, enabled: bool) {
+        if enabled {
+            self.disabled_extensions.remove(id);
+        } else {
+            self.disabled_extensions.insert(id.to_string());
+        }
+    }
+
+    pub fn update_window(&mut self, width: f32, height: f32, scale: f32, focused: bool) {
+        let next = (width, height, scale, focused);
+        if (self.last_window_state.0 - width).abs() <= 0.5
+            && (self.last_window_state.1 - height).abs() <= 0.5
+            && (self.last_window_state.2 - scale).abs() <= 0.01
+            && self.last_window_state.3 == focused
+        {
+            return;
+        }
+        self.last_window_state = next;
+        if let Some(vm) = &self.runtime {
+            vm.send(VmCommand::UpdateWindow {
+                width: width.round() as i32,
+                height: height.round() as i32,
+                scale,
+                focused,
+            });
+        }
     }
 
     pub fn register_extension(
@@ -371,8 +445,40 @@ impl WidgetManager {
         renderer: &mut Renderer,
         scene: &mut Scene,
     ) {
+        self.emit_to_scene_with_config(
+            None,
+            win_size,
+            scale,
+            cell_size,
+            in_tui,
+            pointer_px,
+            inline_y_px,
+            cursor_row_px,
+            theme,
+            renderer,
+            scene,
+        );
+    }
+
+    /// Emit all visible widgets and Beyrix Studio panels into `Scene`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_to_scene_with_config(
+        &mut self,
+        platform_cfg: Option<&crate::config::PlatformConfig>,
+        win_size: (f32, f32),
+        scale: f32,
+        cell_size: (f32, f32),
+        in_tui: bool,
+        pointer_px: (f32, f32),
+        inline_y_px: Option<f32>,
+        cursor_row_px: Option<(f32, f32)>,
+        theme: &Theme,
+        renderer: &mut Renderer,
+        scene: &mut Scene,
+    ) {
         self.hit_targets.clear();
         self.editor_hits.clear();
+        self.editor_panel_rects.clear();
         self.resolved_rects.clear();
         if !self.config.enabled {
             return;
@@ -383,6 +489,9 @@ impl WidgetManager {
 
         let mut occupied: Vec<(f32, f32, f32, f32)> = Vec::new();
         for (id, cfg) in ordered {
+            if !self.is_extension_enabled(id) {
+                continue;
+            }
             let Some(state) = renders.get(id) else {
                 continue;
             };
@@ -462,8 +571,10 @@ impl WidgetManager {
         }
         if self.editor.active {
             let mut ed_hits = Vec::new();
+            let mut ed_rects = Vec::new();
             editor_ui::emit_visual_editor_panel(
                 self,
+                platform_cfg,
                 win_size,
                 scale,
                 pointer_px,
@@ -471,18 +582,33 @@ impl WidgetManager {
                 renderer,
                 scene,
                 &mut ed_hits,
+                &mut ed_rects,
             );
             self.editor_hits = ed_hits;
+            self.editor_panel_rects = ed_rects;
         }
     }
 
-    /// Handle pointer press; returns `true` if a widget or the layout editor consumed it.
+    /// Handle pointer press; returns `true` if a widget or Beyrix Studio consumed it.
     pub fn handle_pointer_press(&mut self, pointer_px: (f32, f32), scale: f32) -> bool {
+        self.handle_pointer_press_with_config(pointer_px, scale, None)
+            .0
+    }
+
+    /// Handle pointer press with optional mutable `PlatformConfig` for Beyrix Studio
+    /// Background Engine & X-Ray controls. Returns `(consumed, platform_config_changed)`.
+    pub fn handle_pointer_press_with_config(
+        &mut self,
+        pointer_px: (f32, f32),
+        scale: f32,
+        mut platform_cfg: Option<&mut crate::config::PlatformConfig>,
+    ) -> (bool, bool) {
         if !self.config.enabled {
-            return false;
+            return (false, false);
         }
+        let mut cfg_changed = false;
         if self.editor.active {
-            // 1. Check Visual Layout Editor panel controls first.
+            // 1. Check Beyrix Studio panel controls first.
             let hit_opt = self
                 .editor_hits
                 .iter()
@@ -495,7 +621,25 @@ impl WidgetManager {
                 })
                 .cloned();
             if let Some(hit) = hit_opt {
+                // Clicking any non-input control blurs focused text input.
+                if hit.kind != HitKind::TextInput {
+                    self.commit_focused_editor_input();
+                }
                 match (hit.node_id.as_str(), hit.kind) {
+                    ("ed.left.tabs", HitKind::Tab(idx)) => {
+                        self.editor.left_tab = if idx == 0 {
+                            layout::StudioLeftTab::Catalog
+                        } else {
+                            layout::StudioLeftTab::Layers
+                        };
+                    }
+                    ("ed.narrow.pane", HitKind::Tab(idx)) => {
+                        self.editor.narrow_pane = match idx {
+                            0 => layout::NarrowStudioPane::Preview,
+                            1 => layout::NarrowStudioPane::Catalog,
+                            _ => layout::NarrowStudioPane::Inspector,
+                        };
+                    }
                     ("ed.tabs", HitKind::Tab(idx)) => {
                         self.editor.active_tab = match idx {
                             0 => layout::EditorTab::Catalog,
@@ -513,6 +657,128 @@ impl WidgetManager {
                     }
                     ("ed.redo", _) => {
                         self.editor.redo(&mut self.placements);
+                    }
+                    ("ed.profile.dropdown", _) => {
+                        let names: Vec<String> = self.profiles.profiles.keys().cloned().collect();
+                        if !names.is_empty() {
+                            let cur = names
+                                .iter()
+                                .position(|n| n == &self.profiles.active)
+                                .unwrap_or(0);
+                            let next = names[(cur + 1) % names.len()].clone();
+                            self.editor.push_undo(self.placements.clone());
+                            if let Some(profile) = self.profiles.switch(&next) {
+                                for (wid, pcfg) in &profile.widgets {
+                                    self.placements.insert(wid.clone(), pcfg.clone());
+                                }
+                            }
+                        }
+                    }
+                    (id_str, HitKind::TextInput) if id_str.starts_with("ed.in.") => {
+                        if let Some(sel) = self.editor.selected_widget.clone()
+                            && let Some(cfg) = self.placements.get(&sel)
+                        {
+                            let buf = match id_str {
+                                "ed.in.x" => format!("{:.0}", cfg.x),
+                                "ed.in.y" => format!("{:.0}", cfg.y),
+                                "ed.in.w" => format!("{:.0}", cfg.width),
+                                "ed.in.h" => format!("{:.0}", cfg.height),
+                                "ed.in.radius" => format!("{:.0}", cfg.border_radius),
+                                "ed.in.z" => format!("{}", cfg.z_index),
+                                _ => String::new(),
+                            };
+                            self.editor.focused_input = Some(id_str.to_string());
+                            self.editor.input_buffer = buf;
+                        }
+                    }
+                    ("ed.bg.enabled", _) => {
+                        if let Some(pc) = platform_cfg.as_deref_mut() {
+                            pc.background.enabled = !pc.background.enabled;
+                            cfg_changed = true;
+                        }
+                    }
+                    ("ed.bg.preset", _) => {
+                        if let Some(pc) = platform_cfg.as_deref_mut() {
+                            let all = crate::config::BackgroundPreset::ALL;
+                            let idx = all
+                                .iter()
+                                .position(|&p| p == pc.background.preset)
+                                .unwrap_or(0);
+                            pc.background.preset = all[(idx + 1) % all.len()];
+                            cfg_changed = true;
+                        }
+                    }
+                    ("ed.bg.fit", _) => {
+                        if let Some(pc) = platform_cfg.as_deref_mut() {
+                            use crate::config::BackgroundFitMode;
+                            pc.background.fit_mode = match pc.background.fit_mode {
+                                BackgroundFitMode::Fit => BackgroundFitMode::Fill,
+                                BackgroundFitMode::Fill => BackgroundFitMode::FixedScale,
+                                BackgroundFitMode::FixedScale => BackgroundFitMode::Responsive,
+                                BackgroundFitMode::Responsive => BackgroundFitMode::Fit,
+                            };
+                            cfg_changed = true;
+                        }
+                    }
+                    ("ed.bg.alpha", HitKind::Slider) => {
+                        if let Some(pc) = platform_cfg.as_deref_mut() {
+                            pc.background.alpha =
+                                ((pointer_px.0 - hit.x) / hit.w.max(1.0)).clamp(0.05, 1.0);
+                            cfg_changed = true;
+                        }
+                    }
+                    ("ed.bg.speed", HitKind::Slider) => {
+                        if let Some(pc) = platform_cfg.as_deref_mut() {
+                            pc.background.speed =
+                                (((pointer_px.0 - hit.x) / hit.w.max(1.0)).clamp(0.05, 1.0)) * 3.0;
+                            cfg_changed = true;
+                        }
+                    }
+                    ("ed.bg.mouse", _) => {
+                        if let Some(pc) = platform_cfg.as_deref_mut() {
+                            pc.background.mouse_reactive = !pc.background.mouse_reactive;
+                            cfg_changed = true;
+                        }
+                    }
+                    ("ed.bg.audio", _) => {
+                        if let Some(pc) = platform_cfg.as_deref_mut() {
+                            pc.background.audio_reactive = !pc.background.audio_reactive;
+                            cfg_changed = true;
+                        }
+                    }
+                    ("ed.bg.auto_quality", _) => {
+                        if let Some(pc) = platform_cfg.as_deref_mut() {
+                            pc.background.auto_quality = !pc.background.auto_quality;
+                            cfg_changed = true;
+                        }
+                    }
+                    ("ed.xray.enabled", _) => {
+                        if let Some(pc) = platform_cfg.as_deref_mut() {
+                            pc.xray.enabled = !pc.xray.enabled;
+                            cfg_changed = true;
+                        }
+                    }
+                    ("ed.xray.compact", _) => {
+                        if let Some(pc) = platform_cfg.as_deref_mut() {
+                            pc.xray.compact_indicator = !pc.xray.compact_indicator;
+                            cfg_changed = true;
+                        }
+                    }
+                    ("ed.xray.privacy", _) => {
+                        if let Some(pc) = platform_cfg.as_deref_mut() {
+                            pc.xray.privacy_mode = !pc.xray.privacy_mode;
+                            cfg_changed = true;
+                        }
+                    }
+                    ("ed.xray.level", _) => {
+                        if let Some(pc) = platform_cfg.as_deref_mut() {
+                            use crate::config::XRayLevel;
+                            pc.xray.level = match pc.xray.level {
+                                XRayLevel::Light => XRayLevel::Inspect,
+                                _ => XRayLevel::Light,
+                            };
+                            cfg_changed = true;
+                        }
                     }
                     ("ed.prop.mode", _) => {
                         if let Some(id) = self.editor.selected_widget.clone() {
@@ -666,10 +932,38 @@ impl WidgetManager {
                         let _ = self.profiles.delete(name);
                         let _ = self.persist_profiles();
                     }
+                    (id_str, HitKind::Slider) if id_str.starts_with("ed.schema.slider.") => {
+                        let key = id_str.trim_start_matches("ed.schema.slider.").to_string();
+                        if let Some(sel) = self.editor.selected_widget.clone()
+                            && let Some(ext) = self.extensions.get(&sel)
+                            && let Some(field) =
+                                ext.manifest.settings_schema.iter().find(|f| f.key == key)
+                        {
+                            let min = field.min.unwrap_or(0.0);
+                            let max = field.max.unwrap_or(100.0).max(min + 1.0);
+                            let step = field.step.unwrap_or(1.0).max(0.01);
+                            let norm = ((pointer_px.0 - hit.x) / hit.w.max(1.0)).clamp(0.0, 1.0) as f64;
+                            let raw = min + norm * (max - min);
+                            let snapped = (raw / step).round() * step;
+                            let mut obj = self
+                                .extension_settings
+                                .get(&sel)
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!({}));
+                            obj[key] = serde_json::json!(snapped);
+                            let _ = self.update_extension_settings(&sel, obj);
+                        }
+                    }
+                    (id_str, _) if id_str.starts_with("ed.toggle.") => {
+                        let wid = id_str.trim_start_matches("ed.toggle.").to_string();
+                        let next = !self.is_extension_enabled(&wid);
+                        self.set_extension_enabled(&wid, next);
+                    }
                     (id_str, _) if id_str.starts_with("ed.select.") => {
                         let wid = id_str.trim_start_matches("ed.select.").to_string();
                         self.editor.selected_widget = Some(wid);
                         self.editor.active_tab = layout::EditorTab::Properties;
+                        self.editor.narrow_pane = layout::NarrowStudioPane::Inspector;
                     }
                     (id_str, _) if id_str.starts_with("ed.reload.") => {
                         let wid = id_str.trim_start_matches("ed.reload.");
@@ -700,11 +994,20 @@ impl WidgetManager {
                     }
                     _ => {}
                 }
-                return true;
+                return (true, cfg_changed);
             }
 
-            // 2. Otherwise check widget canvas for Drag & Drop / Resize handles.
-            for (id, rect) in &self.resolved_rects {
+            self.commit_focused_editor_input();
+
+            // 2. Otherwise check widget canvas for Drag & Drop / Resize handles in reverse Z-order.
+            let mut z_ordered: Vec<(&String, &ResolvedWidgetRect)> =
+                self.resolved_rects.iter().collect();
+            z_ordered.sort_by_key(|(id, _)| {
+                self.placements
+                    .get(*id)
+                    .map_or(0, |c| c.z_index)
+            });
+            for (id, rect) in z_ordered.into_iter().rev() {
                 if pointer_px.0 >= rect.x
                     && pointer_px.0 <= rect.x + rect.w
                     && pointer_px.1 >= rect.y
@@ -733,10 +1036,10 @@ impl WidgetManager {
                         pointer_px,
                         (rect.x, rect.y, rect.w, rect.h),
                     );
-                    return true;
+                    return (true, false);
                 }
             }
-            return false;
+            return (false, false);
         }
 
         for hit in self.hit_targets.iter().rev() {
@@ -757,7 +1060,7 @@ impl WidgetManager {
                         HitKind::Button => ("click", 1.0),
                         HitKind::Toggle | HitKind::Checkbox => ("toggle", 1.0),
                         HitKind::Dropdown => ("cycle", 1.0),
-                        HitKind::ScrollView => continue,
+                        HitKind::ScrollView | HitKind::TextInput => continue,
                         HitKind::Tab(idx) => ("tab", idx as f32),
                         HitKind::Slider => {
                             self.active_slider = Some((
@@ -779,10 +1082,70 @@ impl WidgetManager {
                         value,
                     });
                 }
-                return true;
+                return (true, false);
             }
         }
-        false
+        (false, false)
+    }
+
+    pub fn commit_focused_editor_input(&mut self) {
+        let Some(input_id) = self.editor.focused_input.take() else {
+            return;
+        };
+        let raw = std::mem::take(&mut self.editor.input_buffer);
+        let Some(sel) = self.editor.selected_widget.clone() else {
+            return;
+        };
+        let Ok(val) = raw.trim().parse::<f32>() else {
+            return;
+        };
+        self.editor.push_undo(self.placements.clone());
+        if let Some(cfg) = self.placements.get_mut(&sel) {
+            match input_id.as_str() {
+                "ed.in.x" => cfg.x = val.clamp(-2000.0, 2000.0),
+                "ed.in.y" => cfg.y = val.clamp(-2000.0, 2000.0),
+                "ed.in.w" => cfg.width = val.clamp(cfg.min_width.max(40.0), 1600.0),
+                "ed.in.h" => cfg.height = val.clamp(cfg.min_height.max(24.0), 1200.0),
+                "ed.in.radius" => cfg.border_radius = val.clamp(0.0, 32.0),
+                "ed.in.z" => cfg.z_index = (val.round() as i32).clamp(-100, 100),
+                _ => {}
+            }
+        }
+    }
+
+    /// Handle keyboard input when a Beyrix Studio numeric input is focused.
+    /// Returns `true` if the key was consumed.
+    pub fn handle_editor_key(
+        &mut self,
+        ch: Option<char>,
+        backspace: bool,
+        enter: bool,
+        escape: bool,
+    ) -> bool {
+        if !self.editor.active || self.editor.focused_input.is_none() {
+            return false;
+        }
+        if escape {
+            self.editor.focused_input = None;
+            self.editor.input_buffer.clear();
+            return true;
+        }
+        if enter {
+            self.commit_focused_editor_input();
+            return true;
+        }
+        if backspace {
+            self.editor.input_buffer.pop();
+            return true;
+        }
+        if let Some(c) = ch
+            && (c.is_ascii_digit() || c == '-' || c == '.')
+            && self.editor.input_buffer.len() < 8
+        {
+            self.editor.input_buffer.push(c);
+            return true;
+        }
+        true
     }
 
     pub fn handle_pointer_motion(

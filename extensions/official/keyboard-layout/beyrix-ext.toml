@@ -8,7 +8,7 @@ author = "Beyrix Team"
 description = "Compact, theme-aware keyboard layout indicator with always/on-switch modes and per-layout colors."
 license = "MPL-2.0"
 official = true
-permissions = ["ui", "keyboard-layout", "theme", "timers"]
+permissions = ["ui", "keyboard-layout", "theme", "window"]
 
 [[settings_schema]]
 key = "mode"

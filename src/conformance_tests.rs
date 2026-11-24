@@ -597,3 +597,466 @@ fn sgr_attributes_render_distinct_scenes_in_software_backend() {
     );
     assert!(scene.overlays.len() >= 4);
 }
+
+#[test]
+fn all_official_extensions_load_render_and_report_load_errors_in_catalog() {
+    let official_dir = std::path::Path::new("extensions/official");
+    assert!(official_dir.is_dir());
+
+    let bus = crate::events::EventBus::new();
+    let mut mgr = crate::widgets::WidgetManager::new(crate::config::WidgetsConfig {
+        enabled: true,
+        hot_reload: false,
+        ..Default::default()
+    });
+    let theme = crate::theme::Theme::default();
+    mgr.ensure_started(theme.clone(), bus).unwrap();
+    let loaded_count = mgr
+        .load_directory(official_dir, crate::widgets::ExtensionTrust::HostOfficial)
+        .unwrap();
+
+    // Zero silent drops: every official extension must load cleanly.
+    assert!(
+        mgr.load_errors.is_empty(),
+        "unexpected official extension load errors: {:?}",
+        mgr.load_errors
+    );
+    assert!(
+        loaded_count >= 2,
+        "expected keyboard-layout and media-player, got {loaded_count}"
+    );
+    assert!(mgr.extensions.contains_key("beyrix.official.keyboard-layout"));
+    assert!(mgr.extensions.contains_key("beyrix.official.media-player"));
+
+    // Wait briefly for JS runtime to run initial renderWidget() for all official widgets.
+    std::thread::sleep(Duration::from_millis(160));
+    let snaps = mgr.render_snapshots();
+    for id in [
+        "beyrix.official.keyboard-layout",
+        "beyrix.official.media-player",
+    ] {
+        let st = snaps
+            .get(id)
+            .unwrap_or_else(|| panic!("official extension {id} must produce render snapshot"));
+        assert!(
+            st.last_error.is_none(),
+            "official extension {id} had JS error: {:?}",
+            st.last_error
+        );
+        assert!(
+            st.tree.is_some(),
+            "official extension {id} must emit a UiNode tree"
+        );
+    }
+
+    // Verify both widgets emit valid geometry across all required widths and HiDPI scales.
+    let mut renderer = crate::render::Renderer::with_theme(theme.clone()).unwrap();
+    for &logical_w in &[320.0_f32, 480.0, 720.0, 1024.0, 1600.0] {
+        for &scale in &[1.0_f32, 1.25, 1.5, 1.75] {
+            let win_w = logical_w * scale;
+            let win_h = 640.0 * scale;
+            let mut scene = crate::render::Scene::default();
+            mgr.emit_to_scene(
+                (win_w, win_h),
+                scale,
+                (10.0 * scale, 18.0 * scale),
+                false,
+                (0.0, 0.0),
+                None,
+                None,
+                &theme,
+                &mut renderer,
+                &mut scene,
+            );
+            assert!(
+                !scene.overlay_rounded.is_empty(),
+                "widgets must emit rounded surfaces at {logical_w}px@{scale}x"
+            );
+            assert!(
+                !scene.overlay_glyphs.is_empty(),
+                "widgets must emit glyphs at {logical_w}px@{scale}x"
+            );
+            for (wid, rect) in &mgr.resolved_rects {
+                assert!(
+                    rect.x >= -0.5 && rect.y >= -0.5 && rect.x + rect.w <= win_w + 0.5 && rect.y + rect.h <= win_h + 0.5,
+                    "widget {wid} overflowed viewport {win_w}x{win_h}: {rect:?}"
+                );
+            }
+            // No button may be squished below readable minimum height.
+            for hit in &mgr.hit_targets {
+                if hit.kind == crate::widgets::ui::HitKind::Button {
+                    assert!(
+                        hit.h >= 19.0 * scale,
+                        "button {} squished to h={} at {logical_w}px@{scale}x",
+                        hit.node_id,
+                        hit.h
+                    );
+                }
+            }
+        }
+    }
+
+    // Verify broken manifests are surfaced in load_errors (never silently dropped).
+    let broken_root = tempfile::tempdir().unwrap();
+    let broken_ext = broken_root.path().join("broken-widget");
+    std::fs::create_dir_all(&broken_ext).unwrap();
+    std::fs::write(broken_ext.join("index.js"), "beyrix.ui.render(beyrix.ui.text('x'));").unwrap();
+    std::fs::write(
+        broken_ext.join("beyrix-ext.toml"),
+        r#"
+id = "org.test.broken"
+name = "Broken"
+version = "1.0.0"
+kind = "widget"
+sdk_version = "1.0.0"
+entry = "index.js"
+permissions = ["ui", "nonexistent-cap"]
+"#,
+    )
+    .unwrap();
+    let _ = mgr.load_directory(broken_root.path(), crate::widgets::ExtensionTrust::ThirdParty);
+    assert!(
+        mgr.load_errors
+            .iter()
+            .any(|e| e.dir_name == "broken-widget" && e.error.contains("nonexistent-cap")),
+        "broken manifest error must be recorded in load_errors: {:?}",
+        mgr.load_errors
+    );
+}
+
+#[test]
+fn software_renderer_paints_true_rounded_corners_clipping_and_opaque_panels() {
+    let theme = crate::theme::Theme::default();
+    let mut renderer = crate::render::Renderer::with_theme(theme.clone()).unwrap();
+    assert!(
+        renderer.has_distinct_ui_font(),
+        "proportional UI font stack should load separately from monospace terminal font"
+    );
+
+    // Paint bright green terminal background text, then an opaque rounded card on top.
+    let w = 240usize;
+    let h = 160usize;
+    let mut scene = crate::render::Scene {
+        background: [0.05, 0.06, 0.08, 1.0],
+        ..Default::default()
+    };
+    scene.rects.push(crate::render::SceneRect {
+        x: 0.0,
+        y: 0.0,
+        w: w as f32,
+        h: h as f32,
+        color: [0.0, 0.9, 0.1, 1.0], // bright green behind panel
+    });
+    // Rounded opaque card with radius=20 at (40, 30, 160, 100)
+    scene.overlay_rounded.push(crate::render::SceneRoundedRect {
+        x: 40.0,
+        y: 30.0,
+        w: 160.0,
+        h: 100.0,
+        radius: 20.0,
+        color: [0.12, 0.14, 0.20, 1.0],
+        border_width: 2.0,
+        border_color: [0.4, 0.7, 1.0, 1.0],
+        shadow_blur: 0.0,
+        shadow_offset_y: 0.0,
+        shadow_color: [0.0; 4],
+        clip: None,
+    });
+    // Clipped bright red rect that attempts to draw outside [60..140, 50..90]
+    scene.overlay_rounded.push(crate::render::SceneRoundedRect {
+        x: 10.0,
+        y: 10.0,
+        w: 220.0,
+        h: 140.0,
+        radius: 0.0,
+        color: [0.95, 0.1, 0.1, 1.0],
+        border_width: 0.0,
+        border_color: [0.0; 4],
+        shadow_blur: 0.0,
+        shadow_offset_y: 0.0,
+        shadow_color: [0.0; 4],
+        clip: Some([60.0, 50.0, 80.0, 40.0]),
+    });
+
+    let mut pixels = vec![0u8; w * h * 4];
+    renderer.paint_scene(&scene, w, &mut pixels);
+    let px_at = |x: usize, y: usize| -> [u8; 4] {
+        let off = (y * w + x) * 4;
+        [pixels[off], pixels[off + 1], pixels[off + 2], pixels[off + 3]] // BGRA
+    };
+
+    // 1. Exact corner (40, 30) of radius=20 card MUST still show green background (NOT card fill!).
+    let corner = px_at(40, 30);
+    assert!(
+        corner[1] > 180 && corner[2] < 40,
+        "corner pixel (40,30) should be rounded away to show green bg, got BGRA={corner:?}"
+    );
+    // 2. Interior card pixel outside red clip (e.g. 50, 70) MUST be opaque card color (no green bleed).
+    let interior = px_at(50, 70);
+    assert!(
+        interior[1] < 60 && interior[0] > 35,
+        "interior pixel (50,70) should be opaque card fill without green bleed, got BGRA={interior:?}"
+    );
+    // 3. Inside clip rect (100, 70) MUST be red (BGRA: R=pixels[2]).
+    let clipped_in = px_at(100, 70);
+    assert!(
+        clipped_in[2] > 200 && clipped_in[1] < 40,
+        "inside clip pixel (100,70) should be red, got BGRA={clipped_in:?}"
+    );
+    // 4. Outside clip rect (15, 15) MUST NOT be red — still green bg.
+    let clipped_out = px_at(15, 15);
+    assert!(
+        clipped_out[1] > 180 && clipped_out[2] < 40,
+        "outside clip pixel (15,15) must remain green, got BGRA={clipped_out:?}"
+    );
+}
+
+#[test]
+fn visual_regression_studio_xray_settings_and_widgets_geometry_and_screenshots() {
+    let theme = crate::theme::Theme::builtin("developer").unwrap();
+    let mut renderer = crate::render::Renderer::with_theme(theme.clone()).unwrap();
+    let mut terminal = Terminal::with_theme(120, 36, theme.clone());
+    terminal.process(
+        b"\x1b[1;36mbeykus@fedora\x1b[0m \x1b[33m~/Beynal/beynal\x1b[0m $ cargo test --release\r\n\
+          \x1b[32m   Compiling\x1b[0m beyrix v0.1.0-alpha.2 (/home/beykus/Beynal/beynal)\r\n\
+          \x1b[32m    Finished\x1b[0m `release` profile [optimized] target(s) in 4.12s\r\n\
+          \x1b[1;36mbeykus@fedora\x1b[0m \x1b[33m~/Beynal/beynal\x1b[0m $ ",
+    );
+
+    let bus = crate::events::EventBus::new();
+    let mut mgr = crate::widgets::WidgetManager::new(crate::config::WidgetsConfig {
+        enabled: true,
+        hot_reload: false,
+        ..Default::default()
+    });
+    mgr.ensure_started(theme.clone(), bus.clone()).unwrap();
+    let _ = mgr.load_directory(
+        std::path::Path::new("extensions/official"),
+        crate::widgets::ExtensionTrust::HostOfficial,
+    );
+    std::thread::sleep(Duration::from_millis(160));
+
+    let mut platform_cfg = crate::config::PlatformConfig::default();
+    platform_cfg.widgets.enabled = true;
+    platform_cfg.xray.enabled = true;
+
+    let mut xray = crate::xray::XRayEngine::new(platform_cfg.xray.clone());
+    let mut settings = crate::widgets::editor_ui::SettingsOverlay::default();
+
+    let save_dir = std::env::var_os("BEYRIX_SAVE_SCREENSHOTS").map(std::path::PathBuf::from);
+    if let Some(dir) = &save_dir {
+        let _ = std::fs::create_dir_all(dir);
+    }
+
+    let save_png = |name: &str, w: usize, h: usize, bgra: &[u8]| {
+        if let Some(dir) = &save_dir {
+            let mut rgba = vec![0u8; w * h * 4];
+            for (src, dst) in bgra.chunks_exact(4).zip(rgba.chunks_exact_mut(4)) {
+                dst[0] = src[2];
+                dst[1] = src[1];
+                dst[2] = src[0];
+                dst[3] = 255;
+            }
+            let img = image::RgbaImage::from_raw(w as u32, h as u32, rgba).unwrap();
+            img.save(dir.join(format!("{name}.png"))).unwrap();
+        }
+    };
+
+    // 1. Live Desktop (Widgets + X-Ray compact indicator) at Wide (1280x720) and Narrow (480x640)
+    for (label, lw, lh, scale) in [
+        ("widgets_1280x720", 1280.0_f32, 720.0_f32, 1.0_f32),
+        ("widgets_480x640", 480.0, 640.0, 1.0),
+        ("widgets_320x480_hidpi", 320.0, 480.0, 1.25),
+    ] {
+        mgr.update_window(lw, lh, scale, true);
+        std::thread::sleep(Duration::from_millis(90));
+        let pw = (lw * scale).round() as usize;
+        let ph = (lh * scale).round() as usize;
+        let mut scene = renderer.build_terminal_scene(
+            terminal.screen(),
+            (pw, ph),
+            &crate::selection::Selection::default(),
+            true,
+            true,
+            scale,
+            None,
+        );
+        mgr.emit_to_scene_with_config(
+            Some(&platform_cfg),
+            (pw as f32, ph as f32),
+            scale,
+            (10.0 * scale, 18.0 * scale),
+            false,
+            (0.0, 0.0),
+            None,
+            None,
+            &theme,
+            &mut renderer,
+            &mut scene,
+        );
+        let mut xhits = Vec::new();
+        let xrects = xray.emit_to_scene(
+            (pw as f32, ph as f32),
+            scale,
+            (0.0, 0.0),
+            &theme,
+            &mut renderer,
+            &mut scene,
+            &mut xhits,
+        );
+        assert!(xrects.indicator.is_some());
+        let mut pixels = vec![0u8; pw * ph * 4];
+        renderer.paint_scene(&scene, pw, &mut pixels);
+        save_png(label, pw, ph, &pixels);
+    }
+
+    // 2. Beyrix Studio Wide (1600x900) — Topbar, Left Sidebar, Right Inspector must not overlap!
+    mgr.editor.active = true;
+    mgr.editor.selected_widget = Some("beyrix.official.media-player".into());
+    {
+        let (pw, ph, scale) = (1600usize, 900usize, 1.0_f32);
+        let mut scene = renderer.build_terminal_scene(
+            terminal.screen(),
+            (pw, ph),
+            &crate::selection::Selection::default(),
+            true,
+            true,
+            scale,
+            None,
+        );
+        mgr.emit_to_scene_with_config(
+            Some(&platform_cfg),
+            (pw as f32, ph as f32),
+            scale,
+            (10.0, 18.0),
+            false,
+            (0.0, 0.0),
+            None,
+            None,
+            &theme,
+            &mut renderer,
+            &mut scene,
+        );
+        assert_eq!(
+            mgr.editor_panel_rects.len(),
+            3,
+            "Wide Studio must emit Topbar + Left + Right panels"
+        );
+        for i in 0..mgr.editor_panel_rects.len() {
+            let a = mgr.editor_panel_rects[i];
+            for b in &mgr.editor_panel_rects[i + 1..] {
+                let overlaps = a.0 < b.0 + b.2
+                    && a.0 + a.2 > b.0
+                    && a.1 < b.1 + b.3
+                    && a.1 + a.3 > b.1;
+                assert!(!overlaps, "Studio panels overlapped: {a:?} vs {b:?}");
+            }
+        }
+        // Must expose real TextInput fields (not W+/W-/H+/H- cycling buttons)
+        assert!(
+            mgr.editor_hits
+                .iter()
+                .any(|h| h.node_id == "ed.in.w" && h.kind == crate::widgets::ui::HitKind::TextInput),
+            "Studio inspector must expose editable TextInput fields"
+        );
+        let mut pixels = vec![0u8; pw * ph * 4];
+        renderer.paint_scene(&scene, pw, &mut pixels);
+        save_png("studio_wide_1600x900", pw, ph, &pixels);
+    }
+
+    // 3. Beyrix Studio Narrow (480x640) — Collapsible Inspector Drawer, zero overflow!
+    mgr.editor.narrow_pane = crate::widgets::layout::NarrowStudioPane::Inspector;
+    {
+        let (pw, ph, scale) = (480usize, 640usize, 1.0_f32);
+        let mut scene = renderer.build_terminal_scene(
+            terminal.screen(),
+            (pw, ph),
+            &crate::selection::Selection::default(),
+            true,
+            true,
+            scale,
+            None,
+        );
+        mgr.emit_to_scene_with_config(
+            Some(&platform_cfg),
+            (pw as f32, ph as f32),
+            scale,
+            (10.0, 18.0),
+            false,
+            (0.0, 0.0),
+            None,
+            None,
+            &theme,
+            &mut renderer,
+            &mut scene,
+        );
+        for h in &mgr.editor_hits {
+            assert!(
+                h.x >= -0.5 && h.x + h.w <= pw as f32 + 0.5 && h.y + h.h <= ph as f32 + 0.5,
+                "Narrow Studio hit overflowed viewport: {h:?}"
+            );
+        }
+        let mut pixels = vec![0u8; pw * ph * 4];
+        renderer.paint_scene(&scene, pw, &mut pixels);
+        save_png("studio_narrow_480x640", pw, ph, &pixels);
+    }
+    mgr.editor.active = false;
+
+    // 4. X-Ray Panel (1024x640)
+    xray.panel_open = true;
+    {
+        let (pw, ph, scale) = (1024usize, 640usize, 1.0_f32);
+        let mut scene = renderer.build_terminal_scene(
+            terminal.screen(),
+            (pw, ph),
+            &crate::selection::Selection::default(),
+            true,
+            true,
+            scale,
+            None,
+        );
+        let mut xhits = Vec::new();
+        let xrects = xray.emit_to_scene(
+            (pw as f32, ph as f32),
+            scale,
+            (0.0, 0.0),
+            &theme,
+            &mut renderer,
+            &mut scene,
+            &mut xhits,
+        );
+        assert!(xrects.panel.is_some());
+        let mut pixels = vec![0u8; pw * ph * 4];
+        renderer.paint_scene(&scene, pw, &mut pixels);
+        save_png("xray_panel_1024x640", pw, ph, &pixels);
+    }
+    xray.panel_open = false;
+
+    // 5. Settings Overlay (1024x640)
+    settings.open = true;
+    {
+        let (pw, ph, scale) = (1024usize, 640usize, 1.0_f32);
+        let mut scene = renderer.build_terminal_scene(
+            terminal.screen(),
+            (pw, ph),
+            &crate::selection::Selection::default(),
+            true,
+            true,
+            scale,
+            None,
+        );
+        settings.emit_to_scene(
+            &platform_cfg,
+            (pw as f32, ph as f32),
+            scale,
+            (0.0, 0.0),
+            &theme,
+            &mut renderer,
+            &mut scene,
+        );
+        assert!(settings.panel_rect.is_some());
+        let mut pixels = vec![0u8; pw * ph * 4];
+        renderer.paint_scene(&scene, pw, &mut pixels);
+        save_png("settings_1024x640", pw, ph, &pixels);
+    }
+}
