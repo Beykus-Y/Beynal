@@ -204,6 +204,99 @@ impl IoAccumulator {
     }
 }
 
+/// Unified command lifecycle tracker combining OSC 133 semantic shell markers
+/// with Linux foreground PGID sampling so every command produces at most one
+/// report with clean metrics and accurate exit code / signal attribution.
+struct ActiveCommand {
+    source_osc133: bool,
+    pgid: Option<i32>,
+    name: String,
+    started_at: Instant,
+    started_wall: SystemTime,
+    peak_rss: u64,
+    peak_procs: usize,
+    io_acc: IoAccumulator,
+    wait_events: Vec<String>,
+}
+
+impl ActiveCommand {
+    fn new(source_osc133: bool, pgid: Option<i32>, name: String) -> Self {
+        Self {
+            source_osc133,
+            pgid,
+            name,
+            started_at: Instant::now(),
+            started_wall: SystemTime::now(),
+            peak_rss: 0,
+            peak_procs: 0,
+            io_acc: IoAccumulator::default(),
+            wait_events: Vec::new(),
+        }
+    }
+
+    fn update_from_nodes(&mut self, cmd_nodes: &[&ProcessNode]) {
+        let cmd_rss: u64 = cmd_nodes.iter().map(|n| n.rss_bytes).sum();
+        let cmd_procs = cmd_nodes.len();
+        self.peak_rss = self.peak_rss.max(cmd_rss);
+        self.peak_procs = self.peak_procs.max(cmd_procs);
+        self.io_acc.update(cmd_nodes);
+        if self.name.is_empty() && !cmd_nodes.is_empty() {
+            // Capture pipeline names cleanly (e.g. "cat | grep") up to 3 stages.
+            let mut names: Vec<&str> = Vec::new();
+            for n in cmd_nodes {
+                if !names.contains(&n.comm.as_str()) {
+                    names.push(&n.comm);
+                    if names.len() >= 3 {
+                        break;
+                    }
+                }
+            }
+            self.name = names.join(" | ");
+        }
+        for n in cmd_nodes {
+            if !matches!(
+                n.diagnosis.reason,
+                diagnosis::WaitReason::ActiveCompute | diagnosis::WaitReason::Unknown
+            ) {
+                let label = n.diagnosis.reason.label().to_string();
+                if !self.wait_events.contains(&label) && self.wait_events.len() < 16 {
+                    self.wait_events.push(label);
+                }
+            }
+        }
+    }
+
+    fn finish(self, command_id: u64, exit_code: Option<i32>) -> CommandReport {
+        let signal = exit_code.and_then(|c| (c > 128 && c <= 192).then_some(c - 128));
+        let label = if !self.name.is_empty() {
+            self.name
+        } else if self.source_osc133 {
+            "shell-builtin".to_string()
+        } else if let Some(pg) = self.pgid {
+            format!("pgid:{pg}")
+        } else {
+            "command".to_string()
+        };
+        CommandReport {
+            command_id,
+            command: label,
+            exit_code,
+            signal,
+            started_at: self.started_wall,
+            duration_ms: self.started_at.elapsed().as_millis() as u64,
+            peak_rss_bytes: self.peak_rss,
+            peak_process_count: self.peak_procs.max(usize::from(self.source_osc133)),
+            physical_read_bytes: self.io_acc.totals.0,
+            physical_write_bytes: self.io_acc.totals.1,
+            logical_read_bytes: self.io_acc.totals.2,
+            logical_write_bytes: self.io_acc.totals.3,
+            wait_events: self.wait_events,
+            trace_active: false,
+            io_is_approximate: true,
+        }
+    }
+}
+
 pub struct XRayEngine {
     pub config: XRayConfig,
     pub panel_open: bool,
@@ -320,18 +413,9 @@ impl XRayEngine {
                 let mut sampler = windows::WindowsSampler::new();
 
                 let mut reports = ReportStore::new(history_limit, privacy);
-                let mut prev_fg: Option<i32> = None;
-                let mut cmd_started = Instant::now();
-                let mut cmd_wall = SystemTime::now();
-                let mut cmd_name = String::new();
-                let mut peak_rss = 0u64;
-                let mut peak_procs = 0usize;
-                let mut io_acc = IoAccumulator::default();
-                let mut wait_events: Vec<String> = Vec::new();
+                let mut active: Option<ActiveCommand> = None;
+                let mut osc133_seen = false;
                 let mut cmd_seq = 1u64;
-                let mut shell_cmd_active = false;
-                let mut shell_cmd_started = Instant::now();
-                let mut shell_cmd_wall = SystemTime::now();
 
                 while !shutdown.load(Ordering::Relaxed) {
                     let pending_shell: Vec<crate::terminal::ShellEvent> = {
@@ -339,40 +423,20 @@ impl XRayEngine {
                         std::mem::take(&mut *q)
                     };
                     for ev in pending_shell {
+                        osc133_seen = true;
                         match ev {
                             crate::terminal::ShellEvent::CommandExecuted { .. } => {
-                                shell_cmd_active = true;
-                                shell_cmd_started = Instant::now();
-                                shell_cmd_wall = SystemTime::now();
+                                if let Some(prev) = active.take() {
+                                    reports.push(prev.finish(cmd_seq, None));
+                                    cmd_seq += 1;
+                                }
+                                active = Some(ActiveCommand::new(true, None, String::new()));
                             }
-                            crate::terminal::ShellEvent::CommandFinished { exit_code, .. }
-                                if shell_cmd_active =>
-                            {
-                                shell_cmd_active = false;
-                                let label = if !cmd_name.is_empty() && prev_fg != Some(root_pid) {
-                                    cmd_name.clone()
-                                } else {
-                                    "shell-command".to_string()
-                                };
-                                reports.push(CommandReport {
-                                    command_id: cmd_seq,
-                                    command: label,
-                                    exit_code,
-                                    signal: None,
-                                    started_at: shell_cmd_wall,
-                                    duration_ms: shell_cmd_started.elapsed().as_millis() as u64,
-                                    peak_rss_bytes: peak_rss,
-                                    peak_process_count: peak_procs.max(1),
-                                    physical_read_bytes: io_acc.totals.0,
-                                    physical_write_bytes: io_acc.totals.1,
-                                    logical_read_bytes: io_acc.totals.2,
-                                    logical_write_bytes: io_acc.totals.3,
-                                    wait_events: std::mem::take(&mut wait_events),
-                                    trace_active: false,
-                                    io_is_approximate: true,
-                                });
-                                cmd_seq += 1;
-                                cmd_name.clear();
+                            crate::terminal::ShellEvent::CommandFinished { exit_code, .. } => {
+                                if let Some(cur) = active.take() {
+                                    reports.push(cur.finish(cmd_seq, exit_code));
+                                    cmd_seq += 1;
+                                }
                             }
                             _ => {}
                         }
@@ -395,63 +459,45 @@ impl XRayEngine {
                     let total_rss: u64 = nodes.iter().map(|n| n.rss_bytes).sum();
 
                     if let Some(fg) = fg_pgid {
-                        let cmd_nodes: Vec<&ProcessNode> =
-                            nodes.iter().filter(|n| n.pgid == fg).collect();
-                        let cmd_rss: u64 = cmd_nodes.iter().map(|n| n.rss_bytes).sum();
-                        let cmd_procs = cmd_nodes.len();
-
-                        if prev_fg != Some(fg) {
-                            if let Some(old_fg) = prev_fg
-                                && !cmd_name.is_empty()
-                                && old_fg != root_pid
-                            {
-                                reports.push(CommandReport {
-                                    command_id: cmd_seq,
-                                    command: cmd_name.clone(),
-                                    exit_code: None,
-                                    signal: None,
-                                    started_at: cmd_wall,
-                                    duration_ms: cmd_started.elapsed().as_millis() as u64,
-                                    peak_rss_bytes: peak_rss,
-                                    peak_process_count: peak_procs,
-                                    physical_read_bytes: io_acc.totals.0,
-                                    physical_write_bytes: io_acc.totals.1,
-                                    logical_read_bytes: io_acc.totals.2,
-                                    logical_write_bytes: io_acc.totals.3,
-                                    wait_events: std::mem::take(&mut wait_events),
-                                    trace_active: false,
-                                    io_is_approximate: true,
-                                });
-                                cmd_seq += 1;
-                            }
-                            prev_fg = Some(fg);
-                            cmd_started = Instant::now();
-                            cmd_wall = SystemTime::now();
-                            peak_rss = cmd_rss;
-                            peak_procs = cmd_procs;
-                            io_acc.reset();
-                            io_acc.update(&cmd_nodes);
-                            wait_events.clear();
-                            cmd_name = cmd_nodes
-                                .first()
-                                .map(|n| n.comm.clone())
-                                .unwrap_or_else(|| format!("pgid:{fg}"));
-                        } else {
-                            peak_rss = peak_rss.max(cmd_rss);
-                            peak_procs = peak_procs.max(cmd_procs);
-                            io_acc.update(&cmd_nodes);
-                            for n in &cmd_nodes {
-                                if !matches!(
-                                    n.diagnosis.reason,
-                                    diagnosis::WaitReason::ActiveCompute
-                                        | diagnosis::WaitReason::Unknown
-                                ) {
-                                    let label = n.diagnosis.reason.label().to_string();
-                                    if !wait_events.contains(&label) && wait_events.len() < 16 {
-                                        wait_events.push(label);
+                        if fg != root_pid {
+                            let cmd_nodes: Vec<&ProcessNode> =
+                                nodes.iter().filter(|n| n.pgid == fg).collect();
+                            match active.as_mut() {
+                                Some(cur) if cur.source_osc133 => {
+                                    // Attach foreground PGID metrics to the active OSC 133 command.
+                                    if cur.pgid.is_none() || cur.pgid == Some(fg) {
+                                        cur.pgid = Some(fg);
+                                        cur.update_from_nodes(&cmd_nodes);
                                     }
                                 }
+                                Some(cur) if cur.pgid == Some(fg) => {
+                                    cur.update_from_nodes(&cmd_nodes);
+                                }
+                                Some(_) => {
+                                    if let Some(prev) = active.take() {
+                                        reports.push(prev.finish(cmd_seq, None));
+                                        cmd_seq += 1;
+                                    }
+                                    let mut next =
+                                        ActiveCommand::new(false, Some(fg), String::new());
+                                    next.update_from_nodes(&cmd_nodes);
+                                    active = Some(next);
+                                }
+                                None if !osc133_seen => {
+                                    let mut next =
+                                        ActiveCommand::new(false, Some(fg), String::new());
+                                    next.update_from_nodes(&cmd_nodes);
+                                    active = Some(next);
+                                }
+                                None => {}
                             }
+                        } else if let Some(cur) = &active
+                            && !cur.source_osc133
+                            && let Some(finished) = active.take()
+                        {
+                            // Fallback PGID-only mode: command returned to root shell.
+                            reports.push(finished.finish(cmd_seq, None));
+                            cmd_seq += 1;
                         }
                     }
 
@@ -475,9 +521,12 @@ impl XRayEngine {
                         snap.command_diagnosis = cmd_diag;
                         snap.total_cpu_percent = total_cpu;
                         snap.total_rss_bytes = total_rss;
-                        snap.approx_io_totals = io_acc.totals;
+                        snap.approx_io_totals =
+                            active.as_ref().map_or((0, 0, 0, 0), |c| c.io_acc.totals);
                         snap.seconds_since_output = secs_since_out;
-                        snap.command_elapsed_secs = cmd_started.elapsed().as_secs_f64();
+                        snap.command_elapsed_secs = active
+                            .as_ref()
+                            .map_or(0.0, |c| c.started_at.elapsed().as_secs_f64());
                         if snap.cpu_history.len() >= 32 {
                             snap.cpu_history.remove(0);
                         }

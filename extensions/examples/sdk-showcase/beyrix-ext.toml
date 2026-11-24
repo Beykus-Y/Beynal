@@ -5,7 +5,7 @@ sdk_version = "1.0.0"
 kind = "widget"
 entry = "index.js"
 description = "Interactive showcase of all public BeyrixWidgets SDK UI components."
-permissions = ["ui"]
+permissions = ["ui", "theme"]
 
 [placement]
 mode = "overlay"

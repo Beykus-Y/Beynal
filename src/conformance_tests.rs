@@ -2,8 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Headless terminal conformance, differential, chunked-input, fuzz-resilience,
-//! terminfo, and real-PTY TUI integration test harness.
+//! Headless terminal conformance, differential, chunked-input, DoS/OOM-resilience,
+//! terminfo, X-Ray unified lifecycle, graphics damage tracking, and real interactive
+//! PTY TUI integration test harness.
 
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -12,7 +13,10 @@ use std::time::{Duration, Instant};
 
 use crate::keyboard::{KeyEventType, Keyboard, alternate_scroll_sequence};
 use crate::pty::Pty;
-use crate::terminal::{CellAttrs, Terminal, TerminalInputModes, UnderlineStyle};
+use crate::terminal::{
+    CellAttrs, SUPPORTED_KITTY_KEYBOARD_FLAGS, ShellEvent, Terminal, TerminalInputModes,
+    UnderlineStyle,
+};
 use crate::terminal_graphics::base64_encode;
 
 /// Headless PTY + Terminal test harness for driving real CLI/TUI applications.
@@ -32,6 +36,13 @@ impl HeadlessPtyHarness {
             pty,
             terminal: Terminal::new(cols as usize, rows as usize),
         }
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) {
+        self.pty
+            .resize_with_pixels(cols, rows, cols * 9, rows * 18)
+            .expect("resize PTY");
+        self.terminal.resize(cols as usize, rows as usize);
     }
 
     fn send(&self, bytes: &[u8]) {
@@ -87,11 +98,27 @@ impl HeadlessPtyHarness {
             .join("\n")
     }
 
-    fn wait_for(&mut self, needle: &str, timeout: Duration) -> bool {
+    /// Wait until a line on screen *equals* or *starts with* `needle` (trimmed),
+    /// preventing false positives from matching echoed shell input commands.
+    fn wait_for_output_line(&mut self, needle: &str, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             self.pump();
-            if self.screen_text().contains(needle) {
+            if (0..self.terminal.screen().rows)
+                .any(|y| self.terminal.screen().line(y).trim() == needle)
+            {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    fn wait_for_alt_screen(&mut self, expected: bool, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            self.pump();
+            if self.terminal.screen().is_alternate_screen() == expected {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -153,7 +180,6 @@ fn chunked_input_invariance_matches_single_shot() {
 #[test]
 fn malformed_and_oversized_sequences_never_panic_or_oom() {
     let mut t = Terminal::new(40, 10);
-    // Truncated / malformed CSI, OSC, DCS, APC, invalid UTF-8
     let cases: &[&[u8]] = &[
         b"\x1b[999999999;999999999H",
         b"\x1b[?99999999h\x1b[?99999999l",
@@ -162,6 +188,7 @@ fn malformed_and_oversized_sequences_never_panic_or_oom() {
         b"\x1b]52;c;!!!not-base64!!!\x07",
         b"\x1bP+qZZZZ\x1b\\",
         b"\x1b_Ga=T,f=32,s=99999,v=99999;AAAA\x1b\\",
+        b"\x1b_Ga=T,f=32,s=1,v=1,r=99999999,c=99999999;AAAA\x1b\\",
         b"\x1b_Ga=T,t=f;/etc/shadow\x1b\\",
         &[0xff, 0xfe, 0x80, 0xc0, 0x1b, b'[', 0xff],
     ];
@@ -178,6 +205,45 @@ fn malformed_and_oversized_sequences_never_panic_or_oom() {
     }
     t.process(b"\x1b\\after");
     assert!(t.screen().line(t.screen().cursor_y).contains("after"));
+}
+
+#[test]
+fn graphics_revision_tracks_add_delete_sixel_and_alt_screen_for_damage() {
+    let mut t = Terminal::new(40, 10);
+    let rev0 = t.screen().graphics.revision;
+
+    // 1. Add Kitty Graphics image -> revision increments.
+    let rgba = [255u8, 0, 0, 255];
+    t.process(format!("\x1b_Ga=T,f=32,s=1,v=1,i=5;{}\x1b\\", base64_encode(&rgba)).as_bytes());
+    let rev1 = t.screen().graphics.revision;
+    assert!(
+        rev1 > rev0,
+        "adding Kitty image must bump graphics revision"
+    );
+    assert_eq!(t.screen().graphics.placements.len(), 1);
+
+    // 2. Delete Kitty Graphics image without changing text -> revision increments again!
+    t.process(b"\x1b_Ga=d,d=a\x1b\\");
+    let rev2 = t.screen().graphics.revision;
+    assert!(
+        rev2 > rev1,
+        "deleting Kitty image must bump graphics revision"
+    );
+    assert!(t.screen().graphics.placements.is_empty());
+
+    // 3. SIXEL image on alternate screen -> cleared when leaving alt screen -> bumps revision!
+    t.process(b"\x1b[?1049h\x1bPq#1;2;100;0;0#1!4~\x1b\\");
+    let rev3 = t.screen().graphics.revision;
+    assert!(rev3 > rev2, "SIXEL image must bump graphics revision");
+    assert_eq!(t.screen().graphics.placements.len(), 1);
+
+    t.process(b"\x1b[?1049l");
+    let rev4 = t.screen().graphics.revision;
+    assert!(
+        rev4 > rev3,
+        "leaving alt screen must clear alt images and bump revision"
+    );
+    assert!(t.screen().graphics.placements.is_empty());
 }
 
 #[test]
@@ -228,7 +294,16 @@ fn keyboard_protocols_decckm_deckpam_debkm_modify_other_keys_and_kitty() {
         b"\x1b[27;5;13~"
     );
 
-    // Kitty Keyboard Protocol: flags=3 (disambiguate + report events)
+    // Kitty Keyboard Protocol: verify unsupported bit 4 (0x04) is never advertised.
+    assert_eq!(SUPPORTED_KITTY_KEYBOARD_FLAGS & 0x04, 0);
+    let mut term = Terminal::new(80, 24);
+    term.process(b"\x1b[>31u\x1b[?u");
+    assert_eq!(
+        term.take_responses(),
+        format!("\x1b[?{}u", SUPPORTED_KITTY_KEYBOARD_FLAGS).as_bytes()
+    );
+
+    // Kitty flags=3 (disambiguate + report events): Press / Repeat / Release
     modes = TerminalInputModes {
         kitty_flags: 3,
         ..Default::default()
@@ -246,6 +321,43 @@ fn keyboard_protocols_decckm_deckpam_debkm_modify_other_keys_and_kitty() {
         kb.key_with_modes(30, modes, KeyEventType::Release),
         b"\x1b[97;5:3u"
     );
+}
+
+#[test]
+fn xray_unified_osc133_lifecycle_has_no_duplicates_and_tracks_exit_codes() {
+    let cfg = crate::config::XRayConfig {
+        enabled: true,
+        poll_interval_ms: 50,
+        ..Default::default()
+    };
+    let mut xray = crate::xray::XRayEngine::new(cfg);
+    let bus = crate::events::EventBus::new();
+    xray.ensure_started(std::process::id() as i32, None, bus);
+
+    // 1. Fast builtin command (exit 0)
+    xray.notify_shell_event(ShellEvent::CommandExecuted { abs_row: 0 });
+    xray.notify_shell_event(ShellEvent::CommandFinished {
+        abs_row: 1,
+        exit_code: Some(0),
+    });
+    // 2. Failing / Ctrl+C interrupted command (exit 130 -> SIGINT = 2)
+    xray.notify_shell_event(ShellEvent::CommandExecuted { abs_row: 2 });
+    xray.notify_shell_event(ShellEvent::CommandFinished {
+        abs_row: 3,
+        exit_code: Some(130),
+    });
+
+    std::thread::sleep(Duration::from_millis(140));
+    let snap = xray.snapshot();
+    assert_eq!(
+        snap.reports.len(),
+        2,
+        "must emit exactly one report per command with zero duplicates"
+    );
+    assert_eq!(snap.reports[0].exit_code, Some(0));
+    assert_eq!(snap.reports[0].signal, None);
+    assert_eq!(snap.reports[1].exit_code, Some(130));
+    assert_eq!(snap.reports[1].signal, Some(2));
 }
 
 #[test]
@@ -309,9 +421,11 @@ fn terminfo_file_compiles_with_tic_and_passes_infocmp_tput() {
 #[test]
 fn pty_env_declares_xterm_256color_truecolor_and_beyrix_identity() {
     let mut h = HeadlessPtyHarness::spawn(80, 24);
-    h.send(b"printf 'ENV:%s|%s|%s|%s\\n' \"$TERM\" \"$COLORTERM\" \"$TERM_PROGRAM\" \"$(tput colors)\"\n");
+    h.send(
+        b"printf 'ENV:%s|%s|%s|%s\\n' \"$TERM\" \"$COLORTERM\" \"$TERM_PROGRAM\" \"$(tput colors)\"\n",
+    );
     assert!(
-        h.wait_for(
+        h.wait_for_output_line(
             "ENV:xterm-256color|truecolor|Beyrix|256",
             Duration::from_secs(4)
         ),
@@ -321,58 +435,131 @@ fn pty_env_declares_xterm_256color_truecolor_and_beyrix_identity() {
 }
 
 #[test]
-fn real_tui_apps_less_and_tmux_run_cleanly_in_pty() {
-    // 1. Test `less` with alternate screen & clean exit via 'q'
+fn real_interactive_tui_apps_less_nano_btop_and_tmux_work_end_to_end() {
+    // 1. Interactive `less` (split marker prevents echo false positive)
     if Command::new("which")
         .arg("less")
         .output()
         .is_ok_and(|o| o.status.success())
     {
         let mut h = HeadlessPtyHarness::spawn(80, 20);
-        h.send(b"printf 'LINE_ONE\\nLINE_TWO\\n' | less; echo LESS_EXITED\n");
-        assert!(h.wait_for("LINE_ONE", Duration::from_secs(4)));
+        h.send(b"printf 'ROW_A\\nROW_B\\n' | less; printf 'LESS_%s\\n' EXITED\n");
+        assert!(h.wait_for_alt_screen(true, Duration::from_secs(4)));
         h.send(b"q");
         assert!(
-            h.wait_for("LESS_EXITED", Duration::from_secs(4)),
+            h.wait_for_output_line("LESS_EXITED", Duration::from_secs(4)),
             "less did not exit cleanly:\n{}",
             h.screen_text()
         );
         assert!(!h.terminal.screen().is_alternate_screen());
     }
 
-    // 2. Test `tmux` in an isolated socket (if installed)
+    // 2. Interactive `tmux` (attached session, command execution inside pane, resize, clean exit)
     if Command::new("which")
         .arg("tmux")
         .output()
         .is_ok_and(|o| o.status.success())
     {
+        let sock_dir = tempfile::tempdir().unwrap();
+        let sock_path = sock_dir.path().join("tmux.sock");
         let mut h = HeadlessPtyHarness::spawn(80, 24);
-        let sock = format!("beyrix-test-{}", std::process::id());
         h.send(
-            format!("tmux -L {sock} -f /dev/null new-session -d 'sleep 2' && tmux -L {sock} list-sessions && tmux -L {sock} kill-server && echo TMUX_OK\n")
-                .as_bytes(),
+            format!(
+                "tmux -S '{}' -f /dev/null new-session; printf 'TMUX_%s\\n' RETURNED\n",
+                sock_path.display()
+            )
+            .as_bytes(),
         );
         assert!(
-            h.wait_for("TMUX_OK", Duration::from_secs(5)),
-            "tmux check failed:\n{}",
+            h.wait_for_alt_screen(true, Duration::from_secs(5)),
+            "interactive tmux did not enter alternate screen:\n{}",
             h.screen_text()
         );
+        // Resize while inside attached tmux session
+        h.resize(90, 26);
+        std::thread::sleep(Duration::from_millis(120));
+        // Execute command inside interactive tmux pane (echo-proof split marker)
+        h.send(b"printf 'INSIDE_%s\\n' TMUX_PANE\n");
+        assert!(
+            h.wait_for_output_line("INSIDE_TMUX_PANE", Duration::from_secs(5)),
+            "interactive tmux pane did not render command output:\n{}",
+            h.screen_text()
+        );
+        // Exit the shell inside tmux -> closes tmux cleanly and returns to outer shell
+        h.send(b"exit\n");
+        assert!(
+            h.wait_for_output_line("TMUX_RETURNED", Duration::from_secs(5)),
+            "interactive tmux did not return to outer shell:\n{}",
+            h.screen_text()
+        );
+        assert!(!h.terminal.screen().is_alternate_screen());
     }
 
-    // 3. Test `fastfetch` (if installed)
+    // 3. Interactive `btop` (launch -> alt screen -> resize -> quit 'q' -> return to shell)
     if Command::new("which")
-        .arg("fastfetch")
+        .arg("btop")
         .output()
         .is_ok_and(|o| o.status.success())
     {
         let mut h = HeadlessPtyHarness::spawn(100, 30);
-        h.send(b"fastfetch --logo none; echo FF_OK\n");
+        h.send(b"btop --utf-force; printf 'BTOP_%s\\n' CLEAN\n");
+        if h.wait_for_alt_screen(true, Duration::from_secs(5)) {
+            h.resize(110, 32);
+            std::thread::sleep(Duration::from_millis(150));
+            h.send(b"q");
+            assert!(
+                h.wait_for_output_line("BTOP_CLEAN", Duration::from_secs(5)),
+                "btop did not exit cleanly:\n{}",
+                h.screen_text()
+            );
+            assert!(!h.terminal.screen().is_alternate_screen());
+        }
+    }
+
+    // 4. Interactive `nano` (launch -> alt screen -> type -> Ctrl+X -> 'n' -> return to shell)
+    if Command::new("which")
+        .arg("nano")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        let mut h = HeadlessPtyHarness::spawn(80, 24);
+        h.send(b"nano; printf 'NANO_%s\\n' CLEAN\n");
+        assert!(h.wait_for_alt_screen(true, Duration::from_secs(4)));
+        std::thread::sleep(Duration::from_millis(100));
+        h.send(b"\x18"); // Ctrl+X
         assert!(
-            h.wait_for("FF_OK", Duration::from_secs(5)),
-            "fastfetch check failed:\n{}",
+            h.wait_for_output_line("NANO_CLEAN", Duration::from_secs(4)),
+            "nano did not exit cleanly:\n{}",
             h.screen_text()
         );
+        assert!(!h.terminal.screen().is_alternate_screen());
     }
+}
+
+#[test]
+fn sdk_showcase_extension_loads_and_renders_valid_ui_tree() {
+    let path = std::path::Path::new("extensions/examples/sdk-showcase");
+    assert!(path.join("beyrix-ext.toml").is_file());
+    let loaded = crate::widgets::manifest::ExtensionManifest::load_from_dir(path).unwrap();
+    let bus = crate::events::EventBus::new();
+    let mut mgr = crate::widgets::WidgetManager::new(crate::config::WidgetsConfig {
+        enabled: true,
+        hot_reload: false,
+        ..Default::default()
+    });
+    mgr.ensure_started(crate::theme::Theme::default(), bus)
+        .unwrap();
+    mgr.register_extension(loaded, crate::widgets::ExtensionTrust::ThirdParty)
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let snaps = mgr.render_snapshots();
+    let st = snaps
+        .get("beyrix.example.sdk-showcase")
+        .expect("sdk-showcase must render");
+    assert!(st.last_error.is_none(), "JS error: {:?}", st.last_error);
+    assert!(st.tree.is_some());
+    // When hot_reload is false, poll_hot_reload must do zero work.
+    assert_eq!(mgr.poll_hot_reload(), 0);
 }
 
 #[test]
@@ -395,6 +582,5 @@ fn sgr_attributes_render_distinct_scenes_in_software_backend() {
         1.0,
         None,
     );
-    // Curly underline + strikethrough + overline must emit overlay decoration rects.
     assert!(scene.overlays.len() >= 4);
 }

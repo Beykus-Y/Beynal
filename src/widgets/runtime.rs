@@ -1078,7 +1078,34 @@ globalThis.beyrix = {{
             return {{ kind: "slider", id, value: Number(value), ...opts }};
         }},
         canvas(width, height, commands) {{ return {{ kind: "canvas", width, height, commands }}; }},
-        scrollView(height, children, scrollY = 0) {{ return {{ kind: "scroll-view", height, children, scroll_y: scrollY }}; }},
+        scrollView(height, children, scrollY = 0, id = "", onScroll = null) {{
+            if (id && onScroll) globalThis.__beyrix_ui_handlers[id] = onScroll;
+            return {{ kind: "scroll-view", id, height, children, scroll_y: scrollY }};
+        }},
+        image(id, width, height, opts = {{}}) {{
+            return {{ kind: "image", id: Number(id), width: Number(width), height: Number(height), ...opts }};
+        }},
+        toggle(id, label, checked, onToggle, opts = {{}}) {{
+            if (onToggle) globalThis.__beyrix_ui_handlers[id] = onToggle;
+            return {{ kind: "toggle", id, label: String(label), checked: Boolean(checked), ...opts }};
+        }},
+        checkbox(id, label, checked, onToggle, opts = {{}}) {{
+            if (onToggle) globalThis.__beyrix_ui_handlers[id] = onToggle;
+            return {{ kind: "checkbox", id, label: String(label), checked: Boolean(checked), ...opts }};
+        }},
+        dropdown(id, options, selected, onCycle, opts = {{}}) {{
+            if (onCycle) globalThis.__beyrix_ui_handlers[id] = onCycle;
+            return {{ kind: "dropdown", id, options: Array.from(options).map(String), selected: Number(selected), ...opts }};
+        }},
+        tabs(id, tabs, active, onSelect) {{
+            if (onSelect) globalThis.__beyrix_ui_handlers[id] = onSelect;
+            return {{ kind: "tabs", id, tabs: Array.from(tabs).map(String), active: Number(active) }};
+        }},
+        badge(text, opts = {{}}) {{ return {{ kind: "badge", text: String(text), ...opts }}; }},
+        divider(opts = {{}}) {{ return {{ kind: "divider", ...opts }}; }},
+        sparkline(values, width, height, opts = {{}}) {{
+            return {{ kind: "sparkline", values: Array.from(values).map(Number), width: Number(width), height: Number(height), ...opts }};
+        }},
     }},
     keyboard: {{
         onLayoutChange(cb) {{
