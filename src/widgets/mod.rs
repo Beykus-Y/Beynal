@@ -135,7 +135,7 @@ impl WidgetManager {
             .entry(id.clone())
             .or_insert_with(|| loaded.manifest.placement.clone());
         if let Some(vm) = &self.runtime {
-            vm.send(VmCommand::LoadExtension {
+            vm.send_lifecycle(VmCommand::LoadExtension {
                 id: id.clone(),
                 generation,
                 entry_path: loaded.entry_path.clone(),
@@ -154,17 +154,22 @@ impl WidgetManager {
         }
         self.unloaded_extensions.push(id.to_string());
         if let Some(vm) = &self.runtime {
-            vm.send(VmCommand::UnloadExtension { id: id.to_string() });
+            vm.send_lifecycle(VmCommand::UnloadExtension { id: id.to_string() });
         }
     }
 
     pub fn reload_extension(&mut self, id: &str) {
-        if let Some(g) = self.generations.get_mut(id) {
-            *g += 1;
-        }
+        let generation = {
+            let entry = self.generations.entry(id.to_string()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
         self.unloaded_extensions.push(id.to_string());
         if let Some(vm) = &self.runtime {
-            vm.send(VmCommand::ReloadExtension { id: id.to_string() });
+            vm.send_lifecycle(VmCommand::ReloadExtension {
+                id: id.to_string(),
+                generation,
+            });
         }
     }
 

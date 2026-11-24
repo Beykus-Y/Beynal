@@ -127,6 +127,7 @@ pub enum VmCommand {
     },
     ReloadExtension {
         id: String,
+        generation: u64,
     },
     UiEvent {
         widget_id: String,
@@ -217,6 +218,13 @@ impl WidgetRuntime {
 
     pub fn send(&self, cmd: VmCommand) {
         let _ = self.tx.try_send(cmd);
+    }
+
+    /// Reliable blocking send for lifecycle commands (`LoadExtension`,
+    /// `UnloadExtension`, `ReloadExtension`, `Shutdown`) so they are never
+    /// silently dropped when the channel is busy.
+    pub fn send_lifecycle(&self, cmd: VmCommand) {
+        let _ = self.tx.send(cmd);
     }
 
     pub fn snapshot_renders(&self) -> HashMap<String, WidgetRenderState> {
@@ -324,10 +332,9 @@ fn run_vm_loop(
                     s.renders.remove(&id);
                     s.pending_actions.retain(|env| env.extension_id != id);
                 }
-                VmCommand::ReloadExtension { id } => {
+                VmCommand::ReloadExtension { id, generation } => {
                     if let Some(ext) = extensions.get(&id).map(|e| {
                         (
-                            e.generation + 1,
                             e.entry_path.clone(),
                             Box::new(e.manifest.clone()),
                             e.permissions.clone(),
@@ -345,10 +352,10 @@ fn run_vm_loop(
                             &deadline,
                             timeout,
                             id,
+                            generation,
                             ext.0,
                             ext.1,
                             ext.2,
-                            ext.3,
                             &theme,
                             win_state,
                         );

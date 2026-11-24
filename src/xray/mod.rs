@@ -107,23 +107,43 @@ impl IoAccumulator {
         let current_keys: std::collections::HashSet<(i32, u64)> =
             nodes.iter().map(|n| (n.pid, n.starttime)).collect();
 
-        // Any previously-live process that disappeared: if its parent is still
-        // alive in `nodes`, the parent absorbed its I/O via waitpid() (do NOT add
-        // to `unabsorbed_exited`). Otherwise, preserve its last observed I/O.
-        let disappeared: Vec<(i32, u64)> = self
+        // Any previously-live process that disappeared: walk its recorded ancestor
+        // chain (`ppid`). If ANY ancestor is still alive in `live_pids`, that
+        // ancestor (or an intermediate parent) will absorb/has absorbed its I/O via
+        // waitpid(). Only add to `unabsorbed_exited` if no tracked ancestor remains.
+        let disappeared: Vec<PidKey> = self
             .live
             .keys()
             .filter(|k| !current_keys.contains(k))
             .copied()
             .collect();
+        let snapshot_live = self.live.clone();
         for key in disappeared {
-            if let Some((ppid, last_io)) = self.live.remove(&key)
-                && !live_pids.contains(&ppid)
-            {
-                self.unabsorbed_exited.0 += last_io.0;
-                self.unabsorbed_exited.1 += last_io.1;
-                self.unabsorbed_exited.2 += last_io.2;
-                self.unabsorbed_exited.3 += last_io.3;
+            if let Some((ppid, last_io)) = self.live.remove(&key) {
+                let mut cur_ppid = ppid;
+                let mut has_live_ancestor = false;
+                for _ in 0..32 {
+                    if live_pids.contains(&cur_ppid) {
+                        has_live_ancestor = true;
+                        break;
+                    }
+                    if let Some((_, (next_ppid, _))) =
+                        snapshot_live.iter().find(|((p, _), _)| *p == cur_ppid)
+                    {
+                        if *next_ppid == cur_ppid {
+                            break;
+                        }
+                        cur_ppid = *next_ppid;
+                    } else {
+                        break;
+                    }
+                }
+                if !has_live_ancestor {
+                    self.unabsorbed_exited.0 += last_io.0;
+                    self.unabsorbed_exited.1 += last_io.1;
+                    self.unabsorbed_exited.2 += last_io.2;
+                    self.unabsorbed_exited.3 += last_io.3;
+                }
             }
         }
 
@@ -295,6 +315,7 @@ impl XRayEngine {
                                     logical_write_bytes: io_acc.totals.3,
                                     wait_events: std::mem::take(&mut wait_events),
                                     trace_active: false,
+                                    io_is_approximate: true,
                                 });
                                 cmd_seq += 1;
                             }
@@ -845,6 +866,102 @@ else:
         assert!(
             acc.totals.3 < 1_500_000,
             "double-counted waited-for child I/O: got {} bytes",
+            acc.totals.3
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io_accumulator_does_not_double_count_three_generation_waitpid() {
+        use std::io::{BufRead, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let out_file = dir.path().join("gen3_io.bin");
+        let pipe_go = dir.path().join("go3.fifo");
+        let pipe_ready = dir.path().join("ready3.fifo");
+        let pipe_exit = dir.path().join("exit3.fifo");
+        for p in [&pipe_go, &pipe_ready, &pipe_exit] {
+            let c_p = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c_p.as_ptr(), 0o600) }, 0);
+        }
+
+        // A -> B -> C: C writes 1 MiB and blocks; after Sample 1, C exits,
+        // B waitpid(C) and exits, A waitpid(B); Sample 2 sees only A.
+        let py = format!(
+            r#"
+import os
+pid_b = os.fork()
+if pid_b == 0:
+    pid_c = os.fork()
+    if pid_c == 0:
+        with open({out:?}, 'wb') as f:
+            f.write(b'B' * 1048576)
+            f.flush()
+            os.fsync(f.fileno())
+        with open({ready:?}, 'w') as r:
+            r.write('READY\n')
+            r.flush()
+        with open({go:?}, 'r') as g:
+            g.read()
+        os._exit(0)
+    else:
+        os.waitpid(pid_c, 0)
+        os._exit(0)
+else:
+    with open({ready:?}, 'r') as r:
+        r.readline()
+    print('TREE_ALIVE', flush=True)
+    os.waitpid(pid_b, 0)
+    print('AB_WAITED', flush=True)
+    with open({exit_p:?}, 'r') as e:
+        e.read()
+"#,
+            out = out_file.to_str().unwrap(),
+            ready = pipe_ready.to_str().unwrap(),
+            go = pipe_go.to_str().unwrap(),
+            exit_p = pipe_exit.to_str().unwrap(),
+        );
+
+        let mut parent = Command::new("python3")
+            .args(["-c", &py])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn python3");
+        let root_pid = parent.id() as i32;
+        let mut stdout = BufReader::new(parent.stdout.take().unwrap());
+
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "TREE_ALIVE");
+
+        let mut sampler = linux::LinuxSampler::new();
+        let mut acc = IoAccumulator::default();
+
+        // Sample 1: A, B, and C are all alive.
+        let tree1 = sampler.collect_tree(root_pid, None, false, 1.0);
+        assert_eq!(tree1.len(), 3, "expected A, B, and C alive");
+        let refs1: Vec<&ProcessNode> = tree1.iter().collect();
+        acc.update(&refs1);
+
+        // Allow C to exit -> B waitpid(C) & exit -> A waitpid(B).
+        std::fs::write(&pipe_go, b"GO\n").unwrap();
+        line.clear();
+        stdout.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "AB_WAITED");
+
+        // Sample 2: Only A is alive (absorbing B+C's 1 MiB).
+        let tree2 = sampler.collect_tree(root_pid, None, false, 1.0);
+        assert_eq!(tree2.len(), 1, "expected only A alive after waitpid(B)");
+        let refs2: Vec<&ProcessNode> = tree2.iter().collect();
+        acc.update(&refs2);
+
+        let _ = std::fs::write(&pipe_exit, b"EXIT\n");
+        let _ = parent.wait();
+
+        assert!(acc.totals.3 >= 1_048_576);
+        assert!(
+            acc.totals.3 < 1_500_000,
+            "double-counted 3-generation waited-for I/O: got {} bytes",
             acc.totals.3
         );
     }

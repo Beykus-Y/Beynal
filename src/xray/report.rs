@@ -26,6 +26,9 @@ pub struct CommandReport {
     pub logical_write_bytes: u64,
     pub wait_events: Vec<String>,
     pub trace_active: bool,
+    /// True when counters come from passive procfs polling (sampled/approximate),
+    /// false only when exact kernel accounting (taskstats/eBPF) is active.
+    pub io_is_approximate: bool,
 }
 
 pub struct ReportStore {
@@ -104,6 +107,7 @@ mod tests {
                 logical_write_bytes: 0,
                 wait_events: Vec::new(),
                 trace_active: false,
+                io_is_approximate: true,
             });
         }
         let list = store.list();
