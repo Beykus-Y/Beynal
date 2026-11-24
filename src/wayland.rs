@@ -2625,7 +2625,7 @@ mod input_tests {
             let terminal = state.terminal.as_mut().unwrap();
             let screen = terminal.screen();
             assert_eq!((screen.columns, screen.rows), sizes.grid_size(renderer));
-            terminal.process(b"\x1b[4;3H");
+            terminal.process(b"\x1b[4;3H\x1b[2 q");
             let screen = terminal.screen();
             let rect = row_pixel_rect(g, sizes.physical, (3, 4));
             assert_eq!(rect.y as usize, g.padding + 3 * g.cell_height);
