@@ -29,12 +29,24 @@ use permissions::PermissionSet;
 use runtime::{HostAction, VmCommand, WidgetRuntime};
 use ui::{HitKind, UiHitTarget, UiLayer, emit_editor_chrome, emit_ui_tree};
 
+/// Host-determined trust level for an extension.
+///
+/// Trust is NEVER read from the extension's own manifest (`manifest.official`);
+/// only extensions explicitly loaded from host-controlled official paths
+/// receive `HostOfficial`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtensionTrust {
+    ThirdParty,
+    HostOfficial,
+}
+
 /// Top-level coordinator for BeyrixWidgets.
 ///
 /// Lazy-initializes the JS runtime only when `config.enabled` is true.
 pub struct WidgetManager {
     pub config: WidgetsConfig,
     pub extensions: BTreeMap<String, LoadedExtension>,
+    pub granted_permissions: BTreeMap<String, PermissionSet>,
     pub placements: BTreeMap<String, WidgetPlacementConfig>,
     pub editor: VisualLayoutEditor,
     pub hit_targets: Vec<UiHitTarget>,
@@ -47,6 +59,7 @@ impl WidgetManager {
         Self {
             config,
             extensions: BTreeMap::new(),
+            granted_permissions: BTreeMap::new(),
             placements: BTreeMap::new(),
             editor: VisualLayoutEditor::new(),
             hit_targets: Vec::new(),
@@ -78,12 +91,12 @@ impl WidgetManager {
             .or_else(crate::config::PlatformConfig::default_extensions_dir)
             && dir.is_dir()
         {
-            let _ = self.load_directory(&dir);
+            let _ = self.load_directory(&dir, ExtensionTrust::ThirdParty);
         }
         Ok(())
     }
 
-    pub fn load_directory(&mut self, dir: &Path) -> Result<usize, String> {
+    pub fn load_directory(&mut self, dir: &Path, trust: ExtensionTrust) -> Result<usize, String> {
         let entries = std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))?;
         let mut count = 0;
         for entry in entries.flatten() {
@@ -92,20 +105,25 @@ impl WidgetManager {
                 && path.join("beyrix-ext.toml").is_file()
                 && let Ok(loaded) = ExtensionManifest::load_from_dir(&path)
             {
-                self.register_extension(loaded);
+                self.register_extension(loaded, trust);
                 count += 1;
             }
         }
         Ok(count)
     }
 
-    pub fn register_extension(&mut self, loaded: LoadedExtension) {
+    pub fn register_extension(&mut self, loaded: LoadedExtension, trust: ExtensionTrust) {
         let id = loaded.manifest.id.clone();
-        let perms = if loaded.manifest.official {
-            PermissionSet::new(loaded.manifest.permissions.iter().copied())
-        } else {
-            PermissionSet::safe_default(&loaded.manifest.permissions, &[])
+        // Security: Never trust `loaded.manifest.official` from an untrusted manifest!
+        let perms = match trust {
+            ExtensionTrust::HostOfficial => {
+                PermissionSet::new(loaded.manifest.permissions.iter().copied())
+            }
+            ExtensionTrust::ThirdParty => {
+                PermissionSet::safe_default(&loaded.manifest.permissions, &[])
+            }
         };
+        self.granted_permissions.insert(id.clone(), perms.clone());
         self.placements
             .entry(id.clone())
             .or_insert_with(|| loaded.manifest.placement.clone());
@@ -156,6 +174,7 @@ impl WidgetManager {
         cell_size: (f32, f32),
         in_tui: bool,
         pointer_px: (f32, f32),
+        inline_y_px: Option<f32>,
         theme: &Theme,
         renderer: &mut Renderer,
         scene: &mut Scene,
@@ -185,7 +204,7 @@ impl WidgetManager {
                 cell_size.1,
                 in_tui,
                 true,
-                None,
+                inline_y_px,
             );
             let hovered = pointer_px.0 >= pre_rect.x
                 && pointer_px.0 <= pre_rect.x + pre_rect.w
@@ -200,7 +219,7 @@ impl WidgetManager {
                 cell_size.1,
                 in_tui,
                 hovered,
-                None,
+                inline_y_px,
             );
             self.resolved_rects.insert(id.clone(), resolved);
             if !resolved.visible && !self.editor.active {
@@ -334,5 +353,44 @@ impl WidgetManager {
 
     pub fn handle_pointer_release(&mut self) {
         self.editor.end_drag();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use permissions::Capability;
+
+    #[test]
+    fn third_party_cannot_escalate_privileges_via_manifest_official_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let ext_dir = dir.path().join("sneaky");
+        std::fs::create_dir(&ext_dir).unwrap();
+        std::fs::write(ext_dir.join("index.js"), "beyrix.log('hi');").unwrap();
+        std::fs::write(
+            ext_dir.join("beyrix-ext.toml"),
+            r#"
+id = "org.untrusted.sneaky"
+name = "Sneaky"
+sdk_version = "1.0.0"
+official = true
+permissions = ["ui", "terminal-read", "network", "process-spawn", "xray-control"]
+"#,
+        )
+        .unwrap();
+
+        let _ = ExtensionManifest::load_from_dir(&ext_dir).unwrap();
+        let mut mgr = WidgetManager::new(WidgetsConfig::default());
+        let count = mgr
+            .load_directory(dir.path(), ExtensionTrust::ThirdParty)
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let perms = mgr.granted_permissions.get("org.untrusted.sneaky").unwrap();
+        assert!(perms.has(Capability::Ui));
+        assert!(!perms.has(Capability::TerminalRead));
+        assert!(!perms.has(Capability::Network));
+        assert!(!perms.has(Capability::ProcessSpawn));
+        assert!(!perms.has(Capability::XRayControl));
     }
 }

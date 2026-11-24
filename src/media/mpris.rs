@@ -171,3 +171,42 @@ pub fn send_mpris_command(
         .map_err(|e| format!("mpris {method}: {e}"))?;
     Ok(())
 }
+
+pub fn send_mpris_seek(
+    conn: &zbus::blocking::Connection,
+    bus_name: &str,
+    position_secs: f64,
+) -> Result<(), String> {
+    let proxy = zbus::blocking::Proxy::new(
+        conn,
+        bus_name,
+        "/org/mpris/MediaPlayer2",
+        "org.mpris.MediaPlayer2.Player",
+    )
+    .map_err(|e| format!("mpris proxy: {e}"))?;
+    let current_us = proxy.get_property::<i64>("Position").unwrap_or(0);
+    let target_us = (position_secs.max(0.0) * 1_000_000.0).round() as i64;
+    let offset_us = target_us - current_us;
+    proxy
+        .call_method("Seek", &(offset_us,))
+        .map_err(|e| format!("mpris Seek: {e}"))?;
+    Ok(())
+}
+
+pub fn send_mpris_volume(
+    conn: &zbus::blocking::Connection,
+    bus_name: &str,
+    volume: f64,
+) -> Result<(), String> {
+    let proxy = zbus::blocking::Proxy::new(
+        conn,
+        bus_name,
+        "/org/mpris/MediaPlayer2",
+        "org.mpris.MediaPlayer2.Player",
+    )
+    .map_err(|e| format!("mpris proxy: {e}"))?;
+    proxy
+        .set_property("Volume", volume.clamp(0.0, 1.5))
+        .map_err(|e| format!("mpris Volume: {e}"))?;
+    Ok(())
+}

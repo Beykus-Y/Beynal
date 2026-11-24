@@ -1097,7 +1097,7 @@ impl State {
         }
         let old_physical = self.surface_sizes().physical;
         let (columns, rows) =
-            sizes.grid_size(self.renderer.as_ref().ok_or("renderer unavailable")?);
+            self.effective_grid_size(sizes, self.renderer.as_ref().ok_or("renderer unavailable")?);
         if sizes.physical != old_physical {
             if let Some(gl) = &mut self.gl
                 && let Err(error) = gl.resize(sizes.physical.0, sizes.physical.1)
@@ -1774,7 +1774,11 @@ impl State {
         }
         if self.backend == ActiveBackend::OpenGl && self.gl.is_some() {
             let logical = (self.width as usize, self.height as usize);
-            let force_full = self.damage_full || self.editor.is_some() || self.platform_active();
+            let bg_active = self
+                .background
+                .as_ref()
+                .is_some_and(|b| b.is_active(self.keyboard_focus, self.in_tui_mode()));
+            let force_full = self.damage_full || self.editor.is_some() || bg_active;
             self.damage_full = false;
             let mut damage = if let Some(terminal) = &self.terminal {
                 terminal_damage(
@@ -2027,19 +2031,41 @@ impl State {
         gl.present(&rects, full)
     }
 
-    fn platform_active(&self) -> bool {
-        self.widgets.as_ref().is_some_and(|w| w.is_enabled())
-            || self
-                .background
+    fn in_tui_mode(&self) -> bool {
+        let Some(terminal) = &self.terminal else {
+            return false;
+        };
+        let screen = terminal.screen();
+        let signals = crate::widgets::layout::TuiSignals {
+            alternate_screen: screen.is_alternate_screen(),
+            mouse_reporting: screen.mouse_mode() != crate::mouse::Mode::Off,
+            bracketed_paste: screen.bracketed_paste,
+            full_scroll_margins: !screen.has_custom_scroll_margins(),
+            known_tui_foreground: self
+                .xray
                 .as_ref()
-                .is_some_and(|b| b.is_active(self.keyboard_focus, self.in_tui_mode()))
-            || self.xray.as_ref().is_some_and(|x| x.config.enabled)
+                .is_some_and(|x| x.has_known_tui_foreground()),
+        };
+        signals.is_fullscreen_tui()
     }
 
-    fn in_tui_mode(&self) -> bool {
-        self.terminal
+    fn effective_grid_size(
+        &self,
+        sizes: SurfaceSizes,
+        renderer: &render::Renderer,
+    ) -> (usize, usize) {
+        let (w, h) = sizes.buffer_dimensions();
+        let insets = self
+            .widgets
             .as_ref()
-            .is_some_and(|t| t.screen().is_alternate_screen())
+            .map_or_else(crate::widgets::layout::ViewportInsets::default, |widgets| {
+                widgets.dock_insets(self.in_tui_mode(), sizes.scale.factor())
+            });
+        let eff_w = (w as f32 - insets.left - insets.right).max(1.0) as usize;
+        let eff_h = (h as f32 - insets.top - insets.bottom).max(1.0) as usize;
+        renderer
+            .geometry(sizes.scale.factor())
+            .grid_size(eff_w, eff_h)
     }
 
     fn init_platform_subsystems(&mut self, child_pid: libc::pid_t, pty_master_fd: i32) {
@@ -2112,10 +2138,80 @@ impl State {
                             &mut self.background,
                             crate::config::BackgroundPreset::parse(&name),
                         ) {
-                            bg.config.preset = preset;
+                            bg.set_preset(preset);
+                            self.dirty = true;
                         }
                     }
-                    crate::widgets::runtime::HostAction::BackgroundBind { .. } => {}
+                    crate::widgets::runtime::HostAction::BackgroundClearScene { owner } => {
+                        if let Some(bg) = &mut self.background {
+                            bg.clear_scene(&owner);
+                            self.dirty = true;
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundAddObject { owner, spec } => {
+                        if let Some(bg) = &mut self.background {
+                            let _ = bg.add_object(&owner, spec);
+                            self.dirty = true;
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundUpdateObject {
+                        owner,
+                        id,
+                        position,
+                        rotation,
+                        scale,
+                        color,
+                    } => {
+                        if let Some(bg) = &mut self.background {
+                            bg.update_object(&owner, &id, position, rotation, scale, color);
+                            self.dirty = true;
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundRemoveObject { owner, id } => {
+                        if let Some(bg) = &mut self.background {
+                            bg.remove_object(&owner, &id);
+                            self.dirty = true;
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundSetCamera {
+                        owner,
+                        position,
+                        target,
+                        fov_deg,
+                        ortho,
+                    } => {
+                        if let Some(bg) = &mut self.background {
+                            bg.set_camera(&owner, position, target, fov_deg, ortho);
+                            self.dirty = true;
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundSetLight {
+                        owner,
+                        direction,
+                        color,
+                        intensity,
+                    } => {
+                        if let Some(bg) = &mut self.background {
+                            bg.set_light(&owner, direction, color, intensity);
+                            self.dirty = true;
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundSetCharset(charset) => {
+                        if let Some(bg) = &mut self.background {
+                            bg.config.charset = charset;
+                            self.dirty = true;
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundBind(binding) => {
+                        if let Some(bg) = &mut self.background {
+                            bg.add_binding(binding);
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundUnbind(id) => {
+                        if let Some(bg) = &mut self.background {
+                            bg.remove_binding(&id);
+                        }
+                    }
                     crate::widgets::runtime::HostAction::WidgetLog {
                         extension_id,
                         level,
@@ -2129,6 +2225,22 @@ impl State {
             }
         }
         let in_tui = self.in_tui_mode();
+        if self.widgets.is_some()
+            && let Some(renderer) = &self.renderer
+        {
+            let sizes = self.surface_sizes();
+            let (cols, rows) = self.effective_grid_size(sizes, renderer);
+            if let Some(terminal) = &mut self.terminal
+                && (terminal.screen().columns, terminal.screen().rows) != (cols, rows)
+            {
+                if let Some(pty) = &self.pty {
+                    let _ = pty.resize(cols as u16, rows as u16);
+                }
+                terminal.resize(cols, rows);
+                self.damage_full = true;
+                self.dirty = true;
+            }
+        }
         if let Some(bg) = &self.background
             && bg.is_active(self.keyboard_focus, in_tui)
             && bg.should_step()
@@ -2182,12 +2294,18 @@ impl State {
         }
         if let Some(widgets) = &mut self.widgets {
             let g = renderer.geometry(scale);
+            let inline_y_px = self
+                .terminal
+                .as_ref()
+                .and_then(|t| t.screen().latest_inline_display_row())
+                .map(|row| g.padding as f32 + row as f32 * g.cell_height as f32);
             widgets.emit_to_scene(
                 win_size,
                 scale,
                 (g.cell_width as f32, g.cell_height as f32),
                 in_tui,
                 pointer_px,
+                inline_y_px,
                 theme,
                 renderer,
                 scene,

@@ -37,13 +37,41 @@ pub enum HostAction {
     MediaPlayFile(String),
     MediaEnqueue(String),
     BackgroundSetPreset(String),
-    BackgroundBind {
-        source: String,
-        target: String,
-        min: f32,
-        max: f32,
-        smoothing: f32,
+    BackgroundClearScene {
+        owner: String,
     },
+    BackgroundAddObject {
+        owner: String,
+        spec: crate::background::CustomObjectSpec,
+    },
+    BackgroundUpdateObject {
+        owner: String,
+        id: String,
+        position: Option<[f32; 3]>,
+        rotation: Option<[f32; 3]>,
+        scale: Option<[f32; 3]>,
+        color: Option<[f32; 3]>,
+    },
+    BackgroundRemoveObject {
+        owner: String,
+        id: String,
+    },
+    BackgroundSetCamera {
+        owner: String,
+        position: Option<[f32; 3]>,
+        target: Option<[f32; 3]>,
+        fov_deg: Option<f32>,
+        ortho: Option<bool>,
+    },
+    BackgroundSetLight {
+        owner: String,
+        direction: Option<[f32; 3]>,
+        color: Option<[f32; 3]>,
+        intensity: Option<f32>,
+    },
+    BackgroundSetCharset(String),
+    BackgroundBind(crate::background::bindings::DataBinding),
+    BackgroundUnbind(String),
     WidgetLog {
         extension_id: String,
         level: String,
@@ -515,6 +543,97 @@ fn handle_host_call(
             s.pending_actions
                 .push_back(HostAction::BackgroundSetPreset(arg.to_string()));
         }
+        "background.clearScene" if perms.has(Capability::BackgroundControl) => {
+            s.pending_actions
+                .push_back(HostAction::BackgroundClearScene {
+                    owner: ext_id.to_string(),
+                });
+        }
+        "background.addObject" if perms.has(Capability::BackgroundControl) => {
+            if let Ok(spec) = serde_json::from_str::<crate::background::CustomObjectSpec>(arg) {
+                s.pending_actions
+                    .push_back(HostAction::BackgroundAddObject {
+                        owner: ext_id.to_string(),
+                        spec,
+                    });
+            }
+        }
+        "background.updateObject" if perms.has(Capability::BackgroundControl) => {
+            #[derive(serde::Deserialize)]
+            struct Upd {
+                id: String,
+                position: Option<[f32; 3]>,
+                rotation: Option<[f32; 3]>,
+                scale: Option<[f32; 3]>,
+                color: Option<[f32; 3]>,
+            }
+            if let Ok(u) = serde_json::from_str::<Upd>(arg) {
+                s.pending_actions
+                    .push_back(HostAction::BackgroundUpdateObject {
+                        owner: ext_id.to_string(),
+                        id: u.id,
+                        position: u.position,
+                        rotation: u.rotation,
+                        scale: u.scale,
+                        color: u.color,
+                    });
+            }
+        }
+        "background.removeObject" if perms.has(Capability::BackgroundControl) => {
+            s.pending_actions
+                .push_back(HostAction::BackgroundRemoveObject {
+                    owner: ext_id.to_string(),
+                    id: arg.to_string(),
+                });
+        }
+        "background.setCamera" if perms.has(Capability::BackgroundControl) => {
+            #[derive(serde::Deserialize)]
+            struct Cam {
+                position: Option<[f32; 3]>,
+                target: Option<[f32; 3]>,
+                fov: Option<f32>,
+                ortho: Option<bool>,
+            }
+            if let Ok(c) = serde_json::from_str::<Cam>(arg) {
+                s.pending_actions
+                    .push_back(HostAction::BackgroundSetCamera {
+                        owner: ext_id.to_string(),
+                        position: c.position,
+                        target: c.target,
+                        fov_deg: c.fov,
+                        ortho: c.ortho,
+                    });
+            }
+        }
+        "background.setLight" if perms.has(Capability::BackgroundControl) => {
+            #[derive(serde::Deserialize)]
+            struct Light {
+                direction: Option<[f32; 3]>,
+                color: Option<[f32; 3]>,
+                intensity: Option<f32>,
+            }
+            if let Ok(l) = serde_json::from_str::<Light>(arg) {
+                s.pending_actions.push_back(HostAction::BackgroundSetLight {
+                    owner: ext_id.to_string(),
+                    direction: l.direction,
+                    color: l.color,
+                    intensity: l.intensity,
+                });
+            }
+        }
+        "background.setCharset" if perms.has(Capability::BackgroundControl) => {
+            s.pending_actions
+                .push_back(HostAction::BackgroundSetCharset(arg.to_string()));
+        }
+        "background.bind" if perms.has(Capability::BackgroundControl) => {
+            if let Ok(b) = serde_json::from_str::<crate::background::bindings::DataBinding>(arg) {
+                s.pending_actions.push_back(HostAction::BackgroundBind(b));
+            }
+        }
+        "background.unbind" if perms.has(Capability::BackgroundControl) => {
+            s.pending_actions
+                .push_back(HostAction::BackgroundUnbind(arg.to_string()));
+        }
         _ => {}
     }
 }
@@ -746,6 +865,53 @@ globalThis.beyrix = {{
         setPreset(name) {{
             requirePerm({perm_bg}, "background-control");
             __beyrix_host_call("background.setPreset", String(name));
+        }},
+        clearScene() {{
+            requirePerm({perm_bg}, "background-control");
+            __beyrix_host_call("background.clearScene", "");
+        }},
+        addObject(spec) {{
+            requirePerm({perm_bg}, "background-control");
+            __beyrix_host_call("background.addObject", JSON.stringify(spec));
+        }},
+        updateObject(id, patch) {{
+            requirePerm({perm_bg}, "background-control");
+            __beyrix_host_call("background.updateObject", JSON.stringify({{ id, ...patch }}));
+        }},
+        removeObject(id) {{
+            requirePerm({perm_bg}, "background-control");
+            __beyrix_host_call("background.removeObject", String(id));
+        }},
+        setCamera(cam) {{
+            requirePerm({perm_bg}, "background-control");
+            __beyrix_host_call("background.setCamera", JSON.stringify(cam));
+        }},
+        setLight(light) {{
+            requirePerm({perm_bg}, "background-control");
+            __beyrix_host_call("background.setLight", JSON.stringify(light));
+        }},
+        setCharset(charset) {{
+            requirePerm({perm_bg}, "background-control");
+            __beyrix_host_call("background.setCharset", String(charset));
+        }},
+        bind(binding) {{
+            requirePerm({perm_bg}, "background-control");
+            const payload = {{
+                id: String(binding.id || "bind"),
+                source: binding.source,
+                target: binding.target,
+                in_min: Number(binding.inMin ?? 0.0),
+                in_max: Number(binding.inMax ?? 1.0),
+                out_min: Number(binding.outMin ?? 0.0),
+                out_max: Number(binding.outMax ?? 1.0),
+                smoothing: Number(binding.smoothing ?? 0.35),
+                combine: binding.combine || "replace",
+            }};
+            __beyrix_host_call("background.bind", JSON.stringify(payload));
+        }},
+        unbind(id) {{
+            requirePerm({perm_bg}, "background-control");
+            __beyrix_host_call("background.unbind", String(id));
         }},
     }},
     xray: {{

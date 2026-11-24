@@ -17,7 +17,7 @@ pub mod player;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use crate::config::MediaConfig;
@@ -25,11 +25,21 @@ use crate::events::{AppEvent, AudioFramePayload, EventBus, EventKind, MediaEvent
 use audio::{AudioAnalysis, AudioAnalyzer};
 use player::{LocalAudioPlayer, PlayerCommand};
 
+enum MprisCommand {
+    PlayPause,
+    Next,
+    Previous,
+    Seek(f64),
+    SetVolume(f64),
+    SwitchSession(String),
+}
+
 pub struct MediaManager {
     pub config: MediaConfig,
     analyzer: Arc<Mutex<AudioAnalyzer>>,
     player: Option<LocalAudioPlayer>,
     active_mpris_bus: Arc<Mutex<Option<String>>>,
+    mpris_tx: Option<mpsc::SyncSender<MprisCommand>>,
     shutdown: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -46,6 +56,7 @@ impl MediaManager {
             analyzer,
             player: None,
             active_mpris_bus: Arc::new(Mutex::new(None)),
+            mpris_tx: None,
             shutdown: Arc::new(AtomicBool::new(false)),
             worker: None,
         }
@@ -61,6 +72,9 @@ impl MediaManager {
                 Err(e) => eprintln!("beyrix media player: {e}"),
             }
         }
+        let (mpris_tx, mpris_rx) = mpsc::sync_channel::<MprisCommand>(32);
+        self.mpris_tx = Some(mpris_tx);
+
         let mpris_enabled = self.config.mpris_enabled;
         let active_bus = Arc::clone(&self.active_mpris_bus);
         let analyzer = Arc::clone(&self.analyzer);
@@ -78,6 +92,47 @@ impl MediaManager {
                 };
 
                 while !shutdown.load(Ordering::Relaxed) {
+                    // Service queued non-blocking MPRIS commands on this background thread
+                    while let Ok(cmd) = mpris_rx.try_recv() {
+                        #[cfg(target_os = "linux")]
+                        if let Some(conn) = &dbus {
+                            let bus_name =
+                                active_bus.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                            match cmd {
+                                MprisCommand::SwitchSession(name) => {
+                                    *active_bus.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        Some(name);
+                                }
+                                MprisCommand::PlayPause => {
+                                    if let Some(b) = bus_name {
+                                        let _ = mpris::send_mpris_command(conn, &b, "PlayPause");
+                                    }
+                                }
+                                MprisCommand::Next => {
+                                    if let Some(b) = bus_name {
+                                        let _ = mpris::send_mpris_command(conn, &b, "Next");
+                                    }
+                                }
+                                MprisCommand::Previous => {
+                                    if let Some(b) = bus_name {
+                                        let _ = mpris::send_mpris_command(conn, &b, "Previous");
+                                    }
+                                }
+                                MprisCommand::Seek(secs) => {
+                                    if let Some(b) = bus_name {
+                                        let _ = mpris::send_mpris_seek(conn, &b, secs);
+                                    }
+                                }
+                                MprisCommand::SetVolume(vol) => {
+                                    if let Some(b) = bus_name {
+                                        let _ = mpris::send_mpris_volume(conn, &b, vol);
+                                    }
+                                }
+                            }
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        let _ = cmd;
+                    }
                     if bus.subscriber_count(EventKind::AudioFrame) > 0 && player_present {
                         let a = analyzer
                             .lock()
@@ -142,15 +197,8 @@ impl MediaManager {
             p.send(PlayerCommand::PlayPause);
             return;
         }
-        #[cfg(target_os = "linux")]
-        if let Some(bus_name) = self
-            .active_mpris_bus
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            && let Ok(conn) = zbus::blocking::Connection::session()
-        {
-            let _ = mpris::send_mpris_command(&conn, &bus_name, "PlayPause");
+        if let Some(tx) = &self.mpris_tx {
+            let _ = tx.try_send(MprisCommand::PlayPause);
         }
     }
 
@@ -161,15 +209,8 @@ impl MediaManager {
             p.send(PlayerCommand::Next);
             return;
         }
-        #[cfg(target_os = "linux")]
-        if let Some(bus_name) = self
-            .active_mpris_bus
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            && let Ok(conn) = zbus::blocking::Connection::session()
-        {
-            let _ = mpris::send_mpris_command(&conn, &bus_name, "Next");
+        if let Some(tx) = &self.mpris_tx {
+            let _ = tx.try_send(MprisCommand::Next);
         }
     }
 
@@ -180,15 +221,8 @@ impl MediaManager {
             p.send(PlayerCommand::Previous);
             return;
         }
-        #[cfg(target_os = "linux")]
-        if let Some(bus_name) = self
-            .active_mpris_bus
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            && let Ok(conn) = zbus::blocking::Connection::session()
-        {
-            let _ = mpris::send_mpris_command(&conn, &bus_name, "Previous");
+        if let Some(tx) = &self.mpris_tx {
+            let _ = tx.try_send(MprisCommand::Previous);
         }
     }
 
@@ -199,14 +233,32 @@ impl MediaManager {
     }
 
     pub fn seek(&self, secs: f64) {
-        if let Some(p) = &self.player {
+        if let Some(p) = &self.player
+            && p.status().current.is_some()
+        {
             p.send(PlayerCommand::Seek(secs));
+            return;
+        }
+        if let Some(tx) = &self.mpris_tx {
+            let _ = tx.try_send(MprisCommand::Seek(secs));
         }
     }
 
     pub fn set_volume(&self, v: f64) {
-        if let Some(p) = &self.player {
+        if let Some(p) = &self.player
+            && p.status().current.is_some()
+        {
             p.send(PlayerCommand::SetVolume(v as f32));
+            return;
+        }
+        if let Some(tx) = &self.mpris_tx {
+            let _ = tx.try_send(MprisCommand::SetVolume(v));
+        }
+    }
+
+    pub fn switch_session(&self, bus_name: String) {
+        if let Some(tx) = &self.mpris_tx {
+            let _ = tx.try_send(MprisCommand::SwitchSession(bus_name));
         }
     }
 

@@ -158,6 +158,38 @@ declare namespace Beyrix {
     };
     background: {
       setPreset(preset: "torus" | "sphere" | "terrain" | "ocean" | "tunnel" | "starfield" | "audio-reactive"): void;
+      clearScene(): void;
+      addObject(spec: {
+        id: string;
+        primitive: "torus" | "sphere" | "cube" | "plane" | "obj";
+        obj_data?: string;
+        color?: [number, number, number];
+        position?: [number, number, number];
+        rotation?: [number, number, number];
+        scale?: [number, number, number];
+      }): void;
+      updateObject(id: string, patch: {
+        position?: [number, number, number];
+        rotation?: [number, number, number];
+        scale?: [number, number, number];
+        color?: [number, number, number];
+      }): void;
+      removeObject(id: string): void;
+      setCamera(cam: { position?: [number, number, number]; target?: [number, number, number]; fov?: number; ortho?: boolean }): void;
+      setLight(light: { direction?: [number, number, number]; color?: [number, number, number]; intensity?: number }): void;
+      setCharset(charset: string): void;
+      bind(binding: {
+        id: string;
+        source: "audio-bass" | "audio-mid" | "audio-treble" | "audio-rms" | "audio-peak" | "audio-beat" | "cpu-usage" | "ram-usage" | "xray-activity" | "mouse-x" | "mouse-y" | "time";
+        target: "object-scale" | "rotation-speed" | "light-intensity" | "particle-impulse" | "brightness" | "wave-amplitude";
+        inMin?: number;
+        inMax?: number;
+        outMin?: number;
+        outMax?: number;
+        smoothing?: number;
+        combine?: "replace" | "add" | "multiply" | "max";
+      }): void;
+      unbind(id: string): void;
     };
     xray: {
       onUpdate(cb: (ev: XRayUpdateEvent) => void): void;

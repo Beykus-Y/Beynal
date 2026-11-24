@@ -145,6 +145,8 @@ pub struct Screen {
     viewport_offset: usize,
     wraps: Vec<bool>,
     layout_cache: LayoutCache<Option<(u64, Option<usize>)>>,
+    command_anchors: VecDeque<(usize, u64)>,
+    next_command_id: u64,
 }
 
 impl Screen {
@@ -153,6 +155,15 @@ impl Screen {
     }
     pub fn is_alternate_screen(&self) -> bool {
         self.alternate.is_some()
+    }
+    pub fn has_custom_scroll_margins(&self) -> bool {
+        self.scroll_top != 0 || self.scroll_bottom != self.rows.saturating_sub(1)
+    }
+    pub fn latest_inline_display_row(&self) -> Option<usize> {
+        let &(abs_row, _) = self.command_anchors.back()?;
+        let top_abs = self.history.len().saturating_sub(self.viewport_offset);
+        let rel = abs_row.checked_sub(top_abs)?;
+        (rel < self.rows).then_some(rel)
     }
     #[cfg(test)]
     pub fn new(columns: usize, rows: usize) -> Self {
@@ -196,6 +207,8 @@ impl Screen {
             viewport_offset: 0,
             wraps: vec![false; rows],
             layout_cache: LayoutCache::new(None),
+            command_anchors: VecDeque::new(),
+            next_command_id: 1,
         };
         // The shell inherits the real cursor position, so the first prompt is
         // printed on the last row without touching its output coordinates.
@@ -1157,6 +1170,18 @@ impl Perform for Screen {
     fn unhook(&mut self) {}
 
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        if let [b"133", kind, ..] = params {
+            if matches!(kind.first(), Some(b'A' | b'C')) {
+                let abs_row = self.history.len() + self.cursor_y;
+                let id = self.next_command_id;
+                self.next_command_id += 1;
+                if self.command_anchors.len() >= 256 {
+                    self.command_anchors.pop_front();
+                }
+                self.command_anchors.push_back((abs_row, id));
+            }
+            return;
+        }
         let (mut slot, values) = match params {
             [b"10", values @ ..] => (10, values),
             [b"11", values @ ..] => (11, values),

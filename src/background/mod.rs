@@ -21,12 +21,34 @@ use crate::render::{Renderer, Scene, SceneGlyph};
 use crate::theme::Theme;
 
 use bindings::{BindingInputs, BindingTarget, DataBinding, DataSource, evaluate_bindings};
+use glam::Vec3;
 use presets::build_preset_scene;
-use scene3d::CharRasterizer;
+use scene3d::{
+    CharRasterizer, Material3D, Mesh3D, Object3D, ProjectionMode, Scene3D, grid_mesh,
+    load_obj_mesh, sphere_mesh, torus_mesh,
+};
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+pub struct CustomObjectSpec {
+    pub id: String,
+    pub primitive: String,
+    #[serde(default)]
+    pub obj_data: Option<String>,
+    #[serde(default)]
+    pub color: Option<[f32; 3]>,
+    #[serde(default)]
+    pub position: Option<[f32; 3]>,
+    #[serde(default)]
+    pub rotation: Option<[f32; 3]>,
+    #[serde(default)]
+    pub scale: Option<[f32; 3]>,
+}
 
 pub struct BackgroundEngine {
     pub config: BackgroundConfig,
     pub bindings: Vec<DataBinding>,
+    pub custom_scene: Option<Scene3D>,
+    pub scene_owner: Option<String>,
     rasterizer: CharRasterizer,
     start_time: Instant,
     last_frame: Instant,
@@ -64,12 +86,161 @@ impl BackgroundEngine {
         Self {
             config,
             bindings,
+            custom_scene: None,
+            scene_owner: None,
             rasterizer: CharRasterizer::new(64, 24),
             start_time: Instant::now(),
             last_frame: Instant::now(),
             smoothed_frame_ms: 0.0,
             effective_fps: fps,
         }
+    }
+
+    pub fn set_preset(&mut self, preset: BackgroundPreset) {
+        self.config.preset = preset;
+        self.custom_scene = None;
+        self.scene_owner = None;
+    }
+
+    pub fn clear_scene(&mut self, owner: &str) {
+        self.scene_owner = Some(owner.to_string());
+        self.custom_scene = Some(Scene3D::default());
+    }
+
+    fn ensure_custom_scene_mut(&mut self, owner: &str) -> Option<&mut Scene3D> {
+        if let Some(existing) = &self.scene_owner
+            && existing != owner
+        {
+            return None;
+        }
+        if self.custom_scene.is_none() {
+            self.scene_owner = Some(owner.to_string());
+            self.custom_scene = Some(Scene3D::default());
+        }
+        self.custom_scene.as_mut()
+    }
+
+    pub fn add_object(&mut self, owner: &str, spec: CustomObjectSpec) -> Result<(), String> {
+        let mesh = match spec.primitive.as_str() {
+            "torus" => torus_mesh(1.1, 0.4, 24, 12),
+            "sphere" => sphere_mesh(1.0, 14, 22),
+            "plane" => grid_mesh(12, 12, 4.0, |_, _| 0.0),
+            "cube" => box_mesh(1.2),
+            "obj" => {
+                let data = spec.obj_data.as_deref().ok_or("missing obj_data")?;
+                load_obj_mesh(data)?
+            }
+            other => return Err(format!("unknown primitive {other:?}")),
+        };
+        let Some(scene) = self.ensure_custom_scene_mut(owner) else {
+            return Err("background scene is owned by another extension".to_string());
+        };
+        scene.objects.retain(|o| o.id != spec.id);
+        scene.objects.push(Object3D {
+            id: spec.id,
+            mesh,
+            material: Material3D {
+                color: spec.color.unwrap_or([0.45, 0.78, 0.96]),
+                ..Default::default()
+            },
+            position: spec.position.map_or(Vec3::ZERO, Vec3::from_array),
+            rotation: spec.rotation.map_or(Vec3::ZERO, Vec3::from_array),
+            scale: spec.scale.map_or(Vec3::ONE, Vec3::from_array),
+        });
+        Ok(())
+    }
+
+    pub fn update_object(
+        &mut self,
+        owner: &str,
+        id: &str,
+        position: Option<[f32; 3]>,
+        rotation: Option<[f32; 3]>,
+        scale: Option<[f32; 3]>,
+        color: Option<[f32; 3]>,
+    ) {
+        let Some(scene) = self.ensure_custom_scene_mut(owner) else {
+            return;
+        };
+        if let Some(obj) = scene.objects.iter_mut().find(|o| o.id == id) {
+            if let Some(p) = position {
+                obj.position = Vec3::from_array(p);
+            }
+            if let Some(r) = rotation {
+                obj.rotation = Vec3::from_array(r);
+            }
+            if let Some(s) = scale {
+                obj.scale = Vec3::from_array(s);
+            }
+            if let Some(c) = color {
+                obj.material.color = c;
+            }
+        }
+    }
+
+    pub fn remove_object(&mut self, owner: &str, id: &str) {
+        if let Some(scene) = self.ensure_custom_scene_mut(owner) {
+            scene.objects.retain(|o| o.id != id);
+        }
+    }
+
+    pub fn set_camera(
+        &mut self,
+        owner: &str,
+        position: Option<[f32; 3]>,
+        target: Option<[f32; 3]>,
+        fov_deg: Option<f32>,
+        ortho: Option<bool>,
+    ) {
+        let Some(scene) = self.ensure_custom_scene_mut(owner) else {
+            return;
+        };
+        if let Some(p) = position {
+            scene.camera.position = Vec3::from_array(p);
+        }
+        if let Some(t) = target {
+            scene.camera.target = Vec3::from_array(t);
+        }
+        if let Some(fov) = fov_deg {
+            scene.camera.fov_rad = fov.clamp(15.0, 120.0).to_radians();
+        }
+        if let Some(o) = ortho {
+            scene.camera.projection = if o {
+                ProjectionMode::Orthographic
+            } else {
+                ProjectionMode::Perspective
+            };
+        }
+    }
+
+    pub fn set_light(
+        &mut self,
+        owner: &str,
+        direction: Option<[f32; 3]>,
+        color: Option<[f32; 3]>,
+        intensity: Option<f32>,
+    ) {
+        let Some(scene) = self.ensure_custom_scene_mut(owner) else {
+            return;
+        };
+        if let Some(d) = direction {
+            scene.light.direction = Vec3::from_array(d).normalize_or_zero();
+        }
+        if let Some(c) = color {
+            scene.light.color = c;
+        }
+        if let Some(i) = intensity {
+            scene.light.intensity = i.clamp(0.0, 5.0);
+        }
+    }
+
+    pub fn add_binding(&mut self, binding: DataBinding) {
+        self.bindings.retain(|b| b.id != binding.id);
+        self.bindings.push(binding);
+    }
+
+    pub fn remove_binding(&mut self, id: &str) {
+        self.bindings.retain(|b| b.id != id);
     }
 
     pub fn is_active(&self, focused: bool, in_tui: bool) -> bool {
@@ -126,10 +297,28 @@ impl BackgroundEngine {
             theme.cursor[1] as f32 / 255.0,
             theme.cursor[2] as f32 / 255.0,
         ];
-        let mut s3d = build_preset_scene(self.config.preset, elapsed, &mods, mouse_norm, accent);
-        if !self.config.mouse_reactive {
-            s3d = build_preset_scene(self.config.preset, elapsed, &mods, (0.5, 0.5), accent);
-        }
+        let mut s3d = if let Some(custom) = &self.custom_scene {
+            let mut s = custom.clone();
+            for obj in &mut s.objects {
+                obj.scale *= mods.scale;
+                obj.rotation.y += elapsed * 0.4 * mods.rotation_speed;
+            }
+            s.light.intensity *= mods.light_intensity;
+            s
+        } else {
+            build_preset_scene(
+                self.config.preset,
+                elapsed,
+                &mods,
+                if self.config.mouse_reactive {
+                    mouse_norm
+                } else {
+                    (0.5, 0.5)
+                },
+                accent,
+            )
+        };
+        let _ = &mut s3d;
         self.rasterizer.render(
             &s3d,
             &self.config.charset,
@@ -187,6 +376,17 @@ impl BackgroundEngine {
     }
 }
 
+fn box_mesh(size: f32) -> Mesh3D {
+    let h = size * 0.5;
+    let obj = format!(
+        "v -{h} -{h} {h}\nv {h} -{h} {h}\nv {h} {h} {h}\nv -{h} {h} {h}\n\
+         v -{h} -{h} -{h}\nv {h} -{h} -{h}\nv {h} {h} -{h}\nv -{h} {h} -{h}\n\
+         f 1 2 3\nf 1 3 4\nf 6 5 8\nf 6 8 7\nf 4 3 7\nf 4 7 8\n\
+         f 5 6 2\nf 5 2 1\nf 2 6 7\nf 2 7 3\nf 5 1 4\nf 5 4 8\n"
+    );
+    load_obj_mesh(&obj).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +441,60 @@ mod tests {
             );
             assert!(tui_scene.behind_glyphs.is_empty());
         }
+    }
+
+    #[test]
+    fn custom_scene_ownership_and_objects_render_natively() {
+        let mut renderer = Renderer::new().unwrap();
+        let theme = Theme::default();
+        let mut engine = BackgroundEngine::new(BackgroundConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        engine.clear_scene("ext.a");
+        engine
+            .add_object(
+                "ext.a",
+                CustomObjectSpec {
+                    id: "my-cube".into(),
+                    primitive: "cube".into(),
+                    obj_data: None,
+                    color: Some([0.9, 0.4, 0.2]),
+                    position: None,
+                    rotation: Some([0.4, 0.6, 0.0]),
+                    scale: None,
+                },
+            )
+            .unwrap();
+        // Another extension cannot hijack ext.a's scene without clear_scene
+        assert!(
+            engine
+                .add_object(
+                    "ext.b",
+                    CustomObjectSpec {
+                        id: "hijack".into(),
+                        primitive: "sphere".into(),
+                        obj_data: None,
+                        color: None,
+                        position: None,
+                        rotation: None,
+                        scale: None,
+                    }
+                )
+                .is_err()
+        );
+        let mut scene = Scene::default();
+        engine.render_to_scene(
+            (800.0, 600.0),
+            1.0,
+            true,
+            false,
+            (0.5, 0.5),
+            &BindingInputs::default(),
+            &theme,
+            &mut renderer,
+            &mut scene,
+        );
+        assert!(!scene.behind_glyphs.is_empty());
     }
 }

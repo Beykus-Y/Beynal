@@ -159,6 +159,9 @@ impl XRayEngine {
                 let mut cmd_name = String::new();
                 let mut peak_rss = 0u64;
                 let mut peak_procs = 0usize;
+                let mut start_io = (0u64, 0u64, 0u64, 0u64);
+                let mut last_io = (0u64, 0u64, 0u64, 0u64);
+                let mut wait_events: Vec<String> = Vec::new();
                 let mut cmd_seq = 1u64;
 
                 while !shutdown.load(Ordering::Relaxed) {
@@ -179,8 +182,19 @@ impl XRayEngine {
                     let total_cpu: f32 = nodes.iter().map(|n| n.cpu_percent).sum();
                     let total_rss: u64 = nodes.iter().map(|n| n.rss_bytes).sum();
 
-                    // Track foreground job lifecycle for post-command reports
+                    // Track foreground job lifecycle for post-command reports (scoped to fg PGID)
                     if let Some(fg) = fg_pgid {
+                        let cmd_nodes: Vec<&ProcessNode> =
+                            nodes.iter().filter(|n| n.pgid == fg).collect();
+                        let cmd_rss: u64 = cmd_nodes.iter().map(|n| n.rss_bytes).sum();
+                        let cmd_procs = cmd_nodes.len();
+                        let cmd_io = (
+                            cmd_nodes.iter().map(|n| n.read_bytes).sum::<u64>(),
+                            cmd_nodes.iter().map(|n| n.write_bytes).sum::<u64>(),
+                            cmd_nodes.iter().map(|n| n.logical_read_bytes).sum::<u64>(),
+                            cmd_nodes.iter().map(|n| n.logical_write_bytes).sum::<u64>(),
+                        );
+
                         if prev_fg != Some(fg) {
                             if let Some(old_fg) = prev_fg
                                 && !cmd_name.is_empty()
@@ -195,11 +209,11 @@ impl XRayEngine {
                                     duration_ms: cmd_started.elapsed().as_millis() as u64,
                                     peak_rss_bytes: peak_rss,
                                     peak_process_count: peak_procs,
-                                    physical_read_bytes: 0,
-                                    physical_write_bytes: 0,
-                                    logical_read_bytes: 0,
-                                    logical_write_bytes: 0,
-                                    wait_events: Vec::new(),
+                                    physical_read_bytes: last_io.0.saturating_sub(start_io.0),
+                                    physical_write_bytes: last_io.1.saturating_sub(start_io.1),
+                                    logical_read_bytes: last_io.2.saturating_sub(start_io.2),
+                                    logical_write_bytes: last_io.3.saturating_sub(start_io.3),
+                                    wait_events: std::mem::take(&mut wait_events),
                                     trace_active: lvl == XRayLevel::Trace,
                                 });
                                 cmd_seq += 1;
@@ -207,16 +221,31 @@ impl XRayEngine {
                             prev_fg = Some(fg);
                             cmd_started = Instant::now();
                             cmd_wall = SystemTime::now();
-                            peak_rss = total_rss;
-                            peak_procs = nodes.len();
-                            cmd_name = nodes
-                                .iter()
-                                .find(|n| n.pgid == fg)
+                            peak_rss = cmd_rss;
+                            peak_procs = cmd_procs;
+                            start_io = cmd_io;
+                            last_io = cmd_io;
+                            wait_events.clear();
+                            cmd_name = cmd_nodes
+                                .first()
                                 .map(|n| n.comm.clone())
                                 .unwrap_or_else(|| format!("pgid:{fg}"));
                         } else {
-                            peak_rss = peak_rss.max(total_rss);
-                            peak_procs = peak_procs.max(nodes.len());
+                            peak_rss = peak_rss.max(cmd_rss);
+                            peak_procs = peak_procs.max(cmd_procs);
+                            last_io = cmd_io;
+                            for n in &cmd_nodes {
+                                if !matches!(
+                                    n.diagnosis.reason,
+                                    diagnosis::WaitReason::ActiveCompute
+                                        | diagnosis::WaitReason::Unknown
+                                ) {
+                                    let label = n.diagnosis.reason.label().to_string();
+                                    if !wait_events.contains(&label) && wait_events.len() < 16 {
+                                        wait_events.push(label);
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -251,6 +280,18 @@ impl XRayEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    pub fn has_known_tui_foreground(&self) -> bool {
+        const TUI_NAMES: &[&str] = &[
+            "vim", "nvim", "vi", "nano", "htop", "btop", "top", "tmux", "screen", "less", "man",
+            "mc", "lazygit", "tig", "ranger", "yazi",
+        ];
+        let snap = self.snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        snap.nodes.iter().any(|n| {
+            let c = n.comm.to_ascii_lowercase();
+            TUI_NAMES.contains(&c.as_str())
+        })
     }
 
     /// Render compact indicator and (if open) full X-Ray panel into `Scene` via BeyrixWidgets UI.

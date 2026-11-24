@@ -264,12 +264,32 @@ impl LinuxSampler {
                 None
             };
 
-            let syscall_nr = if inspect_details {
+            let (syscall_nr, syscall_fd) = if inspect_details {
                 fs::read_to_string(format!("/proc/{pid}/syscall"))
                     .ok()
-                    .and_then(|s| s.split_whitespace().next()?.parse::<i64>().ok())
+                    .map(|s| {
+                        let mut parts = s.split_whitespace();
+                        let nr = parts.next().and_then(|v| v.parse::<i64>().ok());
+                        let fd = parts.next().and_then(|v| {
+                            let stripped = v.strip_prefix("0x").unwrap_or(v);
+                            i64::from_str_radix(stripped, 16).ok()
+                        });
+                        (nr, fd)
+                    })
+                    .unwrap_or((None, None))
             } else {
-                None
+                (None, None)
+            };
+
+            let fd0_is_tty = if inspect_details {
+                fs::read_link(format!("/proc/{pid}/fd/0"))
+                    .ok()
+                    .is_some_and(|p| {
+                        let s = p.to_string_lossy();
+                        s.starts_with("/dev/pts/") || s.starts_with("/dev/tty")
+                    })
+            } else {
+                false
             };
 
             let mut open_fds = Vec::new();
@@ -315,6 +335,8 @@ impl LinuxSampler {
                 cpu_percent,
                 wchan: wchan.as_deref(),
                 syscall_nr,
+                syscall_fd,
+                fd0_is_tty,
                 has_tty_fg,
                 has_children,
                 io_delta_bytes: io_delta,
@@ -346,13 +368,50 @@ impl LinuxSampler {
     }
 }
 
-/// Safely perform a process control action after verifying `(pid, starttime)` identity
-/// to prevent acting on a recycled PID.
+/// Safely perform a process control action using `pidfd_open` BEFORE verifying
+/// `(pid, starttime)` identity, and `pidfd_send_signal` without falling back
+/// to `kill(2)`, eliminating PID-reuse TOCTOU races.
 pub fn execute_process_action(
     pid: i32,
     expected_starttime: u64,
     action: ProcessAction,
 ) -> Result<(), String> {
+    if let ProcessAction::Renice(prio) = action {
+        let current =
+            read_proc_stat(pid).ok_or_else(|| format!("process {pid} no longer exists"))?;
+        if current.starttime != expected_starttime {
+            return Err(format!(
+                "PID {pid} was reused (starttime mismatch); action aborted for safety"
+            ));
+        }
+        let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, prio) };
+        return if rc == 0 {
+            Ok(())
+        } else {
+            Err(format!("setpriority: {}", std::io::Error::last_os_error()))
+        };
+    }
+
+    let sig = match action {
+        ProcessAction::Pause => libc::SIGSTOP,
+        ProcessAction::Resume => libc::SIGCONT,
+        ProcessAction::Terminate => libc::SIGTERM,
+        ProcessAction::Kill => libc::SIGKILL,
+        ProcessAction::Renice(_) => unreachable!(),
+    };
+
+    // 1. Pin the kernel `struct pid` with pidfd_open BEFORE checking starttime.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_uint) };
+    if pidfd < 0 {
+        return Err(format!(
+            "pidfd_open({pid}) failed (refusing unsafe kill fallback): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(pidfd as i32) };
+
+    // 2. Verify starttime while holding the pidfd. If the PID was reused before
+    //    pidfd_open, starttime will not match and we abort without signaling.
     let current = read_proc_stat(pid).ok_or_else(|| format!("process {pid} no longer exists"))?;
     if current.starttime != expected_starttime {
         return Err(format!(
@@ -360,45 +419,23 @@ pub fn execute_process_action(
         ));
     }
 
-    // Try pidfd_open + pidfd_send_signal where supported (Linux 5.1+)
-    let sig = match action {
-        ProcessAction::Pause => libc::SIGSTOP,
-        ProcessAction::Resume => libc::SIGCONT,
-        ProcessAction::Terminate => libc::SIGTERM,
-        ProcessAction::Kill => libc::SIGKILL,
-        ProcessAction::Renice(prio) => {
-            let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, prio) };
-            return if rc == 0 {
-                Ok(())
-            } else {
-                Err(format!("setpriority: {}", std::io::Error::last_os_error()))
-            };
-        }
+    // 3. Signal exclusively through pidfd_send_signal. If the process exited
+    //    between step 2 and step 3, pidfd_send_signal returns ESRCH and will
+    //    never hit a newly-spawned process with the same PID.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            sig,
+            std::ptr::null::<libc::siginfo_t>(),
+            0 as libc::c_uint,
+        )
     };
-
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_uint) };
-    if pidfd >= 0 {
-        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(pidfd as i32) };
-        let rc = unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_send_signal,
-                fd.as_raw_fd(),
-                sig,
-                std::ptr::null::<libc::siginfo_t>(),
-                0 as libc::c_uint,
-            )
-        };
-        if rc == 0 {
-            return Ok(());
-        }
-    }
-
-    let rc = unsafe { libc::kill(pid, sig) };
     if rc == 0 {
         Ok(())
     } else {
         Err(format!(
-            "kill({pid}, {sig}): {}",
+            "pidfd_send_signal({pid}, {sig}): {}",
             std::io::Error::last_os_error()
         ))
     }

@@ -125,6 +125,8 @@ pub struct DiagnosisInput<'a> {
     pub cpu_percent: f32,
     pub wchan: Option<&'a str>,
     pub syscall_nr: Option<i64>,
+    pub syscall_fd: Option<i64>,
+    pub fd0_is_tty: bool,
     pub has_tty_fg: bool,
     pub has_children: bool,
     pub io_delta_bytes: u64,
@@ -132,6 +134,11 @@ pub struct DiagnosisInput<'a> {
     pub file_lock: Option<&'a FileLockInfo>,
     pub seconds_since_output: f64,
 }
+
+#[cfg(target_os = "linux")]
+const SYS_READ_NR: i64 = libc::SYS_read;
+#[cfg(not(target_os = "linux"))]
+const SYS_READ_NR: i64 = 0;
 
 /// Classify why a process is currently executing or waiting, based strictly on
 /// observed OS signals.
@@ -307,15 +314,25 @@ pub fn classify_wait_reason(input: &DiagnosisInput<'_>) -> Diagnosis {
         }
     }
 
-    // Fallback when wchan is restricted (e.g., Yama/hidepid) or generic poll
-    if input.syscall_nr == Some(0) && input.has_tty_fg {
+    // Fallback when wchan is restricted (e.g., Yama/hidepid): only classify as
+    // WaitingStdin if the syscall is `read`, the target FD is 0, FD 0 is a TTY,
+    // and the process belongs to the foreground process group.
+    if input.syscall_nr == Some(SYS_READ_NR)
+        && input.syscall_fd == Some(0)
+        && input.fd0_is_tty
+        && input.has_tty_fg
+    {
         return Diagnosis {
             reason: WaitReason::WaitingStdin,
-            summary: "Blocked in read(0) while holding foreground terminal".into(),
-            evidence: vec!["syscall = 0 (read)".into(), "fg_pgid = true".into()],
-            source: "procfs syscall".into(),
+            summary: "Blocked in read(0) on TTY while holding foreground terminal".into(),
+            evidence: vec![
+                format!("syscall = {SYS_READ_NR} (read)"),
+                "fd = 0 (tty)".into(),
+                "fg_pgid = true".into(),
+            ],
+            source: "procfs syscall + fd/0".into(),
             confidence: Confidence::Medium,
-            limitations: "FD 0 could be a pipe if redirected".into(),
+            limitations: "Process may also be polling other descriptors if multiplexed".into(),
             updated_at: now,
         };
     }
@@ -360,6 +377,8 @@ mod tests {
             cpu_percent: 92.0,
             wchan: None,
             syscall_nr: None,
+            syscall_fd: None,
+            fd0_is_tty: false,
             has_tty_fg: true,
             has_children: false,
             io_delta_bytes: 0,
@@ -373,7 +392,9 @@ mod tests {
             state: ProcessStateKind::Sleeping,
             cpu_percent: 0.0,
             wchan: Some("n_tty_read"),
-            syscall_nr: Some(0),
+            syscall_nr: Some(SYS_READ_NR),
+            syscall_fd: Some(0),
+            fd0_is_tty: true,
             has_tty_fg: true,
             has_children: false,
             io_delta_bytes: 0,
@@ -382,6 +403,39 @@ mod tests {
             seconds_since_output: 5.0,
         });
         assert_eq!(stdin.reason, WaitReason::WaitingStdin);
+
+        // Reading a file (fd=3) or a pipe (fd0_is_tty=false) must NOT be misclassified as WaitingStdin
+        let file_read = classify_wait_reason(&DiagnosisInput {
+            state: ProcessStateKind::Sleeping,
+            cpu_percent: 0.0,
+            wchan: None,
+            syscall_nr: Some(SYS_READ_NR),
+            syscall_fd: Some(3),
+            fd0_is_tty: true,
+            has_tty_fg: true,
+            has_children: false,
+            io_delta_bytes: 0,
+            net_sockets: 0,
+            file_lock: None,
+            seconds_since_output: 5.0,
+        });
+        assert_ne!(file_read.reason, WaitReason::WaitingStdin);
+
+        let pipe_read = classify_wait_reason(&DiagnosisInput {
+            state: ProcessStateKind::Sleeping,
+            cpu_percent: 0.0,
+            wchan: None,
+            syscall_nr: Some(SYS_READ_NR),
+            syscall_fd: Some(0),
+            fd0_is_tty: false,
+            has_tty_fg: true,
+            has_children: false,
+            io_delta_bytes: 0,
+            net_sockets: 0,
+            file_lock: None,
+            seconds_since_output: 5.0,
+        });
+        assert_ne!(pipe_read.reason, WaitReason::WaitingStdin);
 
         let lock_info = FileLockInfo {
             path_hint: "/tmp/target/.cargo-lock".into(),
@@ -394,6 +448,8 @@ mod tests {
             cpu_percent: 0.0,
             wchan: Some("flock_lock_inode_wait"),
             syscall_nr: None,
+            syscall_fd: None,
+            fd0_is_tty: false,
             has_tty_fg: true,
             has_children: false,
             io_delta_bytes: 0,

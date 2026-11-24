@@ -37,10 +37,13 @@ pub enum Capability {
     /// Control Beyrix Background Engine scenes, objects, and native data bindings.
     BackgroundControl,
     /// Read X-Ray process summary & wait-reason diagnostics.
+    #[serde(rename = "xray-read")]
     XRayRead,
     /// Read detailed X-Ray inspection data (open FDs, network sockets, locks). Sensitive!
+    #[serde(rename = "xray-inspect")]
     XRayInspect,
     /// Perform process control actions via X-Ray (pause/resume/signal/priority). Sensitive!
+    #[serde(rename = "xray-control")]
     XRayControl,
     /// Scoped key-value storage isolated to this extension's ID.
     Storage,
