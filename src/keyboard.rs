@@ -56,7 +56,57 @@ unsafe extern "C" {
     ) -> c_int;
     fn xkb_keymap_num_layouts(keymap: *mut c_void) -> u32;
     fn xkb_keymap_layout_get_name(keymap: *mut c_void, idx: u32) -> *const c_char;
+    fn xkb_keymap_key_repeats(keymap: *mut c_void, key: u32) -> c_int;
     fn xkb_state_layout_index_is_active(state: *mut c_void, idx: u32, kind: c_int) -> c_int;
+}
+
+/// Layout-independent Linux evdev keycode to ASCII control byte (`Ctrl+A..Z`,
+/// `Ctrl+Space`, `Ctrl+[`, `Ctrl+\`, `Ctrl+]`, `Ctrl+^`, `Ctrl+_`) used when
+/// a non-Latin XKB layout (e.g. Russian) is active so terminal control chords
+/// like `Ctrl+D`, `Ctrl+Z`, `Ctrl+S`, `Ctrl+Q`, `Ctrl+L` always work.
+fn evdev_ctrl_byte(evdev_key: u32) -> Option<u8> {
+    match evdev_key {
+        30 => Some(0x01), // A
+        48 => Some(0x02), // B
+        46 => Some(0x03), // C
+        32 => Some(0x04), // D
+        18 => Some(0x05), // E
+        33 => Some(0x06), // F
+        34 => Some(0x07), // G
+        35 => Some(0x08), // H
+        23 => Some(0x09), // I
+        36 => Some(0x0a), // J
+        37 => Some(0x0b), // K
+        38 => Some(0x0c), // L
+        50 => Some(0x0d), // M
+        49 => Some(0x0e), // N
+        24 => Some(0x0f), // O
+        25 => Some(0x10), // P
+        16 => Some(0x11), // Q
+        19 => Some(0x12), // R
+        31 => Some(0x13), // S
+        20 => Some(0x14), // T
+        22 => Some(0x15), // U
+        47 => Some(0x16), // V
+        17 => Some(0x17), // W
+        45 => Some(0x18), // X
+        21 => Some(0x19), // Y
+        44 => Some(0x1a), // Z
+        57 => Some(0x00), // Space -> NUL
+        26 => Some(0x1b), // [ -> ESC
+        43 => Some(0x1c), // \ -> FS
+        27 => Some(0x1d), // ] -> GS
+        7 => Some(0x1e),  // 6 / ^ -> RS
+        12 => Some(0x1f), // - / _ -> US
+        _ => None,
+    }
+}
+
+/// Xterm modifier parameter (`1 + shift + 2*alt + 4*ctrl`) when at least one
+/// modifier is active.
+fn xterm_modifier(shift: bool, alt: bool, ctrl: bool) -> Option<u8> {
+    let code = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(ctrl);
+    (code > 1).then_some(code)
 }
 
 /// Derive a compact 2-3 character layout code from an XKB layout name.
@@ -234,6 +284,13 @@ impl Keyboard {
     pub fn alt(&self) -> bool {
         self.modifier(c"Mod1")
     }
+    /// Whether this evdev keycode should autorepeat according to the active XKB keymap.
+    pub fn key_repeats(&self, key: u32) -> bool {
+        if self.keymap.is_null() {
+            return false;
+        }
+        unsafe { xkb_keymap_key_repeats(self.keymap, key + 8) > 0 }
+    }
     /// Keysym for the editor's key bindings.
     pub fn sym(&self, key: u32) -> u32 {
         if self.state.is_null() {
@@ -246,11 +303,11 @@ impl Keyboard {
         if self.state.is_null() {
             return Vec::new();
         }
-        let key = key + 8;
-        let sym = unsafe { xkb_state_key_get_one_sym(self.state, key) };
+        let xkb_key = key + 8;
+        let sym = unsafe { xkb_state_key_get_one_sym(self.state, xkb_key) };
         let mut buffer = [0i8; 64];
         unsafe {
-            xkb_state_key_get_utf8(self.state, key, buffer.as_mut_ptr(), buffer.len());
+            xkb_state_key_get_utf8(self.state, xkb_key, buffer.as_mut_ptr(), buffer.len());
         }
         let text = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_bytes();
         translate(sym, text)
@@ -259,23 +316,60 @@ impl Keyboard {
         if self.state.is_null() {
             return Vec::new();
         }
-        let key = key + 8;
-        let sym = unsafe { xkb_state_key_get_one_sym(self.state, key) };
+        let xkb_key = key + 8;
+        let sym = unsafe { xkb_state_key_get_one_sym(self.state, xkb_key) };
+        let ctrl = self.control();
+        let shift = self.shift();
+        let alt = self.alt();
+        let super_mod = self.modifier(c"Mod4") || self.modifier(c"Mod5");
+
+        // Preserve existing Ctrl+Backspace/Delete/Left/Right editing semantics.
         if let Some(sequence) = ctrl_edit_sequence(sym)
-            && self.control()
-            && !self.shift()
-            && !self.modifier(c"Mod1")
-            && !self.modifier(c"Mod4")
-            && !self.modifier(c"Mod5")
+            && ctrl
+            && !shift
+            && !alt
+            && !super_mod
         {
             return sequence.to_vec();
         }
+
+        // Preserve Shift+Ctrl+Backspace/Delete/Left/Right falling back to plain
+        // only when specifically expected by existing tests; Wait: let's handle
+        // modified navigation/function keys cleanly!
+        if !super_mod && let Some(seq) = translate_modified_special(sym, shift, alt, ctrl) {
+            return seq;
+        }
+
         let mut buffer = [0i8; 64];
         unsafe {
-            xkb_state_key_get_utf8(self.state, key, buffer.as_mut_ptr(), buffer.len());
+            xkb_state_key_get_utf8(self.state, xkb_key, buffer.as_mut_ptr(), buffer.len());
         }
         let text = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_bytes();
-        translate(sym, text)
+
+        // Ctrl+A..Z / Ctrl+Space / Ctrl+[\]^_ fallback for non-Latin layouts (e.g. Russian)
+        // when XKB did not produce an ASCII control character.
+        if ctrl && !super_mod {
+            let has_ascii_ctrl = text.len() == 1 && text[0] < 0x20;
+            if !has_ascii_ctrl && let Some(ctrl_byte) = evdev_ctrl_byte(key) {
+                return if alt {
+                    vec![0x1b, ctrl_byte]
+                } else {
+                    vec![ctrl_byte]
+                };
+            }
+        }
+
+        let mut out = translate(sym, text);
+
+        // Alt+key sends ESC prefix for Meta bindings in Bash/Readline/Vim/tmux
+        // (e.g. Alt+b, Alt+f, Alt+d, Alt+Backspace, Alt+.).
+        if alt && !super_mod && !out.is_empty() && out[0] != 0x1b {
+            let mut prefixed = Vec::with_capacity(out.len() + 1);
+            prefixed.push(0x1b);
+            prefixed.extend_from_slice(&out);
+            out = prefixed;
+        }
+        out
     }
 }
 impl Drop for Keyboard {
@@ -291,17 +385,62 @@ impl Drop for Keyboard {
         }
     }
 }
+fn translate_modified_special(sym: u32, shift: bool, alt: bool, ctrl: bool) -> Option<Vec<u8>> {
+    // Shift+Tab -> BackTab (CSI Z)
+    if sym == 0xfe20 || (sym == 0xff09 && shift && !ctrl && !alt) {
+        return Some(b"\x1b[Z".to_vec());
+    }
+    // Keep existing Ctrl+Shift+Backspace/Delete/Left/Right untouched when both
+    // Ctrl and Shift are held on those 4 keys? Wait: in standard xterm,
+    // Ctrl+Shift+Left is CSI 1;6D, whereas our existing test checks
+    // ctrl_edit_keys_use_xkb_in_english_and_russian line 351:
+    // `keyboard.modifiers((1 << 2) | 1, 0, 0, group); assert_eq!(keyboard.key(key), plain);`
+    // Preserve that exact existing contract for Ctrl+Shift on those 4 keys!
+    if ctrl && shift && !alt && ctrl_edit_sequence(sym).is_some() {
+        return None;
+    }
+    let m = xterm_modifier(shift, alt, ctrl)?;
+    match sym {
+        // Arrows
+        0xff52 => Some(format!("\x1b[1;{m}A").into_bytes()),
+        0xff54 => Some(format!("\x1b[1;{m}B").into_bytes()),
+        XKB_KEY_RIGHT => Some(format!("\x1b[1;{m}C").into_bytes()),
+        XKB_KEY_LEFT => Some(format!("\x1b[1;{m}D").into_bytes()),
+        // Home / End
+        0xff50 => Some(format!("\x1b[1;{m}H").into_bytes()),
+        0xff57 => Some(format!("\x1b[1;{m}F").into_bytes()),
+        // Delete / PageUp / PageDown / Insert
+        XKB_KEY_DELETE => Some(format!("\x1b[3;{m}~").into_bytes()),
+        0xff55 => Some(format!("\x1b[5;{m}~").into_bytes()),
+        0xff56 => Some(format!("\x1b[6;{m}~").into_bytes()),
+        0xff63 => Some(format!("\x1b[2;{m}~").into_bytes()),
+        // F1-F4
+        0xffbe..=0xffc1 => {
+            let suffix = (b'P' + (sym - 0xffbe) as u8) as char;
+            Some(format!("\x1b[1;{m}{suffix}").into_bytes())
+        }
+        // F5-F12
+        0xffc2..=0xffc9 => {
+            let codes = [15, 17, 18, 19, 20, 21, 23, 24];
+            Some(format!("\x1b[{};{m}~", codes[(sym - 0xffc2) as usize]).into_bytes())
+        }
+        _ => None,
+    }
+}
+
 fn translate(sym: u32, text: &[u8]) -> Vec<u8> {
     match sym {
         0xff0d | 0xff8d => b"\r".to_vec(),
         XKB_KEY_BACKSPACE => vec![0x7f],
-        0xff09 | 0xfe20 => vec![9],
+        0xff09 => vec![9],
+        0xfe20 => b"\x1b[Z".to_vec(),
         0xff1b => vec![27],
         0xff50 => b"\x1b[H".to_vec(),
         0xff57 => b"\x1b[F".to_vec(),
         XKB_KEY_DELETE => b"\x1b[3~".to_vec(),
         0xff55 => b"\x1b[5~".to_vec(),
         0xff56 => b"\x1b[6~".to_vec(),
+        0xff63 => b"\x1b[2~".to_vec(),
         0xffbe..=0xffc1 => vec![27, b'O', b'P' + (sym - 0xffbe) as u8],
         0xffc2..=0xffc9 => {
             let codes = [15, 17, 18, 19, 20, 21, 23, 24];
@@ -423,5 +562,51 @@ mod tests {
         let ev0 = keyboard.layout_event().unwrap();
         assert_eq!(ev0.active_index, 0);
         assert_eq!(ev0.short_name, "EN");
+    }
+
+    #[test]
+    fn full_keyboard_audit_ctrl_alt_shift_and_russian_layout() {
+        use std::io::Write;
+        let map = br#"xkb_keymap {
+            xkb_keycodes { include "evdev+aliases(qwerty)" };
+            xkb_types { include "complete" };
+            xkb_compatibility { include "complete" };
+            xkb_symbols { include "pc+us+ru:2" };
+        };"#;
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(map).unwrap();
+        let mut kb = super::Keyboard::new().unwrap();
+        kb.keymap(file.into(), map.len() as u32).unwrap();
+
+        // Key repeat metadata: Backspace/Delete/arrows/letters repeat; LeftShift (42) does not.
+        assert!(kb.key_repeats(14)); // Backspace
+        assert!(kb.key_repeats(111)); // Delete
+        assert!(kb.key_repeats(105)); // Left
+        assert!(kb.key_repeats(30)); // A
+        assert!(!kb.key_repeats(42)); // Left Shift
+
+        // Ctrl+D, Ctrl+Z, Ctrl+S, Ctrl+Q, Ctrl+A work in BOTH English (group 0) and Russian (group 1).
+        for group in [0, 1] {
+            kb.modifiers(1 << 2, 0, 0, group);
+            assert_eq!(kb.key(30), b"\x01", "Ctrl+A group={group}");
+            assert_eq!(kb.key(32), b"\x04", "Ctrl+D group={group}");
+            assert_eq!(kb.key(44), b"\x1a", "Ctrl+Z group={group}");
+            assert_eq!(kb.key(31), b"\x13", "Ctrl+S group={group}");
+            assert_eq!(kb.key(16), b"\x11", "Ctrl+Q group={group}");
+        }
+
+        // Shift+Arrows send CSI 1;2A/B/C/D; Shift+Tab sends CSI Z.
+        kb.modifiers(1, 0, 0, 0);
+        assert_eq!(kb.key(103), b"\x1b[1;2A");
+        assert_eq!(kb.key(108), b"\x1b[1;2B");
+        assert_eq!(kb.key(106), b"\x1b[1;2C");
+        assert_eq!(kb.key(105), b"\x1b[1;2D");
+        assert_eq!(kb.key(15), b"\x1b[Z");
+
+        // Alt+b / Alt+f / Alt+Backspace send ESC-prefixed sequences.
+        kb.modifiers(1 << 3, 0, 0, 0);
+        assert_eq!(kb.key(48), b"\x1bb");
+        assert_eq!(kb.key(33), b"\x1bf");
+        assert_eq!(kb.key(14), b"\x1b\x7f");
     }
 }

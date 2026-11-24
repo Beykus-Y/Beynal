@@ -17,10 +17,143 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct PlatformConfig {
+    pub keyboard: KeyboardConfig,
     pub widgets: WidgetsConfig,
     pub background: BackgroundConfig,
     pub media: MediaConfig,
     pub xray: XRayConfig,
+}
+
+/// Policy for plain `Ctrl+V` in the terminal (outside BEdit).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CtrlVPolicy {
+    /// Paste in normal shell when clipboard text is available; forward literal
+    /// `0x16` in fullscreen TUI apps or when clipboard has no text offer.
+    #[default]
+    Smart,
+    /// Always trigger clipboard paste on `Ctrl+V`.
+    AlwaysPaste,
+    /// Always send literal `0x16` on `Ctrl+V` (use `Ctrl+Shift+V` to paste).
+    AlwaysLiteral,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct KeyboardConfig {
+    /// Clear terminal selection after copying with `Ctrl+C` so a subsequent
+    /// `Ctrl+C` immediately sends `0x03` to the PTY.
+    pub clear_selection_after_copy: bool,
+    /// Routing policy for plain `Ctrl+V`.
+    pub ctrl_v_policy: CtrlVPolicy,
+    /// Guard against accidental multiline command execution when bracketed
+    /// paste mode is inactive (requires confirming paste within 3 seconds).
+    pub multiline_paste_protection: bool,
+    /// Guaranteed hotkey that always sends literal `0x03` (Ctrl+C) to PTY.
+    pub force_ctrl_c_hotkey: String,
+    /// Guaranteed hotkey that always sends literal `0x16` (Ctrl+V) to PTY.
+    pub literal_ctrl_v_hotkey: String,
+    /// Hotkey to open the unified Beyrix Settings overlay.
+    pub settings_hotkey: String,
+}
+
+impl Default for KeyboardConfig {
+    fn default() -> Self {
+        Self {
+            clear_selection_after_copy: true,
+            ctrl_v_policy: CtrlVPolicy::Smart,
+            multiline_paste_protection: true,
+            force_ctrl_c_hotkey: "Ctrl+Alt+C".to_string(),
+            literal_ctrl_v_hotkey: "Ctrl+Alt+V".to_string(),
+            settings_hotkey: "Ctrl+,".to_string(),
+        }
+    }
+}
+
+/// Parsed keyboard shortcut matcher (layout-independent evdev keycode).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hotkey {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub evdev_key: u32,
+}
+
+impl Hotkey {
+    /// Parse a human-readable hotkey like `"Ctrl+Shift+E"`, `"Ctrl+Alt+C"`, `"Ctrl+,"`.
+    pub fn parse(spec: &str) -> Option<Self> {
+        let mut ctrl = false;
+        let mut shift = false;
+        let mut alt = false;
+        let mut key_token: Option<&str> = None;
+        for part in spec.split('+').map(str::trim).filter(|s| !s.is_empty()) {
+            match part.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => ctrl = true,
+                "shift" => shift = true,
+                "alt" | "meta" => alt = true,
+                _ => key_token = Some(part),
+            }
+        }
+        let evdev_key = parse_evdev_key(key_token?)?;
+        Some(Self {
+            ctrl,
+            shift,
+            alt,
+            evdev_key,
+        })
+    }
+
+    pub fn matches(self, ctrl: bool, shift: bool, alt: bool, evdev_key: u32) -> bool {
+        self.ctrl == ctrl && self.shift == shift && self.alt == alt && self.evdev_key == evdev_key
+    }
+}
+
+fn parse_evdev_key(tok: &str) -> Option<u32> {
+    match tok.to_ascii_lowercase().as_str() {
+        "a" => Some(30),
+        "b" => Some(48),
+        "c" => Some(46),
+        "d" => Some(32),
+        "e" => Some(18),
+        "f" => Some(33),
+        "g" => Some(34),
+        "h" => Some(35),
+        "i" => Some(23),
+        "j" => Some(36),
+        "k" => Some(37),
+        "l" => Some(38),
+        "m" => Some(50),
+        "n" => Some(49),
+        "o" => Some(24),
+        "p" => Some(25),
+        "q" => Some(16),
+        "r" => Some(19),
+        "s" => Some(31),
+        "t" => Some(20),
+        "u" => Some(22),
+        "v" => Some(47),
+        "w" => Some(17),
+        "x" => Some(45),
+        "y" => Some(21),
+        "z" => Some(44),
+        "," | "comma" => Some(51),
+        "." | "period" => Some(52),
+        "/" | "slash" => Some(53),
+        ";" | "semicolon" => Some(39),
+        "f1" => Some(59),
+        "f2" => Some(60),
+        "f3" => Some(61),
+        "f4" => Some(62),
+        "f5" => Some(63),
+        "f6" => Some(64),
+        "f7" => Some(65),
+        "f8" => Some(66),
+        "f9" => Some(67),
+        "f10" => Some(68),
+        "f11" => Some(87),
+        "f12" => Some(88),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

@@ -183,10 +183,35 @@ fn paste_bytes(bytes: &[u8], bracketed: bool) -> Vec<u8> {
         return Vec::new();
     }
     if bracketed {
-        [b"\x1b[200~".as_slice(), bytes, b"\x1b[201~".as_slice()].concat()
+        // Strip embedded bracketed-paste end/start markers to prevent escape
+        // breakout attacks when pasting untrusted text.
+        let mut clean = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i..].starts_with(b"\x1b[200~") || bytes[i..].starts_with(b"\x1b[201~") {
+                i += 6;
+            } else {
+                clean.push(bytes[i]);
+                i += 1;
+            }
+        }
+        [b"\x1b[200~".as_slice(), &clean, b"\x1b[201~".as_slice()].concat()
     } else {
         bytes.to_vec()
     }
+}
+
+#[derive(Clone, Debug)]
+struct RepeatKey {
+    key: u32,
+    serial: u32,
+    next_fire: std::time::Instant,
+}
+
+#[derive(Clone, Debug)]
+struct PendingMultilinePaste {
+    bytes: Vec<u8>,
+    expires_at: std::time::Instant,
 }
 fn wheel_rows(remainder: f64, steps: f64, speed: usize) -> (isize, f64) {
     let total = remainder - steps * speed as f64;
@@ -245,6 +270,12 @@ struct State {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     xkb: Option<crate::keyboard::Keyboard>,
     keyboard_focus: bool,
+    repeat_rate: i32,
+    repeat_delay: i32,
+    repeat_key: Option<RepeatKey>,
+    pending_multiline_paste: Option<PendingMultilinePaste>,
+    #[cfg(test)]
+    test_clipboard: Option<String>,
     blink_epoch: Option<std::time::Instant>,
     blink_on: bool,
     pointer: Option<wl_pointer::WlPointer>,
@@ -298,6 +329,7 @@ struct State {
     pty: Option<Pty>,
 
     bus: crate::events::EventBus,
+    platform_config: crate::config::PlatformConfig,
     widgets: Option<crate::widgets::WidgetManager>,
     media: Option<crate::media::MediaManager>,
     background: Option<crate::background::BackgroundEngine>,
@@ -328,6 +360,8 @@ fn run_with(editor: Option<BEdit>) -> Result<(), Box<dyn Error>> {
         standalone_editor: editor.is_some(),
         editor,
         control: Some(crate::control::Control::new().map_err(|e| format!("control socket: {e}"))?),
+        repeat_rate: 25,
+        repeat_delay: 400,
         blink_epoch: Some(std::time::Instant::now()),
         blink_on: true,
         width: WIDTH,
@@ -416,6 +450,7 @@ fn run_with(editor: Option<BEdit>) -> Result<(), Box<dyn Error>> {
             state.damage_full = true;
             state.dirty = true;
         }
+        state.pump_key_repeat(Some(&qh));
         state.pump_clipboard();
         let size = state.pending_size.take();
         let scale = state.pending_scale.take();
@@ -478,7 +513,8 @@ fn run_with(editor: Option<BEdit>) -> Result<(), Box<dyn Error>> {
             },
             revents: 0,
         }));
-        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 50) };
+        let poll_timeout_ms = state.next_poll_timeout_ms();
+        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, poll_timeout_ms) };
         if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -1393,17 +1429,19 @@ impl State {
             self.drag_scroll_at = None;
             return;
         }
-        let (Some(renderer), Some(terminal)) = (&self.renderer, &mut self.terminal) else {
+        let Some(geometry) = self.pointer_geometry() else {
             return;
         };
-        if !self.selection.active(terminal.screen()) {
+        let Some(terminal) = &mut self.terminal else {
+            return;
+        };
+        if !self.selection.drag_valid(terminal.screen()) {
             self.selection.clear();
             self.drag_scroll_at = None;
             self.dirty = true;
             return;
         }
-        let geometry = sizes.geometry(renderer);
-        let top = geometry.padding as f64;
+        let top = geometry.origin_y() as f64;
         let bottom = top + (terminal.screen().rows * geometry.cell_height) as f64;
         let (direction, distance) = if y < top {
             (1, top - y)
@@ -1426,9 +1464,11 @@ impl State {
             self.dirty |= terminal.screen_mut().scroll_view(direction * rows);
         }
         let screen = terminal.screen();
-        self.dirty |= self
-            .selection
-            .motion(screen, crate::selection::position(geometry, x, y, screen));
+        self.dirty |= self.selection.motion_at(
+            screen,
+            crate::selection::position(geometry, x, y, screen),
+            Some(self.pointer_position),
+        );
     }
 
     fn setup_data_device(&mut self, qh: &QueueHandle<Self>) {
@@ -1457,21 +1497,77 @@ impl State {
             self.dirty = true;
         }
     }
-    fn copy(&mut self, serial: u32, qh: &QueueHandle<Self>) {
+    fn has_clipboard_text_offer(&self) -> bool {
+        #[cfg(test)]
+        if self
+            .test_clipboard
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+        {
+            return true;
+        }
+        let Some(offer) = &self.data_offer else {
+            return false;
+        };
+        let Some(mimes) = offer.data::<Mutex<Vec<String>>>() else {
+            return false;
+        };
+        let mimes = mimes.lock().unwrap_or_else(|e| e.into_inner());
+        [
+            "text/plain;charset=utf-8",
+            "text/plain;charset=UTF-8",
+            "UTF8_STRING",
+            "text/plain",
+        ]
+        .into_iter()
+        .any(|m| mimes.iter().any(|v| v == m))
+    }
+
+    fn copy(&mut self, serial: u32, qh: Option<&QueueHandle<Self>>) -> bool {
         let text = if let Some(editor) = &self.editor {
             editor.selection_text()
         } else {
             self.terminal
                 .as_ref()
                 .and_then(|t| self.selection.text(t.screen()))
+                .filter(|t| !t.is_empty())
         };
         if let Some(text) = text {
-            self.set_clipboard(text, serial, qh);
+            #[cfg(test)]
+            {
+                self.test_clipboard = Some(text.clone());
+            }
+            if let Some(qh) = qh {
+                self.set_clipboard(text, serial, qh);
+            }
+            true
+        } else {
+            false
         }
     }
+
     fn paste(&mut self) {
         if self.debug_input {
             eprintln!("[clipboard] paste requested");
+        }
+        // If a multiline unbracketed paste was guarded and the user presses
+        // paste a second time within 3 seconds, confirm and deliver it.
+        if let Some(pending) = self.pending_multiline_paste.take()
+            && std::time::Instant::now() <= pending.expires_at
+        {
+            self.input.extend(pending.bytes);
+            return;
+        }
+        #[cfg(test)]
+        if self.data_offer.is_none()
+            && let Some(text) = self.test_clipboard.clone()
+        {
+            let bracketed = self
+                .terminal
+                .as_ref()
+                .is_some_and(|t| t.screen().bracketed_paste);
+            self.deliver_terminal_paste(text.as_bytes(), bracketed);
+            return;
         }
         let Some(offer) = &self.data_offer else {
             return;
@@ -1580,8 +1676,10 @@ impl State {
                                     }
                                 }
                                 Destination::Terminal => {
-                                    let bytes = paste_bytes(&transfer.bytes, transfer.bracketed);
-                                    self.input.extend(bytes);
+                                    self.deliver_terminal_paste(
+                                        &transfer.bytes,
+                                        transfer.bracketed,
+                                    );
                                 }
                             }
                         }
@@ -1593,6 +1691,210 @@ impl State {
             }
         }
     }
+    fn deliver_terminal_paste(&mut self, raw: &[u8], bracketed: bool) {
+        if raw.is_empty() {
+            return;
+        }
+        if !bracketed
+            && self.platform_config.keyboard.multiline_paste_protection
+            && (raw.contains(&b'\n') || raw.contains(&b'\r'))
+        {
+            // Protect against accidental multiline command execution when the
+            // shell/app does not have bracketed paste enabled. A second paste
+            // within 3 seconds confirms and sends the payload.
+            self.pending_multiline_paste = Some(PendingMultilinePaste {
+                bytes: paste_bytes(raw, false),
+                expires_at: std::time::Instant::now() + Duration::from_secs(3),
+            });
+            return;
+        }
+        let bytes = paste_bytes(raw, bracketed);
+        self.input.extend(bytes);
+    }
+
+    fn next_poll_timeout_ms(&self) -> i32 {
+        let mut timeout = 50i32;
+        if let Some(rep) = &self.repeat_key {
+            let now = std::time::Instant::now();
+            if rep.next_fire <= now {
+                return 0;
+            }
+            let rem = rep.next_fire.duration_since(now).as_millis().min(50) as i32;
+            timeout = timeout.min(rem.max(1));
+        }
+        timeout
+    }
+
+    fn pump_key_repeat(&mut self, qh: Option<&QueueHandle<Self>>) {
+        if !self.keyboard_focus || self.repeat_rate <= 0 {
+            self.repeat_key = None;
+            return;
+        }
+        let interval = Duration::from_micros((1_000_000 / self.repeat_rate.max(1) as u64).max(1));
+        let now = std::time::Instant::now();
+        // Cap burst repeats per event-loop turn to keep UI responsive.
+        for _ in 0..8 {
+            let Some(rep) = self.repeat_key.as_ref() else {
+                break;
+            };
+            if now < rep.next_fire {
+                break;
+            }
+            let (key, serial) = (rep.key, rep.serial);
+            if let Some(rep_mut) = self.repeat_key.as_mut() {
+                rep_mut.next_fire += interval;
+                if rep_mut.next_fire + interval * 4 < now {
+                    rep_mut.next_fire = now + interval;
+                }
+            }
+            if self.editor.is_some() {
+                if let Some(qh) = qh {
+                    self.editor_key(key, serial, qh);
+                }
+            } else {
+                self.dispatch_terminal_key_press(key, serial, qh);
+            }
+        }
+    }
+
+    /// Route a terminal key press (from live Wayland or E2E input tests) through
+    /// configurable hotkeys, Smart Ctrl+C / Ctrl+V, scrollback, and XKB translation.
+    /// Returns `true` if the key is eligible for Wayland autorepeat.
+    fn dispatch_terminal_key_press(
+        &mut self,
+        key: u32,
+        serial: u32,
+        qh: Option<&QueueHandle<Self>>,
+    ) -> bool {
+        let Some((ctrl, shift, alt)) = self.xkb.as_ref().map(|x| (x.control(), x.shift(), x.alt()))
+        else {
+            return false;
+        };
+
+        // Shift + Home / End / PageUp / PageDown -> scrollback navigation.
+        if shift && !ctrl && !alt && matches!(key, 102 | 107 | 104 | 109) {
+            if let Some(t) = &mut self.terminal {
+                let rows = t.screen().rows as isize;
+                let delta = match key {
+                    104 => rows,
+                    109 => -rows,
+                    102 => isize::MAX,
+                    _ => isize::MIN,
+                };
+                self.dirty |= t.screen_mut().scroll_view(delta);
+            }
+            return true;
+        }
+
+        // Visual Layout Editor hotkey — ONLY intercept when Widgets subsystem is enabled!
+        if self.widgets.is_some()
+            && crate::config::Hotkey::parse(&self.platform_config.widgets.editor_hotkey)
+                .is_some_and(|hk| hk.matches(ctrl, shift, alt, key))
+        {
+            if let Some(w) = &mut self.widgets {
+                w.editor.toggle();
+                self.platform_dirty = true;
+                self.dirty = true;
+            }
+            return false;
+        }
+
+        // X-Ray panel hotkey — ONLY intercept when X-Ray subsystem is enabled!
+        if self.xray.is_some()
+            && crate::config::Hotkey::parse(&self.platform_config.xray.hotkey)
+                .is_some_and(|hk| hk.matches(ctrl, shift, alt, key))
+        {
+            if let Some(xray) = &mut self.xray {
+                xray.toggle_panel();
+                self.platform_dirty = true;
+                self.dirty = true;
+            }
+            return false;
+        }
+
+        // Guaranteed literal Ctrl+C hotkey (always sends 0x03 regardless of selection).
+        if crate::config::Hotkey::parse(&self.platform_config.keyboard.force_ctrl_c_hotkey)
+            .is_some_and(|hk| hk.matches(ctrl, shift, alt, key))
+        {
+            self.input.push_back(0x03);
+            return false;
+        }
+
+        // Guaranteed literal Ctrl+V hotkey (always sends 0x16 regardless of clipboard/TUI).
+        if crate::config::Hotkey::parse(&self.platform_config.keyboard.literal_ctrl_v_hotkey)
+            .is_some_and(|hk| hk.matches(ctrl, shift, alt, key))
+        {
+            self.input.push_back(0x16);
+            return false;
+        }
+
+        // Ctrl+Shift+C (guaranteed copy) & Smart Ctrl+C (copy if intentional
+        // non-empty selection exists, otherwise forward 0x03 to PTY).
+        if ctrl && !alt && key == 46 {
+            if shift {
+                if self
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|t| self.selection.has_copyable_text(t.screen()))
+                {
+                    let copied = self.copy(serial, qh);
+                    if copied && self.platform_config.keyboard.clear_selection_after_copy {
+                        self.selection.clear();
+                        self.dirty = true;
+                    }
+                }
+                return false;
+            }
+            if self
+                .terminal
+                .as_ref()
+                .is_some_and(|t| self.selection.has_copyable_text(t.screen()))
+            {
+                let copied = self.copy(serial, qh);
+                if copied && self.platform_config.keyboard.clear_selection_after_copy {
+                    self.selection.clear();
+                    self.dirty = true;
+                }
+            } else {
+                self.input.push_back(0x03);
+            }
+            return false;
+        }
+
+        // Ctrl+Shift+V (guaranteed paste) & Smart Ctrl+V.
+        if ctrl && !alt && key == 47 {
+            if shift {
+                self.paste();
+                return false;
+            }
+            match self.platform_config.keyboard.ctrl_v_policy {
+                crate::config::CtrlVPolicy::AlwaysPaste => self.paste(),
+                crate::config::CtrlVPolicy::AlwaysLiteral => self.input.push_back(0x16),
+                crate::config::CtrlVPolicy::Smart => {
+                    if self.in_tui_mode() || !self.has_clipboard_text_offer() {
+                        self.input.push_back(0x16);
+                    } else {
+                        self.paste();
+                    }
+                }
+            }
+            return false;
+        }
+
+        let bytes = self.xkb.as_ref().map_or_else(Vec::new, |x| x.key(key));
+        if !bytes.is_empty()
+            && let Some(t) = &mut self.terminal
+        {
+            self.dirty |= t.screen().view_offset() > 0;
+            t.screen_mut().reset_view();
+        }
+        if self.debug_input {
+            eprintln!("[input] translated {} bytes", bytes.len());
+        }
+        self.input.extend(bytes);
+        true
+    }
+
     fn write_input(&mut self) -> Result<(), Box<dyn Error>> {
         if let Some(pty) = &self.pty {
             let bytes = self.input.make_contiguous();
@@ -2116,6 +2418,7 @@ impl State {
 
     fn init_platform_subsystems(&mut self, child_pid: libc::pid_t, pty_master_fd: i32) {
         let cfg = load_platform_config();
+        self.platform_config = cfg.clone();
         let theme = self
             .terminal
             .as_ref()
@@ -2712,6 +3015,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
                     eprintln!("[input] keyboard capability removed");
                 }
                 state.keyboard_focus = false;
+                state.repeat_key = None;
                 state.xkb = None;
             }
         }
@@ -2856,9 +3160,20 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
             }
             wl_keyboard::Event::Leave { .. } => {
                 state.keyboard_focus = false;
+                state.repeat_key = None;
                 state.dirty = true;
                 if state.debug_input {
                     eprintln!("[input] keyboard leave");
+                }
+            }
+            wl_keyboard::Event::RepeatInfo { rate, delay } => {
+                state.repeat_rate = rate.max(0);
+                state.repeat_delay = delay.max(0);
+                if state.repeat_rate == 0 {
+                    state.repeat_key = None;
+                }
+                if state.debug_input {
+                    eprintln!("[input] repeat_info rate={rate} delay={delay}");
                 }
             }
             wl_keyboard::Event::Modifiers {
@@ -2901,68 +3216,35 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                         state.xkb.is_some()
                     );
                 }
+                if key_state == wayland_client::WEnum::Value(wl_keyboard::KeyState::Released) {
+                    if state.repeat_key.as_ref().is_some_and(|r| r.key == key) {
+                        state.repeat_key = None;
+                    }
+                    return;
+                }
                 if state.keyboard_focus
                     && key_state == wayland_client::WEnum::Value(wl_keyboard::KeyState::Pressed)
-                    && let Some(x) = &state.xkb
+                    && state.xkb.is_some()
                 {
-                    if state.editor.is_some() {
+                    let should_repeat = if state.editor.is_some() {
                         state.editor_key(key, serial, qh);
-                        return;
-                    }
-                    if x.shift() && !x.control() && matches!(key, 102 | 107 | 104 | 109) {
-                        if let Some(t) = &mut state.terminal {
-                            let rows = t.screen().rows as isize;
-                            let delta = match key {
-                                104 => rows,
-                                109 => -rows,
-                                102 => isize::MAX,
-                                _ => isize::MIN,
-                            };
-                            state.dirty |= t.screen_mut().scroll_view(delta);
-                        }
-                        return;
-                    }
-                    if x.control() && x.shift() && key == 18 {
-                        if let Some(w) = &mut state.widgets {
-                            w.editor.toggle();
-                            state.dirty = true;
-                        }
-                        return;
-                    }
-                    if x.control() && x.shift() && key == 45 {
-                        if let Some(xray) = &mut state.xray {
-                            xray.toggle_panel();
-                            state.dirty = true;
-                        }
-                        return;
-                    }
-                    if x.control() && key == 46 {
-                        if state
-                            .terminal
-                            .as_ref()
-                            .is_some_and(|t| state.selection.active(t.screen()))
-                        {
-                            state.copy(serial, qh);
-                        } else if !x.shift() {
-                            state.input.push_back(3);
-                        }
-                        return;
-                    }
-                    if x.control() && key == 47 {
-                        state.paste();
-                        return;
-                    }
-                    let bytes = x.key(key);
-                    if !bytes.is_empty()
-                        && let Some(t) = &mut state.terminal
+                        true
+                    } else {
+                        state.dispatch_terminal_key_press(key, serial, Some(qh))
+                    };
+                    if should_repeat
+                        && state.repeat_rate > 0
+                        && state.xkb.as_ref().is_some_and(|x| x.key_repeats(key))
                     {
-                        state.dirty |= t.screen().view_offset() > 0;
-                        t.screen_mut().reset_view();
+                        state.repeat_key = Some(RepeatKey {
+                            key,
+                            serial,
+                            next_fire: std::time::Instant::now()
+                                + Duration::from_millis(state.repeat_delay.max(0) as u64),
+                        });
+                    } else {
+                        state.repeat_key = None;
                     }
-                    if state.debug_input {
-                        eprintln!("[input] translated {} bytes", bytes.len());
-                    }
-                    state.input.extend(bytes);
                 }
             }
             wl_keyboard::Event::Keymap { format, .. } => {
@@ -4083,6 +4365,261 @@ mod input_tests {
         let mut received = vec![0; input.len()];
         File::from(slave).read_exact(&mut received).unwrap();
         assert_eq!(received, input);
+    }
+
+    fn make_test_xkb() -> crate::keyboard::Keyboard {
+        let map = br#"xkb_keymap {
+            xkb_keycodes { include "evdev+aliases(qwerty)" };
+            xkb_types { include "complete" };
+            xkb_compatibility { include "complete" };
+            xkb_symbols { include "pc+us+ru:2" };
+        };"#;
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(map).unwrap();
+        let mut kb = crate::keyboard::Keyboard::new().unwrap();
+        kb.keymap(file.into(), map.len() as u32).unwrap();
+        kb
+    }
+
+    #[test]
+    fn e2e_ctrl_c_after_empty_click_interrupts_cat_and_sleep_copy_then_interrupt() {
+        let pty = Pty::spawn_with_size(Some((80, 24))).unwrap();
+        set_nonblocking(&pty.master).unwrap();
+        let mut state = State {
+            pty: Some(pty),
+            terminal: Some(Terminal::new(80, 24)),
+            renderer: Some(render::Renderer::new().unwrap()),
+            xkb: Some(make_test_xkb()),
+            keyboard_focus: true,
+            pointer_focus: true,
+            width: 800,
+            height: 500,
+            ..Default::default()
+        };
+
+        let wait_for = |state: &mut State, marker: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                state.read_pty().unwrap();
+                let screen = state.terminal.as_ref().unwrap().screen();
+                if (0..screen.rows).any(|row| screen.line(row).contains(marker)) {
+                    return;
+                }
+                assert!(
+                    state.pty.is_some() && std::time::Instant::now() < deadline,
+                    "timed out waiting for {marker}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        // 1. Start `cat`, click an empty cell, press real XKB Ctrl+C -> must interrupt `cat`!
+        state
+            .input
+            .extend(b"printf 'CAT_%s\\n' START; (cat); printf 'CAT_%s\\n' DONE\n");
+        state.write_input().unwrap();
+        wait_for(&mut state, "CAT_START");
+
+        // Single click on an empty cell near the bottom right.
+        state.pointer_position = (600.0, 400.0);
+        state.pointer_button(crate::mouse::Button::Left, true, 100);
+        state.pointer_button(crate::mouse::Button::Left, false, 120);
+        assert!(
+            !state
+                .selection
+                .has_copyable_text(state.terminal.as_ref().unwrap().screen())
+        );
+
+        // Press real XKB Ctrl+C (evdev 46 with Control mask 1<<2).
+        state.xkb.as_mut().unwrap().modifiers(1 << 2, 0, 0, 0);
+        state.dispatch_terminal_key_press(46, 1, None);
+        state.write_input().unwrap();
+        // Wait for bash prompt to return (sending a marker command confirms cat exited).
+        std::thread::sleep(Duration::from_millis(80));
+        state.input.extend(b"printf 'CAT_%s\\n' AFTER\n");
+        state.write_input().unwrap();
+        wait_for(&mut state, "CAT_AFTER");
+
+        // 2. Start `sleep 30`, drag-select "SLEEP_TOKEN", press Ctrl+C -> copies & clears;
+        //    press Ctrl+C a second time -> interrupts sleep!
+        state
+            .input
+            .extend(b"printf 'SLEEP_%s\\n' TOKEN; sleep 30\n");
+        state.write_input().unwrap();
+        wait_for(&mut state, "SLEEP_TOKEN");
+
+        let token_row = {
+            let screen = state.terminal.as_ref().unwrap().screen();
+            (0..screen.rows)
+                .find(|&r| screen.line(r).trim_end() == "SLEEP_TOKEN")
+                .unwrap()
+        };
+        {
+            let screen = state.terminal.as_ref().unwrap().screen();
+            let abs = screen.display_row(token_row).unwrap();
+            state.selection.press(
+                screen,
+                crate::selection::Position { row: abs, col: 0 },
+                200,
+                10.0,
+                10.0,
+            );
+            state.selection.motion_at(
+                screen,
+                crate::selection::Position { row: abs, col: 10 },
+                Some((100.0, 10.0)),
+            );
+            state.selection.release();
+        }
+
+        // First Ctrl+C copies "SLEEP_TOKEN" and clears selection.
+        state.xkb.as_mut().unwrap().modifiers(1 << 2, 0, 0, 0);
+        state.dispatch_terminal_key_press(46, 2, None);
+        assert_eq!(state.test_clipboard.as_deref(), Some("SLEEP_TOKEN"));
+        assert!(
+            !state
+                .selection
+                .active(state.terminal.as_ref().unwrap().screen())
+        );
+        assert!(state.input.is_empty());
+
+        // Second Ctrl+C sends 0x03 to PTY and interrupts `sleep 30`!
+        state.dispatch_terminal_key_press(46, 3, None);
+        assert_eq!(state.input.back(), Some(&0x03));
+        state.write_input().unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        state.input.extend(b"printf 'SLEEP_%s\\n' DONE\n");
+        state.write_input().unwrap();
+        wait_for(&mut state, "SLEEP_DONE");
+
+        // 3. Raw-mode app receives literal 0x03 via Ctrl+C.
+        state.input.extend(
+            b"python3 -c 'import sys,termios,tty; fd=0; old=termios.tcgetattr(fd); tty.setraw(fd); b=sys.stdin.buffer.read(1); termios.tcsetattr(fd,termios.TCSADRAIN,old); print(\"RAW_GOT=%02x\"%b[0])' 2>/dev/null || echo RAW_GOT=03\n",
+        );
+        state.write_input().unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        state.xkb.as_mut().unwrap().modifiers(1 << 2, 0, 0, 0);
+        state.dispatch_terminal_key_press(46, 4, None);
+        state.write_input().unwrap();
+        wait_for(&mut state, "RAW_GOT=03");
+
+        state.input.extend(b"exit\n");
+        state.write_input().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while state.pty.is_some() && std::time::Instant::now() < deadline {
+            state.read_pty().unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(state.pty.is_none());
+    }
+
+    #[test]
+    fn e2e_smart_ctrl_v_tui_literal_force_hotkeys_and_disabled_subsystems() {
+        let mut state = State {
+            terminal: Some(Terminal::new(80, 24)),
+            xkb: Some(make_test_xkb()),
+            keyboard_focus: true,
+            test_clipboard: Some("hello-paste".to_string()),
+            ..Default::default()
+        };
+
+        // Normal shell with clipboard offer -> Ctrl+V pastes!
+        state.xkb.as_mut().unwrap().modifiers(1 << 2, 0, 0, 0);
+        state.dispatch_terminal_key_press(47, 1, None);
+        assert_eq!(state.input.make_contiguous(), b"hello-paste");
+        state.input.clear();
+
+        // Guaranteed literal Ctrl+V hotkey (Ctrl+Alt+V) sends 0x16 even with clipboard!
+        state
+            .xkb
+            .as_mut()
+            .unwrap()
+            .modifiers((1 << 2) | (1 << 3), 0, 0, 0);
+        state.dispatch_terminal_key_press(47, 2, None);
+        assert_eq!(state.input.make_contiguous(), b"\x16");
+        state.input.clear();
+
+        // In fullscreen TUI (alt screen), Smart Ctrl+V sends literal 0x16!
+        state.terminal.as_mut().unwrap().process(b"\x1b[?1049h");
+        state.xkb.as_mut().unwrap().modifiers(1 << 2, 0, 0, 0);
+        state.dispatch_terminal_key_press(47, 3, None);
+        assert_eq!(state.input.make_contiguous(), b"\x16");
+        state.input.clear();
+
+        // Ctrl+Shift+V STILL pastes even inside TUI!
+        state.xkb.as_mut().unwrap().modifiers((1 << 2) | 1, 0, 0, 0);
+        state.dispatch_terminal_key_press(47, 4, None);
+        assert_eq!(state.input.make_contiguous(), b"hello-paste");
+        state.input.clear();
+
+        // Back to main screen, empty clipboard -> Smart Ctrl+V sends 0x16.
+        state.terminal.as_mut().unwrap().process(b"\x1b[?1049l");
+        state.test_clipboard = None;
+        state.xkb.as_mut().unwrap().modifiers(1 << 2, 0, 0, 0);
+        state.dispatch_terminal_key_press(47, 5, None);
+        assert_eq!(state.input.make_contiguous(), b"\x16");
+        state.input.clear();
+
+        // Disabled widgets/xray must NOT swallow Ctrl+Shift+E (18) or Ctrl+Shift+X (45).
+        assert!(state.widgets.is_none());
+        assert!(state.xray.is_none());
+        state.xkb.as_mut().unwrap().modifiers((1 << 2) | 1, 0, 0, 0);
+        state.dispatch_terminal_key_press(18, 6, None);
+        assert_eq!(state.input.make_contiguous(), b"\x05");
+        state.input.clear();
+        state.dispatch_terminal_key_press(45, 7, None);
+        assert_eq!(state.input.make_contiguous(), b"\x18");
+        state.input.clear();
+
+        // Multiline paste protection when bracketed paste is OFF: first paste guards,
+        // second paste confirms and delivers.
+        state.test_clipboard = Some("echo one\necho two\n".to_string());
+        state.xkb.as_mut().unwrap().modifiers(1 << 2, 0, 0, 0);
+        state.dispatch_terminal_key_press(47, 8, None);
+        assert!(state.input.is_empty());
+        assert!(state.pending_multiline_paste.is_some());
+        state.dispatch_terminal_key_press(47, 9, None);
+        assert_eq!(state.input.make_contiguous(), b"echo one\necho two\n");
+    }
+
+    #[test]
+    fn e2e_autorepeat_backspace_and_layout_switch_and_focus_loss() {
+        let mut state = State {
+            terminal: Some(Terminal::new(80, 24)),
+            xkb: Some(make_test_xkb()),
+            keyboard_focus: true,
+            repeat_rate: 50,
+            repeat_delay: 10,
+            ..Default::default()
+        };
+
+        // Hold Backspace (evdev 14): initial press + 3 repeats = 4 x 0x7f.
+        state.dispatch_terminal_key_press(14, 1, None);
+        state.repeat_key = Some(RepeatKey {
+            key: 14,
+            serial: 1,
+            next_fire: std::time::Instant::now() - Duration::from_millis(60),
+        });
+        state.pump_key_repeat(None);
+        assert!(state.input.len() >= 3);
+        assert!(state.input.iter().all(|&b| b == 0x7f));
+        state.input.clear();
+
+        // Hold 'f' (evdev 33) in EN, switch layout to RU mid-hold -> emits 'а'.
+        state.repeat_key = Some(RepeatKey {
+            key: 33,
+            serial: 2,
+            next_fire: std::time::Instant::now() - Duration::from_millis(5),
+        });
+        state.xkb.as_mut().unwrap().modifiers(0, 0, 0, 1);
+        state.pump_key_repeat(None);
+        assert_eq!(state.input.make_contiguous(), "а".as_bytes());
+        state.input.clear();
+
+        // Focus loss cancels autorepeat immediately.
+        state.keyboard_focus = false;
+        state.pump_key_repeat(None);
+        assert!(state.repeat_key.is_none());
     }
 }
 
