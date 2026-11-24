@@ -1,0 +1,23 @@
+# Beyrix terminfo description
+# Compile with: tic -x packaging/beyrix.terminfo
+# Default PTY TERM is xterm-256color for universal SSH compatibility;
+# users who prefer explicit Beyrix capabilities locally may set TERM=beyrix.
+
+beyrix|Beyrix Wayland terminal emulator,
+	use=xterm-256color,
+	Tc,
+	Sync,
+	Su,
+	Smulx=\E[4:%p1%dm,
+	Setulc=\E[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%d%;m,
+	Ms=\E]52;%p1%s;%p2%s\007,
+
+beyrix-direct|Beyrix Wayland terminal emulator (24-bit direct color),
+	use=beyrix,
+	RGB,
+	colors#0x1000000,
+	pairs#0x10000,
+	setab=\E[48;2;%p1%{65536}%/%d;%p1%{256}%/%{255}%&%d;%p1%{255}%&%dm,
+	setaf=\E[38;2;%p1%{65536}%/%d;%p1%{256}%/%{255}%&%d;%p1%{255}%&%dm,
+	initc@,
+	op=\E[39;49m,

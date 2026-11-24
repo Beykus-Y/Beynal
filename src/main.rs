@@ -6,6 +6,8 @@ mod background;
 mod bedit;
 mod compat;
 mod config;
+#[cfg(test)]
+mod conformance_tests;
 mod control;
 mod editor;
 mod events;
@@ -22,6 +24,7 @@ mod render;
 mod selection;
 mod syntax;
 mod terminal;
+mod terminal_graphics;
 mod theme;
 mod wayland;
 mod widgets;
