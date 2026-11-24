@@ -34,7 +34,8 @@ pub struct AudioAnalyzer {
     fft_size: usize,
     band_count: usize,
     smoothing: f32,
-    planner: FftPlanner<f32>,
+    fft: Arc<dyn rustfft::Fft<f32>>,
+    fft_buf: Vec<Complex<f32>>,
     window: Vec<f32>,
     prev_bands: Vec<f32>,
     energy_history: Vec<f32>,
@@ -46,6 +47,8 @@ impl AudioAnalyzer {
     pub fn new(fft_size: usize, band_count: usize, smoothing: f32) -> Self {
         let fft_size = fft_size.next_power_of_two().clamp(256, 4096);
         let band_count = band_count.clamp(4, 128);
+        let mut planner = FftPlanner::new();
+        let fft = planner.plan_fft_forward(fft_size);
         let window: Vec<f32> = (0..fft_size)
             .map(|i| {
                 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (fft_size - 1) as f32).cos())
@@ -55,7 +58,8 @@ impl AudioAnalyzer {
             fft_size,
             band_count,
             smoothing: smoothing.clamp(0.0, 0.98),
-            planner: FftPlanner::new(),
+            fft,
+            fft_buf: vec![Complex::new(0.0, 0.0); fft_size],
             window,
             prev_bands: vec![0.0; band_count],
             energy_history: vec![0.0; 32],
@@ -94,13 +98,12 @@ impl AudioAnalyzer {
         let amplitude = (sum_abs / n).clamp(0.0, 1.0);
         let rms = (sum_sq / n).sqrt().clamp(0.0, 1.0);
 
-        let mut buffer: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); self.fft_size];
+        self.fft_buf.fill(Complex::new(0.0, 0.0));
         let copy_len = samples.len().min(self.fft_size);
         for (i, &s) in samples[..copy_len].iter().enumerate() {
-            buffer[i].re = s * self.window[i];
+            self.fft_buf[i].re = s * self.window[i];
         }
-        let fft = self.planner.plan_fft_forward(self.fft_size);
-        fft.process(&mut buffer);
+        self.fft.process(&mut self.fft_buf);
 
         let half = self.fft_size / 2;
         let mut bands = vec![0.0_f32; self.band_count];
@@ -110,7 +113,7 @@ impl AudioAnalyzer {
                 .max(start + 1)
                 .min(half);
             let mut acc = 0.0_f32;
-            for c in &buffer[start..end] {
+            for c in &self.fft_buf[start..end] {
                 acc += c.norm();
             }
             let mag =

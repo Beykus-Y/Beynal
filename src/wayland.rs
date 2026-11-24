@@ -2515,7 +2515,11 @@ impl State {
                             m.play_file(std::path::PathBuf::from(p));
                         }
                     }
-                    crate::widgets::runtime::HostAction::MediaEnqueue(_) => {}
+                    crate::widgets::runtime::HostAction::MediaEnqueue(p) => {
+                        if let Some(m) = &self.media {
+                            m.enqueue_file(std::path::PathBuf::from(p));
+                        }
+                    }
                     crate::widgets::runtime::HostAction::BackgroundSetPreset { owner, preset } => {
                         if let (Some(bg), Some(preset)) = (
                             &mut self.background,
@@ -2647,9 +2651,18 @@ impl State {
         }
         if let Some(bg) = &self.background
             && bg.is_active(self.keyboard_focus, in_tui)
-            && bg.should_step()
         {
-            self.dirty = true;
+            if let Some(m) = &self.media {
+                let wants_audio = bg.config.audio_reactive
+                    || bg.config.preset == crate::config::BackgroundPreset::AudioReactive
+                    || !bg.bindings.is_empty();
+                m.set_native_audio_consumer(wants_audio);
+            }
+            if bg.should_step() {
+                self.dirty = true;
+            }
+        } else if let Some(m) = &self.media {
+            m.set_native_audio_consumer(false);
         }
     }
 

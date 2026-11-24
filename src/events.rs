@@ -72,10 +72,17 @@ pub struct MediaEventPayload {
     pub title: String,
     pub artist: String,
     pub album: String,
+    pub art_url: Option<String>,
     pub playing: bool,
     pub position_secs: f64,
     pub duration_secs: f64,
     pub volume: Option<f64>,
+    pub can_play: bool,
+    pub can_pause: bool,
+    pub can_go_next: bool,
+    pub can_go_previous: bool,
+    pub can_seek: bool,
+    pub available_sessions: Vec<String>,
 }
 
 /// Compact audio analysis frame summary for event subscribers.

@@ -488,15 +488,30 @@ fn event_to_js(env: &EventEnvelope, perms: &PermissionSet) -> Option<String> {
                 .join(",")
         )),
         AppEvent::MediaSession(m) if perms.has(Capability::MediaControl) => Some(format!(
-            "if (globalThis.__beyrix_emit) {{ globalThis.__beyrix_emit('mediaSession', {{ sessionId: {}, source: {}, title: {}, artist: {}, album: {}, playing: {}, position: {}, duration: {} }}); }}",
+            "if (globalThis.__beyrix_emit) {{ globalThis.__beyrix_emit('mediaSession', {{ sessionId: {}, source: {}, title: {}, artist: {}, album: {}, artUrl: {}, playing: {}, position: {}, duration: {}, volume: {}, canPlay: {}, canPause: {}, canGoNext: {}, canGoPrevious: {}, canSeek: {}, availableSessions: [{}] }}); }}",
             serde_json_str(&m.session_id),
             serde_json_str(&m.source),
             serde_json_str(&m.title),
             serde_json_str(&m.artist),
             serde_json_str(&m.album),
+            m.art_url
+                .as_deref()
+                .map_or_else(|| "null".to_string(), serde_json_str),
             m.playing,
             m.position_secs,
             m.duration_secs,
+            m.volume
+                .map_or_else(|| "null".to_string(), |v| format!("{v:.3}")),
+            m.can_play,
+            m.can_pause,
+            m.can_go_next,
+            m.can_go_previous,
+            m.can_seek,
+            m.available_sessions
+                .iter()
+                .map(|s| serde_json_str(s))
+                .collect::<Vec<_>>()
+                .join(","),
         )),
         AppEvent::AudioFrame(a) if perms.has(Capability::AudioAnalysis) => Some(format!(
             "if (globalThis.__beyrix_emit) {{ globalThis.__beyrix_emit('audioFrame', {{ amplitude: {}, rms: {}, peak: {}, beat: {}, bass: {}, mid: {}, treble: {} }}); }}",
@@ -598,6 +613,41 @@ fn load_into_vm(
 
     // Execute user extension code
     eval_with_timeout(&mut ext, deadline, timeout, &code, shared);
+
+    // Replay latest keyboard layout & media snapshots immediately so newly
+    // loaded widgets display accurate initial state without waiting for the
+    // first layout switch or media poll.
+    let (init_kbd, init_media) = {
+        let s = shared.lock().unwrap_or_else(|e| e.into_inner());
+        (s.latest_keyboard.clone(), s.latest_media.clone())
+    };
+    if let Some(k) = init_kbd
+        && let Some(js) = event_to_js(
+            &EventEnvelope {
+                seq: 0,
+                timestamp: Instant::now(),
+                wall_time: SystemTime::now(),
+                event: AppEvent::KeyboardLayout(k),
+            },
+            &ext.permissions,
+        )
+    {
+        eval_with_timeout(&mut ext, deadline, timeout, &js, shared);
+    }
+    if let Some(m) = init_media
+        && let Some(js) = event_to_js(
+            &EventEnvelope {
+                seq: 0,
+                timestamp: Instant::now(),
+                wall_time: SystemTime::now(),
+                event: AppEvent::MediaSession(m),
+            },
+            &ext.permissions,
+        )
+    {
+        eval_with_timeout(&mut ext, deadline, timeout, &js, shared);
+    }
+
     sync_render_from_vm(&mut ext, deadline, timeout, shared);
     extensions.insert(id, ext);
 }
