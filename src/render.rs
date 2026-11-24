@@ -4,6 +4,7 @@
 
 use crate::terminal::{Screen, resolve_color};
 use fontdue::{Font, FontSettings, Metrics};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io;
 use std::process::Command;
@@ -66,6 +67,36 @@ pub struct Geometry {
     pub baseline: usize,
 }
 impl Geometry {
+    /// The primary face defines the grid. Fallback faces use those same cells.
+    fn from_font(font: &Font, px_size: f32) -> Self {
+        let (mut ascent, mut descent, gap) =
+            font.horizontal_line_metrics(px_size)
+                .map_or((0, 0, 0), |line| {
+                    (
+                        line.ascent.ceil() as usize,
+                        (-line.descent).ceil() as usize,
+                        line.line_gap.round() as usize,
+                    )
+                });
+        let mut advance = 0.0_f32;
+        // Include the actual bitmap bounds when the line tables understate
+        // the extent of printable ASCII at this physical font size.
+        for ch in ' '..='~' {
+            let glyph = font.metrics(ch, px_size);
+            advance = advance.max(glyph.advance_width);
+            if glyph.width != 0 && glyph.height != 0 {
+                ascent = ascent.max((glyph.ymin + glyph.height as i32).max(0) as usize);
+                descent = descent.max((-glyph.ymin).max(0) as usize);
+            }
+        }
+        Self {
+            cell_width: advance.ceil().max(1.0) as usize,
+            cell_height: (ascent + descent + gap).max(1),
+            baseline: ascent + gap / 2,
+            padding: 0,
+        }
+    }
+
     pub fn for_window(mut self, width: usize, height: usize) -> Self {
         self.padding = self
             .padding
@@ -97,56 +128,12 @@ impl Geometry {
         )
     }
 }
-/// The primary face defines the grid. Fallback glyphs occupy the same cells.
-struct FontMetrics {
-    advance: f32,
-    ascent: f32,
-    descent: f32,
-    line_gap: f32,
-}
-
-impl FontMetrics {
-    fn from_font(font: &Font) -> Self {
-        let mut metrics = Self {
-            advance: 0.0,
-            ascent: 0.0,
-            descent: 0.0,
-            line_gap: 0.0,
-        };
-        if let Some(line) = font.horizontal_line_metrics(1.0) {
-            metrics.ascent = line.ascent;
-            metrics.descent = -line.descent;
-            metrics.line_gap = line.line_gap.max(0.0);
-        }
-        // Include printable ASCII ink when the line tables understate it.
-        for ch in ' '..='~' {
-            let glyph = font.metrics(ch, 1.0);
-            metrics.advance = metrics.advance.max(glyph.advance_width);
-            metrics.ascent = metrics.ascent.max(glyph.bounds.ymin + glyph.bounds.height);
-            metrics.descent = metrics.descent.max(-glyph.bounds.ymin);
-        }
-        metrics
-    }
-
-    fn geometry(&self, px_size: f32, padding: usize) -> Geometry {
-        let ascent = (self.ascent * px_size).ceil() as usize;
-        let descent = (self.descent * px_size).ceil() as usize;
-        let gap = (self.line_gap * px_size).round() as usize;
-        Geometry {
-            cell_width: (self.advance * px_size).ceil().max(1.0) as usize,
-            cell_height: (ascent + descent + gap).max(1),
-            baseline: ascent + gap / 2,
-            padding,
-        }
-    }
-}
-
 const GLYPH_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const GLYPH_CACHE_ENTRIES: usize = 4096;
 
 pub struct Renderer {
     fonts: Vec<Font>,
-    font_metrics: FontMetrics,
+    font_geometry: Cell<Option<(u32, Geometry)>>,
     cache: HashMap<(char, u32), (Metrics, Vec<u8>)>,
     cache_bytes: usize,
     theme: crate::theme::Theme,
@@ -213,7 +200,7 @@ impl Renderer {
             ));
         }
         Ok(Self {
-            font_metrics: FontMetrics::from_font(&fonts[0]),
+            font_geometry: Cell::default(),
             fonts,
             cache: HashMap::new(),
             cache_bytes: 0,
@@ -235,10 +222,18 @@ impl Renderer {
         screen.cursor_x.min(screen.columns - 1)
     }
     pub fn geometry(&self, scale: f32) -> Geometry {
-        self.font_metrics.geometry(
-            self.font_px(scale),
-            (self.theme.padding as f32 * scale).round() as usize,
-        )
+        let px_size = self.font_px(scale);
+        let key = px_size.to_bits();
+        let mut geometry = match self.font_geometry.get() {
+            Some((cached, geometry)) if cached == key => geometry,
+            _ => {
+                let geometry = Geometry::from_font(&self.fonts[0], px_size);
+                self.font_geometry.set(Some((key, geometry)));
+                geometry
+            }
+        };
+        geometry.padding = (self.theme.padding as f32 * scale).round() as usize;
+        geometry
     }
 
     fn font_px(&self, scale: f32) -> f32 {
