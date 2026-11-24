@@ -27,7 +27,7 @@ use layout::{
 use manifest::{ExtensionManifest, LoadedExtension};
 use permissions::PermissionSet;
 use runtime::{HostAction, LifecycleCommand, VmCommand, WidgetRenderState, WidgetRuntime};
-use ui::{HitKind, UiHitTarget, UiLayer, emit_editor_chrome, emit_ui_tree};
+use ui::{HitKind, UiHitTarget, UiLayer, emit_editor_chrome};
 
 /// Host-determined trust level for an extension.
 ///
@@ -296,8 +296,9 @@ impl WidgetManager {
         }
         let renders = self.render_snapshots();
         let mut ordered: Vec<(&String, &WidgetPlacementConfig)> = self.placements.iter().collect();
-        ordered.sort_by_key(|(_, cfg)| cfg.z_index);
+        ordered.sort_by_key(|(_, cfg)| (cfg.z_index, -cfg.priority));
 
+        let mut occupied: Vec<(f32, f32, f32, f32)> = Vec::new();
         for (id, cfg) in ordered {
             let Some(state) = renders.get(id) else {
                 continue;
@@ -318,7 +319,7 @@ impl WidgetManager {
                 && pointer_px.0 <= pre_rect.x + pre_rect.w
                 && pointer_px.1 >= pre_rect.y
                 && pointer_px.1 <= pre_rect.y + pre_rect.h;
-            let resolved = resolve_widget_rect_with_cursor(
+            let mut resolved = resolve_widget_rect_with_cursor(
                 cfg,
                 win_size.0,
                 win_size.1,
@@ -330,6 +331,18 @@ impl WidgetManager {
                 inline_y_px,
                 cursor_row_px,
             );
+            if cfg.avoid_overlap && !self.editor.active {
+                resolved = layout::resolve_non_overlapping_position(
+                    resolved,
+                    &occupied,
+                    win_size.0,
+                    win_size.1,
+                    (cfg.margin * scale).max(6.0 * scale),
+                );
+            }
+            if resolved.visible {
+                occupied.push((resolved.x, resolved.y, resolved.w, resolved.h));
+            }
             self.resolved_rects.insert(id.clone(), resolved);
             if !resolved.visible && !self.editor.active {
                 continue;
@@ -340,13 +353,14 @@ impl WidgetManager {
                 UiLayer::Overlay
             };
             if let Some(tree) = &state.tree {
-                emit_ui_tree(
+                ui::emit_ui_tree_interactive(
                     id,
                     tree,
                     (resolved.x, resolved.y, resolved.w, resolved.h),
                     scale * cfg.scale,
                     cfg.opacity,
                     layer,
+                    Some(pointer_px),
                     theme,
                     renderer,
                     scene,
@@ -411,19 +425,19 @@ impl WidgetManager {
                     continue;
                 }
                 if let Some(vm) = &self.runtime {
-                    let value = match hit.kind {
-                        HitKind::Button => 1.0,
-                        HitKind::Slider => {
-                            ((pointer_px.0 - hit.x) / hit.w.max(1.0)).clamp(0.0, 1.0)
-                        }
+                    let (kind, value) = match hit.kind {
+                        HitKind::Button => ("click", 1.0),
+                        HitKind::Toggle => ("toggle", 1.0),
+                        HitKind::Tab(idx) => ("tab", idx as f32),
+                        HitKind::Slider => (
+                            "change",
+                            ((pointer_px.0 - hit.x) / hit.w.max(1.0)).clamp(0.0, 1.0),
+                        ),
                     };
                     vm.send(VmCommand::UiEvent {
                         widget_id: hit.widget_id.clone(),
                         node_id: hit.node_id.clone(),
-                        kind: match hit.kind {
-                            HitKind::Button => "click".into(),
-                            HitKind::Slider => "change".into(),
-                        },
+                        kind: kind.into(),
                         value,
                     });
                 }

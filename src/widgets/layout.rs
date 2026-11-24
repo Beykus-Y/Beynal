@@ -69,6 +69,52 @@ pub enum Anchor {
     BottomRight,
 }
 
+/// Responsive viewport breakpoint based on logical window width.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ViewportBreakpoint {
+    /// Very small window (< 440 logical px wide).
+    Micro,
+    /// Narrow Niri column (440..720 logical px wide).
+    Narrow,
+    /// Half-screen window (720..1120 logical px wide).
+    Medium,
+    /// Wide / fullscreen window (>= 1120 logical px wide).
+    #[default]
+    Wide,
+}
+
+impl ViewportBreakpoint {
+    pub fn from_logical_width(logical_w: f32) -> Self {
+        if logical_w < 440.0 {
+            Self::Micro
+        } else if logical_w < 720.0 {
+            Self::Narrow
+        } else if logical_w < 1120.0 {
+            Self::Medium
+        } else {
+            Self::Wide
+        }
+    }
+
+    pub fn is_compact(self) -> bool {
+        matches!(self, Self::Micro | Self::Narrow)
+    }
+}
+
+/// Adaptive behavior in narrow/micro windows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NarrowBehavior {
+    /// Automatically switch to compact mode and shrink within available width.
+    #[default]
+    Compact,
+    /// Keep normal layout but scale/clamp to fit viewport.
+    Shrink,
+    /// Hide widget in Micro/Narrow windows to preserve terminal legibility.
+    Hide,
+}
+
 /// Persistent placement & visual styling configuration for a single widget.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -83,17 +129,28 @@ pub struct WidgetPlacementConfig {
     /// Logical width and height.
     pub width: f32,
     pub height: f32,
+    pub min_width: f32,
+    pub max_width: f32,
+    pub min_height: f32,
+    pub max_height: f32,
     pub margin: f32,
     pub z_index: i32,
+    /// Higher priority widgets keep their preferred position during overlap avoidance.
+    pub priority: i32,
     pub opacity: f32,
     pub scale: f32,
     pub border_radius: f32,
+    pub border_width: f32,
     pub background_color: Option<String>,
     pub border_color: Option<String>,
     pub text_color: Option<String>,
     pub click_through: bool,
     pub show_on_hover: bool,
+    pub hide_on_unfocus: bool,
     pub snap_to_grid: bool,
+    pub avoid_overlap: bool,
+    pub locked: bool,
+    pub narrow_behavior: NarrowBehavior,
     pub hotkey: Option<String>,
     /// For Inline mode: optional OSC 133 command_id or line anchor.
     pub inline_row: Option<usize>,
@@ -110,17 +167,27 @@ impl Default for WidgetPlacementConfig {
             y: 16.0,
             width: 240.0,
             height: 64.0,
+            min_width: 72.0,
+            max_width: 640.0,
+            min_height: 26.0,
+            max_height: 480.0,
             margin: 8.0,
             z_index: 10,
-            opacity: 0.92,
+            priority: 10,
+            opacity: 0.94,
             scale: 1.0,
-            border_radius: 8.0,
+            border_radius: 10.0,
+            border_width: 1.0,
             background_color: None,
             border_color: None,
             text_color: None,
             click_through: false,
             show_on_hover: false,
+            hide_on_unfocus: false,
             snap_to_grid: false,
+            avoid_overlap: true,
+            locked: false,
+            narrow_behavior: NarrowBehavior::Compact,
             hotkey: None,
             inline_row: None,
         }
@@ -135,6 +202,8 @@ pub struct ResolvedWidgetRect {
     pub w: f32,
     pub h: f32,
     pub effective_mode: PlacementMode,
+    pub breakpoint: ViewportBreakpoint,
+    pub compact: bool,
     pub visible: bool,
     pub interactive: bool,
 }
@@ -204,11 +273,21 @@ pub fn resolve_effective_mode(
     configured
 }
 
-/// Compute viewport insets reserved by `Dock` widgets (never active in TUI mode).
+/// Compute viewport insets reserved by `Dock` widgets (never active in TUI mode),
+/// clamped so excessive Dock areas can never crush the terminal grid.
 pub fn compute_dock_insets(
     configs: &[&WidgetPlacementConfig],
     in_tui: bool,
     scale: f32,
+) -> ViewportInsets {
+    compute_dock_insets_bounded(configs, in_tui, scale, None)
+}
+
+pub fn compute_dock_insets_bounded(
+    configs: &[&WidgetPlacementConfig],
+    in_tui: bool,
+    scale: f32,
+    win_size_px: Option<(f32, f32)>,
 ) -> ViewportInsets {
     let mut insets = ViewportInsets::default();
     if in_tui {
@@ -227,7 +306,67 @@ pub fn compute_dock_insets(
             DockEdge::Right => insets.right += w,
         }
     }
+    if let Some((win_w, win_h)) = win_size_px {
+        let max_x = (win_w * 0.45).max(0.0);
+        let max_y = (win_h * 0.40).max(0.0);
+        let total_x = insets.left + insets.right;
+        if total_x > max_x && total_x > 0.0 {
+            let f = max_x / total_x;
+            insets.left *= f;
+            insets.right *= f;
+        }
+        let total_y = insets.top + insets.bottom;
+        if total_y > max_y && total_y > 0.0 {
+            let f = max_y / total_y;
+            insets.top *= f;
+            insets.bottom *= f;
+        }
+    }
     insets
+}
+
+/// Resolve non-overlapping placement for a candidate rect against already-placed
+/// higher-priority rects when `avoid_overlap` is enabled.
+pub fn resolve_non_overlapping_position(
+    mut rect: ResolvedWidgetRect,
+    occupied: &[(f32, f32, f32, f32)],
+    win_w: f32,
+    win_h: f32,
+    gap_px: f32,
+) -> ResolvedWidgetRect {
+    if !rect.visible || occupied.is_empty() {
+        return rect;
+    }
+    let overlaps_any = |x: f32, y: f32, w: f32, h: f32| {
+        occupied
+            .iter()
+            .any(|&(ox, oy, ow, oh)| x < ox + ow && x + w > ox && y < oy + oh && y + h > oy)
+    };
+    if !overlaps_any(rect.x, rect.y, rect.w, rect.h) {
+        return rect;
+    }
+    // Try shifting down, up, left, right relative to each colliding rect.
+    for &(ox, oy, ow, oh) in occupied {
+        let candidates = [
+            (rect.x, oy + oh + gap_px),
+            (rect.x, oy - rect.h - gap_px),
+            (ox - rect.w - gap_px, rect.y),
+            (ox + ow + gap_px, rect.y),
+        ];
+        for (cx, cy) in candidates {
+            if cx >= 0.0
+                && cy >= 0.0
+                && cx + rect.w <= win_w
+                && cy + rect.h <= win_h
+                && !overlaps_any(cx, cy, rect.w, rect.h)
+            {
+                rect.x = cx;
+                rect.y = cy;
+                return rect;
+            }
+        }
+    }
+    rect
 }
 
 /// Resolve a widget's physical-pixel rectangle inside `(win_w, win_h)`.
@@ -272,23 +411,48 @@ pub fn resolve_widget_rect_with_cursor(
     inline_y_px: Option<f32>,
     cursor_row_px: Option<(f32, f32)>,
 ) -> ResolvedWidgetRect {
+    let logical_w = win_w / scale.max(0.25);
+    let breakpoint = ViewportBreakpoint::from_logical_width(logical_w);
     let effective_mode =
         resolve_effective_mode(cfg.mode, cfg.tui_behavior, in_tui, inline_y_px.is_some());
-    if effective_mode == PlacementMode::Hidden {
+    if effective_mode == PlacementMode::Hidden
+        || (breakpoint.is_compact() && cfg.narrow_behavior == NarrowBehavior::Hide)
+    {
         return ResolvedWidgetRect {
             x: 0.0,
             y: 0.0,
             w: 0.0,
             h: 0.0,
-            effective_mode,
+            effective_mode: PlacementMode::Hidden,
+            breakpoint,
+            compact: breakpoint.is_compact(),
             visible: false,
             interactive: false,
         };
     }
 
-    let w = (cfg.width * cfg.scale * scale).max(24.0).min(win_w);
-    let h = (cfg.height * cfg.scale * scale).max(20.0).min(win_h);
+    let compact = breakpoint.is_compact() && cfg.narrow_behavior == NarrowBehavior::Compact;
     let margin = cfg.margin * scale;
+    let max_avail_w = (win_w - margin * 2.0).max(24.0);
+    let max_avail_h = (win_h - margin * 2.0).max(20.0);
+
+    let min_w = (cfg.min_width * scale).min(max_avail_w);
+    let max_w = (cfg.max_width * scale).min(max_avail_w).max(min_w);
+    let min_h = (cfg.min_height * scale).min(max_avail_h);
+    let max_h = (cfg.max_height * scale).min(max_avail_h).max(min_h);
+
+    let base_w = if compact {
+        (cfg.width * 0.72).max(cfg.min_width)
+    } else {
+        cfg.width
+    };
+    let base_h = if compact {
+        (cfg.height * 0.75).max(cfg.min_height)
+    } else {
+        cfg.height
+    };
+    let w = (base_w * cfg.scale * scale).clamp(min_w, max_w);
+    let h = (base_h * cfg.scale * scale).clamp(min_h, max_h);
 
     let (mut x, mut y) = match effective_mode {
         PlacementMode::Dock => match cfg.dock_edge {
@@ -343,6 +507,8 @@ pub fn resolve_widget_rect_with_cursor(
         w,
         h,
         effective_mode,
+        breakpoint,
+        compact,
         visible,
         interactive,
     }
@@ -591,5 +757,56 @@ mod tests {
         );
         // Must shift so it does not overlap [110.0, 128.0)
         assert!(resolved.y + resolved.h <= 110.0 || resolved.y >= 128.0);
+    }
+
+    #[test]
+    fn adaptive_breakpoints_overlap_avoidance_and_bounded_dock() {
+        assert_eq!(
+            ViewportBreakpoint::from_logical_width(380.0),
+            ViewportBreakpoint::Micro
+        );
+        assert_eq!(
+            ViewportBreakpoint::from_logical_width(560.0),
+            ViewportBreakpoint::Narrow
+        );
+        assert_eq!(
+            ViewportBreakpoint::from_logical_width(960.0),
+            ViewportBreakpoint::Medium
+        );
+        assert_eq!(
+            ViewportBreakpoint::from_logical_width(1440.0),
+            ViewportBreakpoint::Wide
+        );
+
+        let cfg = WidgetPlacementConfig {
+            width: 300.0,
+            height: 80.0,
+            min_width: 100.0,
+            min_height: 32.0,
+            anchor: Anchor::BottomRight,
+            ..Default::default()
+        };
+        let narrow = resolve_widget_rect(&cfg, 500.0, 600.0, 1.0, 10.0, 18.0, false, false, None);
+        assert!(narrow.compact);
+        assert!(narrow.w < 300.0);
+
+        // Two widgets at the same corner must not overlap after avoidance.
+        let occupied = vec![(narrow.x, narrow.y, narrow.w, narrow.h)];
+        let shifted = resolve_non_overlapping_position(narrow, &occupied, 500.0, 600.0, 8.0);
+        let overlaps = shifted.x < narrow.x + narrow.w
+            && shifted.x + shifted.w > narrow.x
+            && shifted.y < narrow.y + narrow.h
+            && shifted.y + shifted.h > narrow.y;
+        assert!(!overlaps, "widget should shift out of collision");
+
+        // Excessive dock areas are capped so terminal grid never collapses.
+        let huge_dock = WidgetPlacementConfig {
+            mode: PlacementMode::Dock,
+            dock_edge: DockEdge::Top,
+            height: 400.0,
+            ..Default::default()
+        };
+        let bounded = compute_dock_insets_bounded(&[&huge_dock], false, 1.0, Some((800.0, 500.0)));
+        assert!(bounded.top <= 500.0 * 0.40 + 0.01);
     }
 }

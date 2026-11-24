@@ -29,30 +29,70 @@ impl UiColor {
                 "cursor" | "accent" => to_f4(theme.cursor, 1.0),
                 "selection" => to_f4(theme.selection, 1.0),
                 "selection_fg" => to_f4(theme.selection_foreground, 1.0),
-                "muted" => {
+                "muted" | "fg-secondary" => {
                     let bg = theme.background;
                     let fg = theme.foreground;
                     [
-                        (bg[0] as f32 * 0.4 + fg[0] as f32 * 0.6) / 255.0,
-                        (bg[1] as f32 * 0.4 + fg[1] as f32 * 0.6) / 255.0,
-                        (bg[2] as f32 * 0.4 + fg[2] as f32 * 0.6) / 255.0,
+                        (bg[0] as f32 * 0.38 + fg[0] as f32 * 0.62) / 255.0,
+                        (bg[1] as f32 * 0.38 + fg[1] as f32 * 0.62) / 255.0,
+                        (bg[2] as f32 * 0.38 + fg[2] as f32 * 0.62) / 255.0,
                         1.0,
                     ]
                 }
-                "card" => {
+                "card" | "surface" => {
                     let bg = theme.background;
                     let fg = theme.foreground;
                     [
-                        (bg[0] as f32 * 0.88 + fg[0] as f32 * 0.12) / 255.0,
-                        (bg[1] as f32 * 0.88 + fg[1] as f32 * 0.12) / 255.0,
-                        (bg[2] as f32 * 0.88 + fg[2] as f32 * 0.12) / 255.0,
-                        0.94,
+                        (bg[0] as f32 * 0.90 + fg[0] as f32 * 0.10) / 255.0,
+                        (bg[1] as f32 * 0.90 + fg[1] as f32 * 0.10) / 255.0,
+                        (bg[2] as f32 * 0.90 + fg[2] as f32 * 0.10) / 255.0,
+                        0.95,
                     ]
                 }
-                "red" => to_f4(theme.ansi[1], 1.0),
-                "green" => to_f4(theme.ansi[2], 1.0),
-                "yellow" => to_f4(theme.ansi[3], 1.0),
-                "blue" => to_f4(theme.ansi[4], 1.0),
+                "surface-elevated" => {
+                    let bg = theme.background;
+                    let fg = theme.foreground;
+                    [
+                        (bg[0] as f32 * 0.84 + fg[0] as f32 * 0.16) / 255.0,
+                        (bg[1] as f32 * 0.84 + fg[1] as f32 * 0.16) / 255.0,
+                        (bg[2] as f32 * 0.84 + fg[2] as f32 * 0.16) / 255.0,
+                        0.97,
+                    ]
+                }
+                "surface-hover" => {
+                    let bg = theme.background;
+                    let fg = theme.foreground;
+                    [
+                        (bg[0] as f32 * 0.78 + fg[0] as f32 * 0.22) / 255.0,
+                        (bg[1] as f32 * 0.78 + fg[1] as f32 * 0.22) / 255.0,
+                        (bg[2] as f32 * 0.78 + fg[2] as f32 * 0.22) / 255.0,
+                        0.96,
+                    ]
+                }
+                "border" => {
+                    let bg = theme.background;
+                    let fg = theme.foreground;
+                    [
+                        (bg[0] as f32 * 0.68 + fg[0] as f32 * 0.32) / 255.0,
+                        (bg[1] as f32 * 0.68 + fg[1] as f32 * 0.32) / 255.0,
+                        (bg[2] as f32 * 0.68 + fg[2] as f32 * 0.32) / 255.0,
+                        0.55,
+                    ]
+                }
+                "border-subtle" => {
+                    let fg = theme.foreground;
+                    [
+                        fg[0] as f32 / 255.0,
+                        fg[1] as f32 / 255.0,
+                        fg[2] as f32 / 255.0,
+                        0.16,
+                    ]
+                }
+                "accent-soft" => to_f4(theme.cursor, 0.22),
+                "red" | "error" => to_f4(theme.ansi[1], 1.0),
+                "green" | "success" => to_f4(theme.ansi[2], 1.0),
+                "yellow" | "warning" => to_f4(theme.ansi[3], 1.0),
+                "blue" | "info" => to_f4(theme.ansi[4], 1.0),
                 "magenta" => to_f4(theme.ansi[5], 1.0),
                 "cyan" => to_f4(theme.ansi[6], 1.0),
                 hex if hex.starts_with('#') => parse_hex_color(hex).unwrap_or(default),
@@ -252,6 +292,38 @@ pub enum UiNode {
         height: f32,
         children: Vec<UiNode>,
     },
+    Toggle {
+        id: String,
+        label: String,
+        checked: bool,
+        #[serde(default)]
+        disabled: bool,
+    },
+    Divider {
+        #[serde(default)]
+        vertical: bool,
+        #[serde(default)]
+        color: Option<UiColor>,
+    },
+    Badge {
+        text: String,
+        #[serde(default)]
+        color: Option<UiColor>,
+        #[serde(default)]
+        bg: Option<UiColor>,
+    },
+    Tabs {
+        id: String,
+        tabs: Vec<String>,
+        active: usize,
+    },
+    Sparkline {
+        values: Vec<f32>,
+        width: f32,
+        height: f32,
+        #[serde(default)]
+        color: Option<UiColor>,
+    },
 }
 
 /// Interactive hit-target produced during UI layout/emission.
@@ -270,6 +342,8 @@ pub struct UiHitTarget {
 pub enum HitKind {
     Button,
     Slider,
+    Toggle,
+    Tab(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,11 +367,31 @@ pub fn emit_ui_tree(
     scene: &mut Scene,
     hits: &mut Vec<UiHitTarget>,
 ) {
+    emit_ui_tree_interactive(
+        widget_id, node, rect, scale, opacity, layer, None, theme, renderer, scene, hits,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn emit_ui_tree_interactive(
+    widget_id: &str,
+    node: &UiNode,
+    rect: (f32, f32, f32, f32),
+    scale: f32,
+    opacity: f32,
+    layer: UiLayer,
+    pointer_px: Option<(f32, f32)>,
+    theme: &Theme,
+    renderer: &mut Renderer,
+    scene: &mut Scene,
+    hits: &mut Vec<UiHitTarget>,
+) {
     let ctx = EmitContext {
         widget_id,
         scale,
         opacity: opacity.clamp(0.0, 1.0),
         layer,
+        pointer_px,
         theme,
     };
     emit_node(&ctx, node, rect, rect, renderer, scene, hits);
@@ -308,10 +402,16 @@ struct EmitContext<'a> {
     scale: f32,
     opacity: f32,
     layer: UiLayer,
+    pointer_px: Option<(f32, f32)>,
     theme: &'a Theme,
 }
 
 impl EmitContext<'_> {
+    fn is_hovered(&self, rect: (f32, f32, f32, f32)) -> bool {
+        self.pointer_px.is_some_and(|(px, py)| {
+            px >= rect.0 && px <= rect.0 + rect.2 && py >= rect.1 && py <= rect.1 + rect.3
+        })
+    }
     fn push_rect(&self, scene: &mut Scene, rect: SceneRoundedRect) {
         let mut r = rect;
         r.color[3] *= self.opacity;
@@ -439,6 +539,23 @@ fn measure_node(node: &UiNode, max_w: f32, scale: f32) -> (f32, f32) {
         ),
         UiNode::Canvas { width, height, .. } => (width * scale, height * scale),
         UiNode::ScrollView { height, .. } => (max_w, height * scale),
+        UiNode::Toggle { label, .. } => (
+            ((label.chars().count() as f32 * 7.8 + 44.0) * scale).min(max_w),
+            24.0 * scale,
+        ),
+        UiNode::Divider { vertical, .. } => {
+            if *vertical {
+                (1.0 * scale, 18.0 * scale)
+            } else {
+                (max_w, 1.0 * scale)
+            }
+        }
+        UiNode::Badge { text, .. } => (
+            ((text.chars().count() as f32 * 7.0 + 14.0) * scale).min(max_w),
+            20.0 * scale,
+        ),
+        UiNode::Tabs { .. } => (max_w, 26.0 * scale),
+        UiNode::Sparkline { width, height, .. } => ((width * scale).min(max_w), height * scale),
     }
 }
 
@@ -508,9 +625,20 @@ fn emit_node(
             radius,
             ..
         } => {
-            let bg_col = bg
+            let hovered = ctx.is_hovered(rect);
+            let hover_default =
+                UiColor::Token("surface-hover".into()).resolve(ctx.theme, [0.22, 0.25, 0.30, 0.96]);
+            let mut bg_col = bg
                 .as_ref()
                 .map_or(card_default, |c| c.resolve(ctx.theme, card_default));
+            if hovered {
+                bg_col = [
+                    (bg_col[0] * 0.7 + hover_default[0] * 0.3).clamp(0.0, 1.0),
+                    (bg_col[1] * 0.7 + hover_default[1] * 0.3).clamp(0.0, 1.0),
+                    (bg_col[2] * 0.7 + hover_default[2] * 0.3).clamp(0.0, 1.0),
+                    bg_col[3].max(0.95),
+                ];
+            }
             let fg_col = color
                 .as_ref()
                 .map_or(fg_default, |c| c.resolve(ctx.theme, fg_default));
@@ -524,7 +652,11 @@ fn emit_node(
                     radius: *radius * ctx.scale,
                     color: bg_col,
                     border_width: 1.0 * ctx.scale,
-                    border_color: [fg_col[0], fg_col[1], fg_col[2], 0.2],
+                    border_color: if hovered {
+                        [accent_default[0], accent_default[1], accent_default[2], 0.7]
+                    } else {
+                        [fg_col[0], fg_col[1], fg_col[2], 0.22]
+                    },
                 },
             );
             emit_text_line(
@@ -952,6 +1084,251 @@ fn emit_node(
                 cy += ch + 4.0 * ctx.scale;
             }
         }
+        UiNode::Toggle {
+            id,
+            label,
+            checked,
+            disabled,
+        } => {
+            let pill_w = (32.0 * ctx.scale).min(w * 0.45);
+            let pill_h = (16.0 * ctx.scale).min(h);
+            let pill_y = y + (h - pill_h) * 0.5;
+            let track_col = if *checked {
+                accent_default
+            } else {
+                [fg_default[0], fg_default[1], fg_default[2], 0.22]
+            };
+            ctx.push_rect(
+                scene,
+                SceneRoundedRect {
+                    x,
+                    y: pill_y,
+                    w: pill_w,
+                    h: pill_h,
+                    radius: pill_h * 0.5,
+                    color: track_col,
+                    border_width: 0.0,
+                    border_color: [0.0; 4],
+                },
+            );
+            let knob = (pill_h - 4.0 * ctx.scale).max(6.0);
+            let kx = if *checked {
+                x + pill_w - knob - 2.0 * ctx.scale
+            } else {
+                x + 2.0 * ctx.scale
+            };
+            ctx.push_rect(
+                scene,
+                SceneRoundedRect {
+                    x: kx,
+                    y: pill_y + (pill_h - knob) * 0.5,
+                    w: knob,
+                    h: knob,
+                    radius: knob * 0.5,
+                    color: fg_default,
+                    border_width: 0.0,
+                    border_color: [0.0; 4],
+                },
+            );
+            let text_x = x + pill_w + 8.0 * ctx.scale;
+            let text_col = if *disabled {
+                UiColor::Token("muted".into()).resolve(ctx.theme, fg_default)
+            } else {
+                fg_default
+            };
+            emit_text_line(
+                ctx,
+                label,
+                12.0 * ctx.scale,
+                (text_x, y, (x + w - text_x).max(0.0), h),
+                clip,
+                Align::Start,
+                text_col,
+                renderer,
+                scene,
+            );
+            if !*disabled {
+                hits.push(UiHitTarget {
+                    widget_id: ctx.widget_id.to_string(),
+                    node_id: id.clone(),
+                    kind: HitKind::Toggle,
+                    x,
+                    y,
+                    w,
+                    h,
+                });
+            }
+        }
+        UiNode::Divider { vertical, color } => {
+            let col = color.as_ref().map_or(
+                UiColor::Token("border-subtle".into()).resolve(ctx.theme, [1.0, 1.0, 1.0, 0.16]),
+                |c| c.resolve(ctx.theme, [1.0, 1.0, 1.0, 0.16]),
+            );
+            let (dw, dh) = if *vertical {
+                (1.0 * ctx.scale, h)
+            } else {
+                (w, 1.0 * ctx.scale)
+            };
+            ctx.push_rect(
+                scene,
+                SceneRoundedRect {
+                    x,
+                    y,
+                    w: dw,
+                    h: dh,
+                    radius: 0.0,
+                    color: col,
+                    border_width: 0.0,
+                    border_color: [0.0; 4],
+                },
+            );
+        }
+        UiNode::Badge { text, color, bg } => {
+            let fg_col = color
+                .as_ref()
+                .map_or(accent_default, |c| c.resolve(ctx.theme, accent_default));
+            let bg_col = bg
+                .as_ref()
+                .map_or([fg_col[0], fg_col[1], fg_col[2], 0.18], |c| {
+                    c.resolve(ctx.theme, [fg_col[0], fg_col[1], fg_col[2], 0.18])
+                });
+            ctx.push_rect(
+                scene,
+                SceneRoundedRect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    radius: h * 0.45,
+                    color: bg_col,
+                    border_width: 1.0 * ctx.scale,
+                    border_color: [fg_col[0], fg_col[1], fg_col[2], 0.42],
+                },
+            );
+            emit_text_line(
+                ctx,
+                text,
+                11.0 * ctx.scale,
+                (x + 4.0 * ctx.scale, y, (w - 8.0 * ctx.scale).max(0.0), h),
+                clip,
+                Align::Center,
+                fg_col,
+                renderer,
+                scene,
+            );
+        }
+        UiNode::Tabs { id, tabs, active } => {
+            if tabs.is_empty() {
+                return;
+            }
+            let gap = 4.0 * ctx.scale;
+            let tab_w = ((w - gap * (tabs.len().saturating_sub(1)) as f32) / tabs.len() as f32)
+                .max(24.0 * ctx.scale);
+            for (idx, label) in tabs.iter().enumerate() {
+                let tx = x + idx as f32 * (tab_w + gap);
+                if tx >= x + w {
+                    break;
+                }
+                let tw = tab_w.min(x + w - tx);
+                let is_active = idx == *active;
+                let hovered = ctx.is_hovered((tx, y, tw, h));
+                let bg_col = if is_active {
+                    [
+                        accent_default[0],
+                        accent_default[1],
+                        accent_default[2],
+                        0.25,
+                    ]
+                } else if hovered {
+                    UiColor::Token("surface-hover".into())
+                        .resolve(ctx.theme, [0.22, 0.25, 0.30, 0.8])
+                } else {
+                    [0.0, 0.0, 0.0, 0.0]
+                };
+                ctx.push_rect(
+                    scene,
+                    SceneRoundedRect {
+                        x: tx,
+                        y,
+                        w: tw,
+                        h,
+                        radius: 6.0 * ctx.scale,
+                        color: bg_col,
+                        border_width: if is_active { 1.0 * ctx.scale } else { 0.0 },
+                        border_color: accent_default,
+                    },
+                );
+                emit_text_line(
+                    ctx,
+                    label,
+                    11.5 * ctx.scale,
+                    (tx + 4.0 * ctx.scale, y, (tw - 8.0 * ctx.scale).max(0.0), h),
+                    clip,
+                    Align::Center,
+                    if is_active {
+                        fg_default
+                    } else {
+                        UiColor::Token("muted".into()).resolve(ctx.theme, fg_default)
+                    },
+                    renderer,
+                    scene,
+                );
+                hits.push(UiHitTarget {
+                    widget_id: ctx.widget_id.to_string(),
+                    node_id: id.clone(),
+                    kind: HitKind::Tab(idx),
+                    x: tx,
+                    y,
+                    w: tw,
+                    h,
+                });
+            }
+        }
+        UiNode::Sparkline { values, color, .. } => {
+            let line_col = color
+                .as_ref()
+                .map_or(accent_default, |c| c.resolve(ctx.theme, accent_default));
+            ctx.push_rect(
+                scene,
+                SceneRoundedRect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    radius: 4.0 * ctx.scale,
+                    color: [fg_default[0], fg_default[1], fg_default[2], 0.06],
+                    border_width: 0.0,
+                    border_color: [0.0; 4],
+                },
+            );
+            if values.is_empty() {
+                return;
+            }
+            let max_v = values.iter().copied().fold(0.001_f32, f32::max);
+            let n = values.len();
+            let bar_w = (w / n as f32).max(1.5);
+            for (i, &v) in values.iter().enumerate() {
+                let norm = (v / max_v).clamp(0.0, 1.0);
+                let bh = (h * norm).max(1.5);
+                let bx = x + i as f32 * bar_w;
+                let bw = (bar_w - 1.0).max(1.0).min((x + w - bx).max(0.0));
+                if bw > 0.0 {
+                    ctx.push_rect(
+                        scene,
+                        SceneRoundedRect {
+                            x: bx,
+                            y: y + h - bh,
+                            w: bw,
+                            h: bh,
+                            radius: 1.0,
+                            color: [line_col[0], line_col[1], line_col[2], 0.78],
+                            border_width: 0.0,
+                            border_color: [0.0; 4],
+                        },
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -980,7 +1357,18 @@ fn emit_text_line(
     if clip.2 <= 0.0 || clip.3 <= 0.0 {
         return;
     }
-    let approx_w = text.chars().count() as f32 * px_size * 0.58;
+    let max_text_w = clip.2.min(rw).max(0.0);
+    let char_adv = px_size * 0.58;
+    let total_chars = text.chars().count();
+    let max_chars = ((max_text_w / char_adv.max(1.0)).floor() as usize).max(1);
+    let display_text: std::borrow::Cow<'_, str> = if total_chars > max_chars && max_chars >= 2 {
+        let mut s: String = text.chars().take(max_chars - 1).collect();
+        s.push('…');
+        std::borrow::Cow::Owned(s)
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    };
+    let approx_w = (display_text.chars().count() as f32 * char_adv).min(rw);
     let start_x = match align {
         Align::Center => rx + (rw - approx_w).max(0.0) * 0.5,
         Align::End => rx + (rw - approx_w).max(0.0),
@@ -988,7 +1376,7 @@ fn emit_text_line(
     };
     let baseline = ry + (rh + px_size * 0.72) * 0.5;
     let mut pen_x = start_x;
-    for ch in text.chars() {
+    for ch in display_text.chars() {
         if pen_x > clip.0 + clip.2 {
             break;
         }
