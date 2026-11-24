@@ -1,65 +1,131 @@
 name: COPR
 
-# Publish a Fedora source package to COPR when a release is published.
-#
-# The repository secret COPR_CONFIG must contain a complete copr-cli
-# configuration file. Without it the workflow succeeds without publishing.
-# The token is written to a temporary file and is never committed or printed.
-
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+    secrets:
+      COPR_CONFIG:
+        required: true
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag, for example v0.1.0-alpha.1
+        description: Published release tag, for example v0.1.0-alpha.2
         required: true
         type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: copr-beyrix-publish
+  cancel-in-progress: false
+
 jobs:
   publish:
-    name: Build SRPM and submit to COPR
+    name: Publish Fedora 44 and 45 builds
     runs-on: ubuntu-24.04
     container: fedora:44
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
     env:
-      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      TAG: ${{ inputs.tag }}
     steps:
-      - name: Install git for the checkout action
-        run: dnf -y install git
-
-      - name: Check out the packaging branch
-        uses: actions/checkout@v7
-        with:
-          ref: main
-          fetch-depth: 0
-
       - name: Install packaging tools
         run: |
           dnf -y install cargo cargo-rpm-macros copr-cli curl gcc git gzip \
-            rpm-build tar
+            jq rpm-build tar
 
-      - name: Write COPR configuration
-        id: creds
+      - name: Verify the GitHub Release is published
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ ! $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Expected a release tag such as v0.1.0-alpha.2" >&2
+            exit 1
+          fi
+          curl -fsS --retry 3 -H "Authorization: Bearer $GH_TOKEN" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$TAG" |
+            jq -e --arg tag "$TAG" '.tag_name == $tag and (.draft | not) and .published_at != null' >/dev/null
+
+      - name: Check out the published tag
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Submit or watch the existing COPR build
         env:
           COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
         run: |
-          if [ -z "$COPR_CONFIG" ]; then
-            echo "COPR_CONFIG is not configured; skipping publication."
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-          else
-            install -d -m 0700 "$HOME/.config"
-            printf '%s\n' "$COPR_CONFIG" > "$HOME/.config/copr"
-            chmod 0600 "$HOME/.config/copr"
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          if [[ -z $COPR_CONFIG ]]; then
+            echo "::error::COPR_CONFIG is required to publish to COPR"
+            exit 1
           fi
 
-      - name: Create SRPM and submit
-        if: steps.creds.outputs.enabled == 'true'
-        run: ./packaging/fedora/make-sources.sh "$TAG" --submit
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          printf '%s\n' "$COPR_CONFIG" > "$work/copr"
+          chmod 0600 "$work/copr"
+          unset COPR_CONFIG
+          copr=(copr-cli --config "$work/copr" --no-color)
+          api=https://copr.fedorainfracloud.org/api_3
 
-      - name: Remove COPR configuration
-        if: always()
-        run: rm -f "$HOME/.config/copr"
+          spec=packaging/fedora/beyrix.spec
+          commit=$(git rev-parse HEAD)
+          test "$commit" = "$(git rev-parse "refs/tags/$TAG^{commit}")"
+          if [[ $GITHUB_EVENT_NAME == push && $GITHUB_REF == "refs/tags/$TAG" ]]; then
+            test "$commit" = "$GITHUB_SHA"
+          fi
+          test "$(sed -n 's/^%global upver //p' "$spec")" = "${TAG#v}"
+          version=$(rpmspec --undefine dist -q --srpm --qf '%{version}-%{release}' "$spec")
+          offset=0
+          build_id=
+          awaiting_version=false
+          while :; do
+            page=$(curl -fsS --retry 3 \
+              "$api/build/list?ownername=beykus-y&projectname=beyrix&limit=100&offset=$offset")
+            count=$(jq -er '.items | if type == "array" then length else error("missing build list") end' <<< "$page")
+            build_id=$(jq -r --arg version "$version" '
+              [.items[] | select(.source_package.name == "beyrix" and .source_package.version == $version)]
+              | last | .id // empty' <<< "$page")
+            if [[ -n $build_id ]]; then
+              break
+            fi
+            if jq -e '
+              any(.items[]; .source_package.version == null and
+                (.state | IN("succeeded", "failed", "skipped", "canceled") | not))
+            ' <<< "$page" >/dev/null; then
+              awaiting_version=true
+            fi
+            if (( count < 100 )); then
+              break
+            fi
+            offset=$((offset + count))
+          done
+
+          if [[ -z $build_id ]]; then
+            if [[ $awaiting_version == true ]]; then
+              echo "::error::A COPR submission has no source version yet. Retry after it is identified."
+              exit 1
+            fi
+            ./packaging/fedora/make-sources.sh "$TAG" "$work/sources"
+            srpms=("$work/sources"/*.src.rpm)
+            [[ ${#srpms[@]} == 1 && -f ${srpms[0]} ]]
+            "${copr[@]}" build --nowait -r fedora-44-x86_64 -r fedora-45-x86_64 \
+              beykus-y/beyrix "${srpms[0]}" | tee "$work/submission"
+            build_id=$(sed -n 's/^Created builds: \([0-9][0-9]*\)$/\1/p' "$work/submission")
+          fi
+          [[ $build_id =~ ^[0-9]+$ ]]
+          echo "### [COPR build $build_id](https://copr.fedorainfracloud.org/coprs/beykus-y/beyrix/build/$build_id/)" >> "$GITHUB_STEP_SUMMARY"
+          "${copr[@]}" watch-build "$build_id"
+          curl -fsS --retry 3 "$api/build-chroot/list?build_id=$build_id" |
+            jq -e '[.items[] | select(.state == "succeeded") | .name]
+              | index("fedora-44-x86_64") != null and index("fedora-45-x86_64") != null' >/dev/null

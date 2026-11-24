@@ -1,5 +1,5 @@
 %global crate beyrix
-%global upver 0.1.0-alpha.1
+%global upver 0.1.0-alpha.2
 %global tag v%{upver}
 
 # The vendored dependencies are extracted next to the upstream source tree by
@@ -9,7 +9,7 @@
 %global vendordir vendor
 
 Name:           beyrix
-Version:        0.1.0~alpha.1
+Version:        0.1.0~alpha.2
 Release:        1%{?dist}
 Summary:        Experimental Wayland terminal emulator with OpenGL rendering
 
@@ -88,5 +88,8 @@ install -Dpm0644 cargo-vendor.txt %{buildroot}%{_licensedir}/%{name}/cargo-vendo
 %{_licensedir}/%{name}/cargo-vendor.txt
 
 %changelog
+* Tue Nov 24 2026 Beykus Y <beykus-y@users.noreply.github.com> - 0.1.0~alpha.2-1
+- Package the BEdit workspace and native HiDPI text rendering.
+
 * Tue Nov 24 2026 Beykus Y <beykus-y@users.noreply.github.com> - 0.1.0~alpha.1-1
 - Initial Fedora package for the v0.1.0-alpha.1 release

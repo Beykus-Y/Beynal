@@ -60,9 +60,14 @@ SRC="$OUTDIR/Beyrix-$UPVER.tar.gz"
 VENDOR="$OUTDIR/beyrix-vendor-$UPVER.tar.gz"
 
 if [[ ! -f $SRC ]]; then
-    echo "Downloading source archive for v$UPVER"
-    curl -fL --retry 3 -o "$SRC.tmp" \
-        "https://github.com/Beykus-Y/Beyrix/archive/refs/tags/v$UPVER.tar.gz"
+    if git -C "$ROOT" rev-parse -q --verify "refs/tags/v$UPVER^{commit}" >/dev/null; then
+        git -C "$ROOT" archive --format=tar --prefix="Beyrix-$UPVER/" "refs/tags/v$UPVER" |
+            gzip -9n > "$SRC.tmp"
+    else
+        echo "Downloading source archive for v$UPVER"
+        curl -fL --retry 3 -o "$SRC.tmp" \
+            "https://github.com/Beykus-Y/Beyrix/archive/refs/tags/v$UPVER.tar.gz"
+    fi
     mv "$SRC.tmp" "$SRC"
 fi
 sha256sum "$SRC" | tee "$SRC.sha256"

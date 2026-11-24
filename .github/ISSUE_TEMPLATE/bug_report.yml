@@ -20,7 +20,7 @@ body:
     id: version
     attributes:
       label: Beyrix version or commit
-      placeholder: 0.1.0-alpha.1 / commit SHA
+      placeholder: 0.1.0-alpha.2 / commit SHA
     validations:
       required: true
   - type: input

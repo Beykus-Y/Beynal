@@ -4,7 +4,7 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 # Package an already-built release binary from the repository root.
-# Usage: ./scripts/package-release.sh v0.1.0-alpha.1
+# Usage: ./scripts/package-release.sh v0.1.0-alpha.2
 
 set -Eeuo pipefail
 
@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 
 TAG="${1:-}"
 if [[ -z $TAG ]]; then
-    echo "usage: $0 TAG (for example v0.1.0-alpha.1)" >&2
+    echo "usage: $0 TAG (for example v0.1.0-alpha.2)" >&2
     exit 2
 fi
 if [[ ! $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
@@ -51,6 +51,9 @@ install -m 755 "$BIN" "$STAGE/beyrix"
 ln -s beyrix "$STAGE/bedit"
 install -m 644 LICENSE README.md CONFIGURATION.en.md CONFIGURATION.md "$STAGE/"
 install -m 644 docs/ARCHITECTURE.md "$STAGE/docs/ARCHITECTURE.md"
+if [[ -f docs/releases/$TAG.md ]]; then
+    install -Dm644 "docs/releases/$TAG.md" "$STAGE/docs/releases/$TAG.md"
+fi
 install -m 644 packaging/fedora/io.github.beykus_y.BEdit.desktop "$STAGE/"
 install -m 755 packaging/install.sh "$STAGE/install.sh"
 
@@ -63,6 +66,12 @@ Rust: $(rustc --version)
 Cargo: $(cargo --version)
 Built at: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
+
+(
+    cd "$STAGE"
+    find . \( -type f -o -type l \) ! -name SHA256SUMS -print0 |
+        sort -z | xargs -0 sha256sum > SHA256SUMS
+)
 
 tar --sort=name --mtime="@$EPOCH" --owner=0 --group=0 --numeric-owner \
     -C "$DIST" -cf - "$NAME" | gzip -9n > "$ARCHIVE"

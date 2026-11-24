@@ -6,7 +6,7 @@
 [![Latest release](https://img.shields.io/github/v/release/Beykus-Y/Beyrix?include_prereleases&label=release)](https://github.com/Beykus-Y/Beyrix/releases)
 [![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](LICENSE)
 
-> **Status: first alpha (`v0.1.0-alpha.1`).** Expect bugs and breaking changes. Beyrix does not claim full xterm/VT compatibility, a Vulkan renderer, or support for Windows, macOS, X11 or ARM64.
+> **Status: alpha (`v0.1.0-alpha.2`).** Expect bugs and breaking changes. Beyrix does not claim full xterm/VT compatibility, a Vulkan renderer, or support for Windows, macOS, X11 or ARM64.
 
 ![Beyrix running Bash in a real Wayland session](docs/screenshots/bash.png)
 
@@ -75,7 +75,7 @@ Then start it from a Wayland session:
 beyrix
 ```
 
-The package installs the `beyrix` binary, a desktop entry, AppStream metadata, a
+The package installs both executables and desktop entries, AppStream metadata, a
 manual page and the license information for the bundled crates. See
 [packaging/fedora/README.md](packaging/fedora/README.md) for build, packaging and
 release details.
@@ -85,7 +85,7 @@ release details.
 Download the Linux x86_64 archive and checksums, verify them, then install the binary into your user path:
 
 ```sh
-VERSION=v0.1.0-alpha.1
+VERSION=v0.1.0-alpha.2
 BASE="https://github.com/Beykus-Y/Beyrix/releases/download/$VERSION"
 
 curl -LO "$BASE/beyrix-$VERSION-linux-x86_64.tar.gz"
@@ -153,7 +153,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 cargo build --release --locked
-./scripts/package-release.sh v0.1.0-alpha.1
+./scripts/package-release.sh v0.1.0-alpha.2
 ```
 
 The graphical tests and the application itself require an active Wayland session. Unit tests do not replace a real compositor smoke test.
@@ -230,7 +230,7 @@ If you already installed a `beynal` binary system-wide, update any shell aliases
 - [Roadmap](ROADMAP.md)
 - [Security policy](SECURITY.md)
 - [Code of Conduct](CODE_OF_CONDUCT.md)
-- [Release notes](docs/releases/v0.1.0-alpha.1.md)
+- [Release notes](docs/releases/v0.1.0-alpha.2.md)
 - [Fedora/COPR packaging](packaging/fedora/README.md)
 
 ## Contributing and helping the project

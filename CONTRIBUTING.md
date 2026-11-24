@@ -26,7 +26,7 @@ The graphical emulator needs an active Wayland session; tests and command-line h
 Release archives are produced from version tags by [`.github/workflows/release.yml`](.github/workflows/release.yml). To test packaging locally after a release build:
 
 ```sh
-./scripts/package-release.sh v0.1.0-alpha.1
+./scripts/package-release.sh v0.1.0-alpha.2
 ```
 
 ## Good pull requests

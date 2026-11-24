@@ -28,6 +28,12 @@
     <category>TerminalEmulator</category>
   </categories>
   <releases>
+    <release version="0.1.0~alpha.2" date="2026-11-24" type="development">
+      <description>
+        <p>Adds the BEdit project editor and improves text rendering on HiDPI displays.</p>
+      </description>
+      <url type="details">https://github.com/Beykus-Y/Beyrix/releases/tag/v0.1.0-alpha.2</url>
+    </release>
     <release version="0.1.0~alpha.1" date="2026-11-24" type="development">
       <description>
         <p>First public alpha release with Fedora packaging.</p>

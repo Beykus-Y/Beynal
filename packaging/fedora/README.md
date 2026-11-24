@@ -19,7 +19,8 @@ beyrix
 ## What the package contains
 
 - `/usr/bin/beyrix` — the terminal emulator built with the Fedora toolchain.
-- A desktop entry and AppStream metadata so Beyrix appears in application menus.
+- `/usr/bin/bedit` — the project editor launcher.
+- Desktop entries for Beyrix and BEdit and AppStream metadata for Beyrix.
 - `cargo-license.txt` and `cargo-vendor.txt` in `/usr/share/licenses/beyrix/`
   describing every vendored crate that is linked into the binary.
 
@@ -36,43 +37,28 @@ Fedora 44 or newer:
 ```sh
 sudo dnf install rpm-build cargo-rpm-macros rust cargo gcc pkgconf-pkg-config \
     libxkbcommon-devel fontconfig dejavu-sans-mono-fonts
-./packaging/fedora/make-sources.sh v0.1.0-alpha.1
+./packaging/fedora/make-sources.sh v0.1.0-alpha.2
 ```
 
-The script downloads the tagged source archive, runs `cargo vendor --locked`,
+The script archives the local tag or downloads the tagged source, runs `cargo vendor --locked`,
 creates a reproducible vendor archive and builds the SRPM in `dist/fedora/`.
 It uses the tag's commit timestamp as `SOURCE_DATE_EPOCH`.
 
 Build the binary RPM from the SRPM:
 
 ```sh
-sudo dnf builddep dist/fedora/beyrix-0.1.0~alpha.1-1.fc44.src.rpm
-rpmbuild --rebuild dist/fedora/beyrix-0.1.0~alpha.1-1.fc44.src.rpm
+sudo dnf builddep dist/fedora/beyrix-0.1.0~alpha.2-1.fc44.src.rpm
+rpmbuild --rebuild dist/fedora/beyrix-0.1.0~alpha.2-1.fc44.src.rpm
 ```
 
 ## Publish a new release
 
-1. Bump `version` in `Cargo.toml`, run `cargo build --locked`, and commit the
-   resulting `Cargo.lock`.
-2. Update `%global upver`, `Version:` and the `%changelog` entry in
-   `beyrix.spec`, then commit both files to `main`. The packaging automation
-   checks that the tag and `%global upver` agree.
-3. Tag the commit (`git tag vX.Y.Z`) and push the tag.
-4. Generate and submit the SRPM:
+1. Update the Cargo version and lockfile, the RPM spec, AppStream metadata and release notes.
+2. Push the release commit to `main` and wait for Rust CI.
+3. Push the matching version tag. The Release workflow verifies and publishes the archive and checksums, then calls the COPR workflow with the same tag.
+4. Check the COPR build linked from the workflow summary for Fedora 44 and 45 success and wait for the repository metadata to expose the new RPM.
 
-   ```sh
-   ./packaging/fedora/make-sources.sh vX.Y.Z --submit
-   ```
-
-   `copr-cli build` waits for the build by default. Use
-   `copr-cli list-builds beykus-y/beyrix` or the web interface to check older
-   builds.
-
-The GitHub Actions workflow `.github/workflows/copr.yml` can do step 4
-automatically when a GitHub release is published. It requires a repository
-secret named `COPR_CONFIG` containing a complete `copr-cli` configuration
-file; the workflow skips publication when the secret is not configured. Never
-commit that file or the API token to the repository.
+To resume or retry the COPR stage, run the [COPR workflow](../../.github/workflows/copr.yml) manually with the published tag. The workflow watches an existing build for that RPM version instead of submitting it again. It requires the repository secret `COPR_CONFIG` and fails if the secret is missing. Keep COPR credentials in the repository secret store.
 
 ## Comparison with other installation methods
 
