@@ -1,0 +1,31 @@
+id = "beyrix.example.sdk-showcase"
+name = "SDK UI Showcase"
+version = "1.0.0"
+sdk_version = "1.0.0"
+kind = "widget"
+entry = "index.js"
+description = "Interactive showcase of all public BeyrixWidgets SDK UI components."
+permissions = ["ui", "theme"]
+
+[placement]
+mode = "overlay"
+anchor = "top-right"
+x = 16
+y = 16
+width = 300
+height = 280
+opacity = 0.96
+tui_behavior = "hidden"
+
+[[settings_schema]]
+key = "compact"
+label = "Compact Layout"
+kind = "boolean"
+default = false
+
+[[settings_schema]]
+key = "accentStyle"
+label = "Accent Style"
+kind = "enum"
+default = "accent"
+options = ["accent", "cyan", "green", "magenta"]

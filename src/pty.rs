@@ -15,16 +15,39 @@ pub struct Pty {
 
 impl Pty {
     pub fn resize(&self, columns: u16, rows: u16) -> io::Result<()> {
+        self.resize_with_pixels(columns, rows, 0, 0)
+    }
+
+    pub fn resize_with_pixels(
+        &self,
+        columns: u16,
+        rows: u16,
+        xpixel: u16,
+        ypixel: u16,
+    ) -> io::Result<()> {
         let size = libc::winsize {
             ws_col: columns,
             ws_row: rows,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+            ws_xpixel: xpixel,
+            ws_ypixel: ypixel,
         };
         if unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &size) } < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// Query the foreground process group's command name directly from the PTY
+    /// (`tcgetpgrp` + `/proc/<pgid>/comm`), independent of X-Ray.
+    pub fn foreground_comm(&self) -> Option<String> {
+        let pgid = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
+        if pgid <= 0 {
+            return None;
+        }
+        std::fs::read_to_string(format!("/proc/{pgid}/comm"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     }
 
     pub fn spawn() -> io::Result<Self> {
@@ -140,9 +163,12 @@ impl Pty {
                 }
             }
             if size.is_some() {
+                let version = CString::new(env!("CARGO_PKG_VERSION")).unwrap();
                 unsafe {
-                    libc::setenv(c"TERM".as_ptr(), c"ansi".as_ptr(), 1);
-                    libc::unsetenv(c"COLORTERM".as_ptr());
+                    libc::setenv(c"TERM".as_ptr(), c"xterm-256color".as_ptr(), 1);
+                    libc::setenv(c"COLORTERM".as_ptr(), c"truecolor".as_ptr(), 1);
+                    libc::setenv(c"TERM_PROGRAM".as_ptr(), c"Beyrix".as_ptr(), 1);
+                    libc::setenv(c"TERM_PROGRAM_VERSION".as_ptr(), version.as_ptr(), 1);
                 }
             }
             let shell = CString::new("/bin/bash").unwrap();

@@ -28,11 +28,20 @@ pub struct SceneRect {
     pub color: [f32; 4],
 }
 
+/// Font family category for glyph rasterization.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FontKind {
+    #[default]
+    Mono,
+    Ui,
+}
+
 /// A one-to-one copy from a glyph bitmap into the physical framebuffer.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SceneGlyph {
     pub ch: char,
     pub px_size: f32,
+    pub font_kind: FontKind,
     pub x: usize,
     pub y: usize,
     pub w: usize,
@@ -41,12 +50,54 @@ pub struct SceneGlyph {
     pub color: [f32; 4],
 }
 
+/// A rounded rectangle with optional border, drop shadow, and clip rect in physical pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SceneRoundedRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub radius: f32,
+    pub color: [f32; 4],
+    pub border_width: f32,
+    pub border_color: [f32; 4],
+    pub shadow_blur: f32,
+    pub shadow_offset_y: f32,
+    pub shadow_color: [f32; 4],
+    pub clip: Option<[f32; 4]>,
+}
+
+/// An RGBA bitmap image quad in physical pixels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SceneImage {
+    pub id: u64,
+    pub src_w: u32,
+    pub src_h: u32,
+    pub rgba: std::sync::Arc<Vec<u8>>,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub alpha: f32,
+    pub radius: f32,
+    pub clip: Option<[f32; 4]>,
+}
+
 /// Drawing instructions shared by the OpenGL and software backends.
 #[derive(Clone, Debug, Default)]
 pub struct Scene {
+    pub behind_rects: Vec<SceneRoundedRect>,
+    pub behind_images: Vec<SceneImage>,
+    pub behind_glyphs: Vec<SceneGlyph>,
     pub rects: Vec<SceneRect>,
     pub glyphs: Vec<SceneGlyph>,
     pub overlays: Vec<SceneRect>,
+    pub overlay_rounded: Vec<SceneRoundedRect>,
+    pub overlay_images: Vec<SceneImage>,
+    pub overlay_glyphs: Vec<SceneGlyph>,
+    pub panel_rounded: Vec<SceneRoundedRect>,
+    pub panel_images: Vec<SceneImage>,
+    pub panel_glyphs: Vec<SceneGlyph>,
     pub background: [f32; 4],
 }
 
@@ -65,6 +116,10 @@ pub struct Geometry {
     pub cell_height: usize,
     pub padding: usize,
     pub baseline: usize,
+    pub inset_left: usize,
+    pub inset_top: usize,
+    pub inset_right: usize,
+    pub inset_bottom: usize,
 }
 impl Geometry {
     /// The primary face defines the grid. Fallback faces use those same cells.
@@ -94,7 +149,27 @@ impl Geometry {
             cell_height: (ascent + descent + gap).max(1),
             baseline: ascent + gap / 2,
             padding: 0,
+            inset_left: 0,
+            inset_top: 0,
+            inset_right: 0,
+            inset_bottom: 0,
         }
+    }
+
+    pub fn with_insets(mut self, left: f32, top: f32, right: f32, bottom: f32) -> Self {
+        self.inset_left = left.max(0.0).round() as usize;
+        self.inset_top = top.max(0.0).round() as usize;
+        self.inset_right = right.max(0.0).round() as usize;
+        self.inset_bottom = bottom.max(0.0).round() as usize;
+        self
+    }
+
+    pub fn origin_x(self) -> usize {
+        self.padding + self.inset_left
+    }
+
+    pub fn origin_y(self) -> usize {
+        self.padding + self.inset_top
     }
 
     pub fn for_window(mut self, width: usize, height: usize) -> Self {
@@ -105,10 +180,11 @@ impl Geometry {
         self
     }
     pub fn cell_at(self, x: f64, y: f64) -> (usize, usize) {
-        let pad = self.padding as f64;
+        let ox = self.origin_x() as f64;
+        let oy = self.origin_y() as f64;
         (
-            ((x - pad) / self.cell_width as f64).floor() as usize,
-            ((y - pad) / self.cell_height as f64).floor() as usize,
+            ((x - ox) / self.cell_width as f64).floor() as usize,
+            ((y - oy) / self.cell_height as f64).floor() as usize,
         )
     }
 
@@ -116,12 +192,12 @@ impl Geometry {
         let padding = self.for_window(width, height).padding;
         (
             width
-                .saturating_sub(2 * padding)
+                .saturating_sub(2 * padding + self.inset_left + self.inset_right)
                 .checked_div(self.cell_width)
                 .unwrap_or(0)
                 .clamp(1, u16::MAX as usize),
             height
-                .saturating_sub(2 * padding)
+                .saturating_sub(2 * padding + self.inset_top + self.inset_bottom)
                 .checked_div(self.cell_height)
                 .unwrap_or(0)
                 .clamp(1, u16::MAX as usize),
@@ -133,8 +209,9 @@ const GLYPH_CACHE_ENTRIES: usize = 4096;
 
 pub struct Renderer {
     fonts: Vec<Font>,
+    ui_fonts: Vec<Font>,
     font_geometry: Cell<Option<(u32, Geometry)>>,
-    cache: HashMap<(char, u32), (Metrics, Vec<u8>)>,
+    cache: HashMap<(char, u32, FontKind), (Metrics, Vec<u8>)>,
     cache_bytes: usize,
     theme: crate::theme::Theme,
 }
@@ -199,9 +276,68 @@ impl Renderer {
                 "no usable system font found (install a monospace font or fontconfig)",
             ));
         }
+
+        // Load a proportional sans-serif UI font stack separately from the monospace terminal font.
+        let mut ui_paths = Vec::new();
+        for pattern in [
+            "Inter,Cantarell,Noto Sans,DejaVu Sans,sans-serif:style=Regular",
+            "sans-serif:style=Regular",
+        ] {
+            if let Ok(output) = Command::new("fc-match")
+                .args(["-s", "-f", "%{file}\\t%{index}\\n", pattern])
+                .output()
+                && output.status.success()
+            {
+                ui_paths.extend(
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .filter_map(|line| {
+                            let (path, index) = line.rsplit_once('\t')?;
+                            Some((path.to_owned(), index.parse::<u32>().ok()? & 0xffff))
+                        }),
+                );
+                if !ui_paths.is_empty() {
+                    break;
+                }
+            }
+        }
+        ui_paths.extend(
+            [
+                "/usr/share/fonts/google-noto/NotoSans-Regular.ttf",
+                "/usr/share/fonts/cantarell/Cantarell-Regular.otf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+                "/usr/share/fonts/liberation-sans-fonts/LiberationSans-Regular.ttf",
+            ]
+            .iter()
+            .map(|s| (s.to_string(), 0)),
+        );
+        let mut ui_fonts = Vec::new();
+        let mut ui_seen = std::collections::HashSet::new();
+        for (path, collection_index) in ui_paths {
+            if !ui_seen.insert((path.clone(), collection_index)) {
+                continue;
+            }
+            if let Ok(data) = std::fs::read(path)
+                && let Ok(font) = Font::from_bytes(
+                    data,
+                    FontSettings {
+                        collection_index,
+                        ..Default::default()
+                    },
+                )
+            {
+                ui_fonts.push(font);
+                if ui_fonts.len() == 8 {
+                    break;
+                }
+            }
+        }
+
         Ok(Self {
             font_geometry: Cell::default(),
             fonts,
+            ui_fonts,
             cache: HashMap::new(),
             cache_bytes: 0,
             theme,
@@ -214,6 +350,18 @@ impl Renderer {
             self.theme = theme;
         }
         Ok(())
+    }
+    pub fn set_font_size(&mut self, size: f32) {
+        let clamped = size.clamp(6.0, 96.0);
+        if (self.theme.font_size - clamped).abs() > 0.05 {
+            self.theme.font_size = clamped;
+            self.font_geometry.set(None);
+            self.cache.clear();
+            self.cache_bytes = 0;
+        }
+    }
+    pub fn font_size(&self) -> f32 {
+        self.theme.font_size
     }
     pub fn cursor_blinks(&self, screen: &Screen) -> bool {
         self.theme.cursor_blink && screen.cursor_style.is_none_or(|style| style.blink)
@@ -246,22 +394,71 @@ impl Renderer {
             .find(|font| font.lookup_glyph_index(ch) != 0)
     }
 
+    fn font_for_kind(&self, ch: char, kind: FontKind) -> Option<&Font> {
+        match kind {
+            FontKind::Mono => self.font_for(ch),
+            FontKind::Ui => self
+                .ui_fonts
+                .iter()
+                .find(|font| font.lookup_glyph_index(ch) != 0)
+                .or_else(|| self.font_for(ch)),
+        }
+    }
+
     fn raster_source(&self, ch: char) -> (&Font, char) {
-        if let Some(font) = self.font_for(ch) {
+        self.raster_source_kind(ch, FontKind::Mono)
+    }
+
+    fn raster_source_kind(&self, ch: char, kind: FontKind) -> (&Font, char) {
+        if let Some(font) = self.font_for_kind(ch, kind) {
             (font, ch)
         } else {
             // Some faces give the missing-glyph slot an empty outline.
             // Use an explicit replacement while keeping the original cell span.
             let replacement = '\u{fffd}';
-            self.font_for(replacement)
-                .map_or((&self.fonts[0], '?'), |font| (font, replacement))
+            let fallback_primary = match kind {
+                FontKind::Ui => self.ui_fonts.first().unwrap_or(&self.fonts[0]),
+                FontKind::Mono => &self.fonts[0],
+            };
+            self.font_for_kind(replacement, kind)
+                .map_or((fallback_primary, '?'), |font| (font, replacement))
         }
     }
 
+    #[cfg(test)]
+    pub fn has_distinct_ui_font(&self) -> bool {
+        !self.ui_fonts.is_empty()
+    }
+
+    /// Measure proportional UI text width and line height in physical pixels.
+    pub fn measure_ui_text(&self, text: &str, px_size: f32) -> (f32, f32) {
+        let mut width = 0.0_f32;
+        for ch in text.chars() {
+            if ch == ' ' {
+                let (font, _) = self.raster_source_kind(' ', FontKind::Ui);
+                let adv = font.metrics(' ', px_size).advance_width;
+                width += if adv > 0.5 { adv } else { px_size * 0.32 };
+            } else {
+                let (font, rc) = self.raster_source_kind(ch, FontKind::Ui);
+                width += font.metrics(rc, px_size).advance_width.max(px_size * 0.25);
+            }
+        }
+        (width, (px_size * 1.35).ceil())
+    }
+
     pub fn glyph_bitmap(&mut self, ch: char, px_size: f32) -> &(Metrics, Vec<u8>) {
-        let key = (ch, px_size.to_bits());
+        self.glyph_bitmap_kind(ch, px_size, FontKind::Mono)
+    }
+
+    pub fn glyph_bitmap_kind(
+        &mut self,
+        ch: char,
+        px_size: f32,
+        kind: FontKind,
+    ) -> &(Metrics, Vec<u8>) {
+        let key = (ch, px_size.to_bits(), kind);
         if !self.cache.contains_key(&key) {
-            let (font, raster_char) = self.raster_source(ch);
+            let (font, raster_char) = self.raster_source_kind(ch, kind);
             let glyph = font.rasterize(raster_char, px_size);
             if self.cache.len() >= GLYPH_CACHE_ENTRIES
                 || self.cache_bytes + glyph.1.len() > GLYPH_CACHE_BYTES
@@ -320,7 +517,31 @@ impl Renderer {
 
     /// Build a scene in physical pixels. Partial redraws emit only damaged rows.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub fn build_terminal_scene(
+        &mut self,
+        screen: &Screen,
+        dimensions: (usize, usize),
+        selection: &crate::selection::Selection,
+        focused: bool,
+        blink_on: bool,
+        scale: f32,
+        rows: Option<(usize, usize)>,
+    ) -> Scene {
+        self.build_terminal_scene_with_insets(
+            screen,
+            dimensions,
+            selection,
+            focused,
+            blink_on,
+            scale,
+            rows,
+            (0.0, 0.0, 0.0, 0.0),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_terminal_scene_with_insets(
         &mut self,
         screen: &Screen,
         (width, height): (usize, usize),
@@ -329,18 +550,22 @@ impl Renderer {
         blink_on: bool,
         scale: f32,
         rows: Option<(usize, usize)>,
+        insets: (f32, f32, f32, f32),
     ) -> Scene {
-        let base = self.geometry(scale).for_window(width, height);
+        let base = self
+            .geometry(scale)
+            .for_window(width, height)
+            .with_insets(insets.0, insets.1, insets.2, insets.3);
         let (width, height) = (width as f32, height as f32);
         let cell_w = base.cell_width as f32;
         let cell_h = base.cell_height as f32;
         let padding = base.padding as f32;
         let baseline = base.baseline as f32;
         let px_size = self.font_px(scale);
-        let inner_left = padding;
-        let inner_right = (width - padding).max(inner_left);
-        let inner_top = padding;
-        let inner_bottom = (height - padding).max(inner_top);
+        let inner_left = base.origin_x() as f32;
+        let inner_right = (width - padding - base.inset_right as f32).max(inner_left);
+        let inner_top = base.origin_y() as f32;
+        let inner_bottom = (height - padding - base.inset_bottom as f32).max(inner_top);
 
         let background = rgba(self.theme.background);
         let cursor_color = rgba(self.theme.cursor);
@@ -430,38 +655,250 @@ impl Renderer {
                 if cell.continuation {
                     continue;
                 }
-                let foreground = if block_covers(x, y) {
+                let mut foreground = if block_covers(x, y) {
                     background
                 } else if selection.contains(screen, y, x) {
                     selection_foreground
                 } else {
                     rgba(resolve_color(cell.fg, cell.fg_origin, &self.theme))
                 };
+                if cell.attrs.contains(crate::terminal::CellAttrs::DIM) {
+                    foreground[3] *= 0.58;
+                }
+                if cell.attrs.contains(crate::terminal::CellAttrs::BOLD) && !block_covers(x, y) {
+                    foreground[0] = (foreground[0] * 1.12).min(1.0);
+                    foreground[1] = (foreground[1] * 1.12).min(1.0);
+                    foreground[2] = (foreground[2] * 1.12).min(1.0);
+                }
                 let cell_left = inner_left + x as f32 * cell_w;
                 let cell_right = cell_left + cell_w * if cell.wide { 2.0 } else { 1.0 };
-                for (index, ch) in std::iter::once(cell.character)
-                    .chain(cell.combining.iter().copied())
-                    .enumerate()
-                {
-                    if ch == ' ' {
-                        continue;
+                let hidden = cell.attrs.contains(crate::terminal::CellAttrs::CONCEAL)
+                    || (cell.attrs.contains(crate::terminal::CellAttrs::BLINK) && !blink_on);
+                if !hidden {
+                    for (index, ch) in std::iter::once(cell.character)
+                        .chain(cell.combining.iter().copied())
+                        .enumerate()
+                    {
+                        if ch == ' ' {
+                            continue;
+                        }
+                        self.push_scene_glyph(
+                            &mut scene,
+                            ch,
+                            index != 0,
+                            px_size,
+                            cell_left,
+                            cell_right,
+                            top,
+                            bottom,
+                            baseline,
+                            inner_left,
+                            inner_right,
+                            foreground,
+                        );
+                        // Synthetic bold weight: subtle +1px horizontal double-strike.
+                        if cell.attrs.contains(crate::terminal::CellAttrs::BOLD)
+                            && index == 0
+                            && cell_left + 1.0 < cell_right
+                        {
+                            self.push_scene_glyph(
+                                &mut scene,
+                                ch,
+                                false,
+                                px_size,
+                                cell_left + scale.max(1.0) * 0.65,
+                                cell_right,
+                                top,
+                                bottom,
+                                baseline,
+                                inner_left,
+                                inner_right,
+                                [
+                                    foreground[0],
+                                    foreground[1],
+                                    foreground[2],
+                                    foreground[3] * 0.55,
+                                ],
+                            );
+                        }
                     }
-                    self.push_scene_glyph(
-                        &mut scene,
-                        ch,
-                        index != 0,
-                        px_size,
-                        cell_left,
-                        cell_right,
-                        top,
-                        bottom,
-                        baseline,
-                        inner_left,
-                        inner_right,
-                        foreground,
-                    );
+                }
+                // Text decorations: Underline (Single/Double/Curly/Dotted/Dashed), Strikethrough, Overline
+                let thickness = scale.round().max(1.0);
+                let deco_w = (cell_right.min(inner_right) - cell_left).max(0.0);
+                if deco_w > 0.0 {
+                    let ul_style = if cell.underline != crate::terminal::UnderlineStyle::None {
+                        cell.underline
+                    } else if cell.hyperlink_id != 0 {
+                        crate::terminal::UnderlineStyle::Dotted
+                    } else {
+                        crate::terminal::UnderlineStyle::None
+                    };
+                    if ul_style != crate::terminal::UnderlineStyle::None {
+                        let ul_color = cell.underline_color.map_or(foreground, rgba);
+                        let ul_y = (top + baseline + thickness * 1.5).min(bottom - thickness);
+                        match ul_style {
+                            crate::terminal::UnderlineStyle::Single => {
+                                scene.overlays.push(SceneRect {
+                                    x: cell_left,
+                                    y: ul_y,
+                                    w: deco_w,
+                                    h: thickness,
+                                    color: ul_color,
+                                });
+                            }
+                            crate::terminal::UnderlineStyle::Double => {
+                                scene.overlays.push(SceneRect {
+                                    x: cell_left,
+                                    y: (ul_y - thickness).max(top),
+                                    w: deco_w,
+                                    h: thickness,
+                                    color: ul_color,
+                                });
+                                scene.overlays.push(SceneRect {
+                                    x: cell_left,
+                                    y: (ul_y + thickness).min(bottom - thickness),
+                                    w: deco_w,
+                                    h: thickness,
+                                    color: ul_color,
+                                });
+                            }
+                            crate::terminal::UnderlineStyle::Curly => {
+                                let step = (2.0 * scale).max(2.0);
+                                let mut cx = cell_left;
+                                let mut up = false;
+                                while cx < cell_left + deco_w {
+                                    let seg_w = step.min(cell_left + deco_w - cx);
+                                    let cy = if up {
+                                        (ul_y - thickness).max(top)
+                                    } else {
+                                        ul_y
+                                    };
+                                    scene.overlays.push(SceneRect {
+                                        x: cx,
+                                        y: cy,
+                                        w: seg_w,
+                                        h: thickness,
+                                        color: ul_color,
+                                    });
+                                    cx += step;
+                                    up = !up;
+                                }
+                            }
+                            crate::terminal::UnderlineStyle::Dotted => {
+                                let step = (3.0 * scale).max(3.0);
+                                let mut cx = cell_left;
+                                while cx < cell_left + deco_w {
+                                    let seg_w = thickness.min(cell_left + deco_w - cx);
+                                    scene.overlays.push(SceneRect {
+                                        x: cx,
+                                        y: ul_y,
+                                        w: seg_w,
+                                        h: thickness,
+                                        color: ul_color,
+                                    });
+                                    cx += step;
+                                }
+                            }
+                            crate::terminal::UnderlineStyle::Dashed => {
+                                let dash = (4.0 * scale).max(3.0);
+                                let step = dash * 1.6;
+                                let mut cx = cell_left;
+                                while cx < cell_left + deco_w {
+                                    let seg_w = dash.min(cell_left + deco_w - cx);
+                                    scene.overlays.push(SceneRect {
+                                        x: cx,
+                                        y: ul_y,
+                                        w: seg_w,
+                                        h: thickness,
+                                        color: ul_color,
+                                    });
+                                    cx += step;
+                                }
+                            }
+                            crate::terminal::UnderlineStyle::None => {}
+                        }
+                    }
+                    if cell
+                        .attrs
+                        .contains(crate::terminal::CellAttrs::STRIKETHROUGH)
+                    {
+                        scene.overlays.push(SceneRect {
+                            x: cell_left,
+                            y: top + cell_h * 0.52,
+                            w: deco_w,
+                            h: thickness,
+                            color: foreground,
+                        });
+                    }
+                    if cell.attrs.contains(crate::terminal::CellAttrs::OVERLINE) {
+                        scene.overlays.push(SceneRect {
+                            x: cell_left,
+                            y: top,
+                            w: deco_w,
+                            h: thickness,
+                            color: foreground,
+                        });
+                    }
                 }
             }
+        }
+
+        // Emit inline terminal graphics (Kitty Graphics Protocol & SIXEL) visible in viewport.
+        let is_alt = screen.is_alternate_screen();
+        let top_abs = screen.visible_start();
+        let layout_off = screen.layout_offset();
+        for img in &screen.graphics.placements {
+            if img.alternate != is_alt {
+                continue;
+            }
+            let img_end_abs = img.abs_row + img.rows;
+            if img_end_abs <= top_abs || img.abs_row >= top_abs + screen.rows {
+                continue;
+            }
+            let rel_row = img.abs_row as isize - top_abs as isize + layout_off as isize;
+            let ix = inner_left + img.col as f32 * cell_w;
+            let iy = inner_top + rel_row as f32 * cell_h;
+            let iw = img.cols as f32 * cell_w;
+            let ih = img.rows as f32 * cell_h;
+            if iw > 0.0 && ih > 0.0 {
+                scene.overlay_images.push(SceneImage {
+                    id: img.id,
+                    src_w: img.src_w,
+                    src_h: img.src_h,
+                    rgba: std::sync::Arc::clone(&img.rgba),
+                    x: ix,
+                    y: iy,
+                    w: iw,
+                    h: ih,
+                    alpha: 1.0,
+                    radius: 0.0,
+                    clip: None,
+                });
+            }
+        }
+
+        // Emit OSC 9;4 progress bar at the top edge when active.
+        if let Some((state, pct)) = screen.progress
+            && state > 0
+        {
+            let bar_color = match state {
+                2 => rgba(self.theme.ansi[1]), // error (red)
+                4 => rgba(self.theme.ansi[3]), // paused/warning (yellow)
+                _ => cursor_color,
+            };
+            let frac = if state == 3 {
+                0.35
+            } else {
+                (pct as f32 / 100.0).clamp(0.02, 1.0)
+            };
+            scene.overlays.push(SceneRect {
+                x: inner_left,
+                y: inner_top,
+                w: (inner_right - inner_left) * frac,
+                h: (2.5 * scale).max(2.0),
+                color: bar_color,
+            });
         }
 
         if cursor_shown && !block && cursor_row >= row_start && cursor_row < row_end {
@@ -548,7 +985,7 @@ impl Renderer {
         clip_right: f32,
         color: [f32; 4],
     ) {
-        let metrics = if let Some(glyph) = self.cache.get(&(ch, px_size.to_bits())) {
+        let metrics = if let Some(glyph) = self.cache.get(&(ch, px_size.to_bits(), FontKind::Mono)) {
             glyph.0
         } else {
             if combining && self.font_for(ch).is_none() {
@@ -581,6 +1018,7 @@ impl Renderer {
         scene.glyphs.push(SceneGlyph {
             ch,
             px_size,
+            font_kind: FontKind::Mono,
             x: x0 as usize,
             y: y0 as usize,
             w: (x1 - x0) as usize,
@@ -869,10 +1307,49 @@ impl Renderer {
         let (pixels, _) = pixels.as_chunks_mut::<4>();
         let height = pixels.len() / width;
         pixels.fill(to_bgra(scene.background));
+        if !scene.behind_rects.is_empty() {
+            paint_rounded_rects(pixels, width, height, &scene.behind_rects);
+        }
+        if !scene.behind_images.is_empty() {
+            paint_images(pixels, width, height, &scene.behind_images);
+        }
+        if !scene.behind_glyphs.is_empty() {
+            self.paint_glyph_list(pixels, width, height, &scene.behind_glyphs);
+        }
         paint_rects(pixels, width, height, &scene.rects);
-        for glyph in &scene.glyphs {
-            let (metrics, bitmap) = self.glyph_bitmap(glyph.ch, glyph.px_size);
+        self.paint_glyph_list(pixels, width, height, &scene.glyphs);
+        paint_rects(pixels, width, height, &scene.overlays);
+        if !scene.overlay_rounded.is_empty() {
+            paint_rounded_rects(pixels, width, height, &scene.overlay_rounded);
+        }
+        if !scene.overlay_images.is_empty() {
+            paint_images(pixels, width, height, &scene.overlay_images);
+        }
+        if !scene.overlay_glyphs.is_empty() {
+            self.paint_glyph_list(pixels, width, height, &scene.overlay_glyphs);
+        }
+        if !scene.panel_rounded.is_empty() {
+            paint_rounded_rects(pixels, width, height, &scene.panel_rounded);
+        }
+        if !scene.panel_images.is_empty() {
+            paint_images(pixels, width, height, &scene.panel_images);
+        }
+        if !scene.panel_glyphs.is_empty() {
+            self.paint_glyph_list(pixels, width, height, &scene.panel_glyphs);
+        }
+    }
+
+    fn paint_glyph_list(
+        &mut self,
+        pixels: &mut [[u8; 4]],
+        width: usize,
+        height: usize,
+        glyphs: &[SceneGlyph],
+    ) {
+        for glyph in glyphs {
+            let (metrics, bitmap) = self.glyph_bitmap_kind(glyph.ch, glyph.px_size, glyph.font_kind);
             let color = to_bgra(glyph.color);
+            let glyph_alpha = glyph.color[3].clamp(0.0, 1.0);
             let (sx, sy) = glyph.source;
             let right = (glyph.x + glyph.w).min(width);
             let bottom = (glyph.y + glyph.h).min(height);
@@ -887,7 +1364,7 @@ impl Renderer {
                     .iter_mut()
                     .zip(&bitmap[start..start + count])
                 {
-                    let alpha = u32::from(alpha);
+                    let alpha = (f32::from(alpha) * glyph_alpha).round() as u32;
                     for channel in 0..3 {
                         pixel[channel] = ((u32::from(color[channel]) * alpha
                             + u32::from(pixel[channel]) * (255 - alpha))
@@ -896,7 +1373,181 @@ impl Renderer {
                 }
             }
         }
-        paint_rects(pixels, width, height, &scene.overlays);
+    }
+}
+
+#[inline]
+fn sd_rounded_box_px(px: f32, py: f32, half_w: f32, half_h: f32, r: f32) -> f32 {
+    let qx = px.abs() - half_w + r;
+    let qy = py.abs() - half_h + r;
+    qx.max(qy).min(0.0) + qx.max(0.0).hypot(qy.max(0.0)) - r
+}
+
+#[inline]
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0).max(1e-6)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn paint_rounded_rects(
+    pixels: &mut [[u8; 4]],
+    width: usize,
+    height: usize,
+    rects: &[SceneRoundedRect],
+) {
+    for rect in rects {
+        if rect.w <= 0.0 || rect.h <= 0.0 {
+            continue;
+        }
+        let r = rect.radius.min(rect.w * 0.5).min(rect.h * 0.5).max(0.0);
+        let half_w = rect.w * 0.5;
+        let half_h = rect.h * 0.5;
+        let center_x = rect.x + half_w;
+        let center_y = rect.y + half_h;
+
+        let (clip_x0, clip_y0, clip_x1, clip_y1) = if let Some([cx, cy, cw, ch]) = rect.clip {
+            (
+                (cx.floor().max(0.0) as usize).min(width),
+                (cy.floor().max(0.0) as usize).min(height),
+                ((cx + cw).ceil().max(0.0) as usize).min(width),
+                ((cy + ch).ceil().max(0.0) as usize).min(height),
+            )
+        } else {
+            (0, 0, width, height)
+        };
+
+        // 1. Optional soft drop shadow behind the rounded rectangle.
+        let blur = rect.shadow_blur.max(0.0);
+        let sh_a = rect.shadow_color[3].clamp(0.0, 1.0);
+        if blur > 0.5 && sh_a > 0.002 {
+            let sh_bgra = to_bgra(rect.shadow_color);
+            let sy_center = center_y + rect.shadow_offset_y;
+            let sx0 = ((rect.x - blur).floor().max(0.0) as usize).max(clip_x0).min(clip_x1);
+            let sx1 = ((rect.x + rect.w + blur).ceil().max(0.0) as usize).max(clip_x0).min(clip_x1);
+            let sy0 = ((rect.y + rect.shadow_offset_y - blur).floor().max(0.0) as usize)
+                .max(clip_y0)
+                .min(clip_y1);
+            let sy1 = ((rect.y + rect.h + rect.shadow_offset_y + blur).ceil().max(0.0) as usize)
+                .max(clip_y0)
+                .min(clip_y1);
+            for py in sy0..sy1 {
+                let ly = py as f32 + 0.5 - sy_center;
+                for px in sx0..sx1 {
+                    let lx = px as f32 + 0.5 - center_x;
+                    let dist = sd_rounded_box_px(lx, ly, half_w, half_h, r);
+                    let falloff = 1.0 - smoothstep(-blur * 0.25, blur, dist);
+                    let a = sh_a * falloff;
+                    if a > 0.002 {
+                        let dst = &mut pixels[py * width + px];
+                        let inv = 1.0 - a;
+                        for c in 0..3 {
+                            dst[c] = (sh_bgra[c] as f32 * a + dst[c] as f32 * inv).round() as u8;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Main rounded rect fill + anti-aliased inner border.
+        let x0 = (rect.x.floor().max(0.0) as usize).max(clip_x0).min(clip_x1);
+        let x1 = ((rect.x + rect.w).ceil().max(0.0) as usize).max(clip_x0).min(clip_x1);
+        let y0 = (rect.y.floor().max(0.0) as usize).max(clip_y0).min(clip_y1);
+        let y1 = ((rect.y + rect.h).ceil().max(0.0) as usize).max(clip_y0).min(clip_y1);
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
+        let bw = rect.border_width.max(0.0);
+        let fill = to_bgra(rect.color);
+        let fill_a = rect.color[3].clamp(0.0, 1.0);
+        let border = to_bgra(rect.border_color);
+        let border_a = rect.border_color[3].clamp(0.0, 1.0);
+        for py in y0..y1 {
+            let ly = py as f32 + 0.5 - center_y;
+            for px in x0..x1 {
+                let lx = px as f32 + 0.5 - center_x;
+                let dist = sd_rounded_box_px(lx, ly, half_w, half_h, r);
+                if dist > 0.5 {
+                    continue;
+                }
+                let outer_aa = (0.5 - dist).clamp(0.0, 1.0);
+                let dst = &mut pixels[py * width + px];
+                if fill_a > 0.0 {
+                    let a = fill_a * outer_aa;
+                    let inv = 1.0 - a;
+                    for c in 0..3 {
+                        dst[c] = (fill[c] as f32 * a + dst[c] as f32 * inv).round() as u8;
+                    }
+                }
+                if bw > 0.0 && border_a > 0.0 {
+                    let b_mask = (dist + bw + 0.5).clamp(0.0, 1.0) * outer_aa;
+                    if b_mask > 0.002 {
+                        let a = border_a * b_mask;
+                        let inv = 1.0 - a;
+                        for c in 0..3 {
+                            dst[c] = (border[c] as f32 * a + dst[c] as f32 * inv).round() as u8;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn paint_images(pixels: &mut [[u8; 4]], width: usize, height: usize, images: &[SceneImage]) {
+    for img in images {
+        if img.src_w == 0 || img.src_h == 0 || img.w <= 0.0 || img.h <= 0.0 {
+            continue;
+        }
+        let (clip_x0, clip_y0, clip_x1, clip_y1) = if let Some([cx, cy, cw, ch]) = img.clip {
+            (
+                (cx.floor().max(0.0) as usize).min(width),
+                (cy.floor().max(0.0) as usize).min(height),
+                ((cx + cw).ceil().max(0.0) as usize).min(width),
+                ((cy + ch).ceil().max(0.0) as usize).min(height),
+            )
+        } else {
+            (0, 0, width, height)
+        };
+        let x0 = (img.x.floor().max(0.0) as usize).max(clip_x0).min(clip_x1);
+        let x1 = ((img.x + img.w).ceil().max(0.0) as usize).max(clip_x0).min(clip_x1);
+        let y0 = (img.y.floor().max(0.0) as usize).max(clip_y0).min(clip_y1);
+        let y1 = ((img.y + img.h).ceil().max(0.0) as usize).max(clip_y0).min(clip_y1);
+        let r = img.radius.min(img.w * 0.5).min(img.h * 0.5).max(0.0);
+        let half_w = img.w * 0.5;
+        let half_h = img.h * 0.5;
+        let center_x = img.x + half_w;
+        let center_y = img.y + half_h;
+        for py in y0..y1 {
+            let v = ((py as f32 + 0.5 - img.y) / img.h).clamp(0.0, 0.9999);
+            let sy = (v * img.src_h as f32) as usize;
+            let ly = py as f32 + 0.5 - center_y;
+            for px in x0..x1 {
+                let mut mask = 1.0_f32;
+                if r > 0.0 {
+                    let lx = px as f32 + 0.5 - center_x;
+                    let dist = sd_rounded_box_px(lx, ly, half_w, half_h, r);
+                    mask = (0.5 - dist).clamp(0.0, 1.0);
+                    if mask <= 0.002 {
+                        continue;
+                    }
+                }
+                let u = ((px as f32 + 0.5 - img.x) / img.w).clamp(0.0, 0.9999);
+                let sx = (u * img.src_w as f32) as usize;
+                let off = (sy * img.src_w as usize + sx) * 4;
+                if off + 3 >= img.rgba.len() {
+                    continue;
+                }
+                let a = (img.rgba[off + 3] as f32 / 255.0) * img.alpha.clamp(0.0, 1.0) * mask;
+                if a <= 0.002 {
+                    continue;
+                }
+                let inv = 1.0 - a;
+                let dst = &mut pixels[py * width + px];
+                dst[0] = (img.rgba[off + 2] as f32 * a + dst[0] as f32 * inv).round() as u8;
+                dst[1] = (img.rgba[off + 1] as f32 * a + dst[1] as f32 * inv).round() as u8;
+                dst[2] = (img.rgba[off] as f32 * a + dst[2] as f32 * inv).round() as u8;
+            }
+        }
     }
 }
 
@@ -1114,14 +1765,11 @@ mod tests {
         let mut terminal = Terminal::new(2, 1);
         terminal.process(b"A\x1b[?25l");
         let mut selection = crate::selection::Selection::default();
-        selection.press(
+        selection.select_range(
             terminal.screen(),
             crate::selection::Position { row: 0, col: 0 },
-            1,
-            0.0,
-            0.0,
+            crate::selection::Position { row: 0, col: 0 },
         );
-        selection.release();
         let g = renderer.geometry(1.0);
         let (width, height) = frame(g, 2, 1);
         let pixels = renderer.render_selection(terminal.screen(), width, height, &selection);
@@ -1268,5 +1916,39 @@ mod tests {
         }
         assert!(view.status.contains("demo.txt"));
         assert_eq!(view.rows[0].text, "!hello");
+    }
+
+    #[test]
+    fn dock_insets_shift_origin_grid_size_selection_and_scene_identically() {
+        let mut renderer = Renderer::new().unwrap();
+        let g = renderer.geometry(1.0).for_window(800, 600);
+        let g_dock = g.with_insets(40.0, 30.0, 0.0, 0.0);
+        assert_eq!(g_dock.origin_x(), g.padding + 40);
+        assert_eq!(g_dock.origin_y(), g.padding + 30);
+
+        let term = Terminal::new(40, 20);
+        let pos = crate::selection::position(
+            g_dock,
+            (g_dock.origin_x() + 2) as f64,
+            (g_dock.origin_y() + 2) as f64,
+            term.screen(),
+        );
+        assert_eq!((pos.col, pos.row), (0, 0));
+
+        let mut t2 = Terminal::new(40, 20);
+        t2.process(b"A");
+        let scene = renderer.build_terminal_scene_with_insets(
+            t2.screen(),
+            (800, 600),
+            &crate::selection::Selection::default(),
+            true,
+            true,
+            1.0,
+            None,
+            (40.0, 30.0, 0.0, 0.0),
+        );
+        assert!(!scene.glyphs.is_empty());
+        assert!(scene.glyphs[0].x >= g_dock.origin_x());
+        assert!(scene.glyphs[0].y >= g_dock.origin_y());
     }
 }

@@ -183,10 +183,35 @@ fn paste_bytes(bytes: &[u8], bracketed: bool) -> Vec<u8> {
         return Vec::new();
     }
     if bracketed {
-        [b"\x1b[200~".as_slice(), bytes, b"\x1b[201~".as_slice()].concat()
+        // Strip embedded bracketed-paste end/start markers to prevent escape
+        // breakout attacks when pasting untrusted text.
+        let mut clean = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i..].starts_with(b"\x1b[200~") || bytes[i..].starts_with(b"\x1b[201~") {
+                i += 6;
+            } else {
+                clean.push(bytes[i]);
+                i += 1;
+            }
+        }
+        [b"\x1b[200~".as_slice(), &clean, b"\x1b[201~".as_slice()].concat()
     } else {
         bytes.to_vec()
     }
+}
+
+#[derive(Clone, Debug)]
+struct RepeatKey {
+    key: u32,
+    serial: u32,
+    next_fire: std::time::Instant,
+}
+
+#[derive(Clone, Debug)]
+struct PendingMultilinePaste {
+    bytes: Vec<u8>,
+    expires_at: std::time::Instant,
 }
 fn wheel_rows(remainder: f64, steps: f64, speed: usize) -> (isize, f64) {
     let total = remainder - steps * speed as f64;
@@ -231,6 +256,12 @@ impl Drop for FrameBuffer {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PressedKeyRoute {
+    sent_to_pty: bool,
+    kitty_report_release: bool,
+}
+
 #[derive(Default)]
 struct State {
     running: bool,
@@ -245,6 +276,12 @@ struct State {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     xkb: Option<crate::keyboard::Keyboard>,
     keyboard_focus: bool,
+    repeat_rate: i32,
+    repeat_delay: i32,
+    repeat_key: Option<RepeatKey>,
+    pending_multiline_paste: Option<PendingMultilinePaste>,
+    #[cfg(test)]
+    test_clipboard: Option<String>,
     blink_epoch: Option<std::time::Instant>,
     blink_on: bool,
     pointer: Option<wl_pointer::WlPointer>,
@@ -252,8 +289,15 @@ struct State {
     pointer_position: (f64, f64),
     wheel_axis: f64,
     wheel_steps: Option<f64>,
+    wheel_h_axis: f64,
+    wheel_h_steps: Option<f64>,
     wheel_remainder: f64,
     wheel_mouse_remainder: f64,
+    wheel_h_mouse_remainder: f64,
+    last_serial: u32,
+    default_font_size: f32,
+    pending_osc52_clipboard: Option<String>,
+    pressed_keys: std::collections::HashMap<u32, PressedKeyRoute>,
     mouse_button: Option<crate::mouse::Button>,
     drag_scroll_at: Option<std::time::Instant>,
     selection: crate::selection::Selection,
@@ -296,6 +340,17 @@ struct State {
     fractional_manager: Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
     fractional_scale: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
     pty: Option<Pty>,
+
+    bus: crate::events::EventBus,
+    platform_config: crate::config::PlatformConfig,
+    ui_compositor: crate::widgets::compositor::UiCompositor,
+    settings_overlay: crate::widgets::editor_ui::SettingsOverlay,
+    widgets: Option<crate::widgets::WidgetManager>,
+    media: Option<crate::media::MediaManager>,
+    background: Option<crate::background::BackgroundEngine>,
+    xray: Option<crate::xray::XRayEngine>,
+    xray_hits: Vec<crate::widgets::ui::UiHitTarget>,
+    platform_dirty: bool,
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
@@ -320,6 +375,8 @@ fn run_with(editor: Option<BEdit>) -> Result<(), Box<dyn Error>> {
         standalone_editor: editor.is_some(),
         editor,
         control: Some(crate::control::Control::new().map_err(|e| format!("control socket: {e}"))?),
+        repeat_rate: 25,
+        repeat_delay: 400,
         blink_epoch: Some(std::time::Instant::now()),
         blink_on: true,
         width: WIDTH,
@@ -408,7 +465,11 @@ fn run_with(editor: Option<BEdit>) -> Result<(), Box<dyn Error>> {
             state.damage_full = true;
             state.dirty = true;
         }
+        state.pump_key_repeat(Some(&qh));
         state.pump_clipboard();
+        if let Some(osc52_text) = state.pending_osc52_clipboard.take() {
+            state.set_clipboard(osc52_text, state.last_serial, &qh);
+        }
         let size = state.pending_size.take();
         let scale = state.pending_scale.take();
         if size.is_some() || scale.is_some() {
@@ -418,6 +479,7 @@ fn run_with(editor: Option<BEdit>) -> Result<(), Box<dyn Error>> {
                 .map_err(|e| format!("resize window: {e}"))?;
         }
         state.update_drag(true);
+        state.pump_platform();
         state
             .redraw(&qh)
             .map_err(|e| format!("update shared buffer: {e}"))?;
@@ -469,7 +531,8 @@ fn run_with(editor: Option<BEdit>) -> Result<(), Box<dyn Error>> {
             },
             revents: 0,
         }));
-        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 50) };
+        let poll_timeout_ms = state.next_poll_timeout_ms();
+        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, poll_timeout_ms) };
         if result < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -503,6 +566,8 @@ struct TerminalSignature {
     visible_start: usize,
     layout_offset: usize,
     view_offset: usize,
+    graphics_revision: u64,
+    progress: Option<(u8, u8)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -607,8 +672,17 @@ fn row_hash(
             &mut hash,
             u64::from(cell.wide)
                 | (u64::from(cell.continuation) << 1)
-                | (u64::from(cell.written) << 2),
+                | (u64::from(cell.written) << 2)
+                | (u64::from(cell.attrs.0) << 8)
+                | ((cell.underline as u64) << 24)
+                | (u64::from(cell.hyperlink_id) << 32),
         );
+        if let Some(ulc) = cell.underline_color {
+            hash_mix(
+                &mut hash,
+                u32::from_le_bytes([ulc[0], ulc[1], ulc[2], 1]) as u64,
+            );
+        }
         hash_mix(
             &mut hash,
             u32::from_le_bytes([cell.fg[0], cell.fg[1], cell.fg[2], 0]) as u64,
@@ -667,6 +741,8 @@ fn terminal_damage(
         visible_start: screen.visible_start(),
         layout_offset: screen.layout_offset(),
         view_offset: screen.view_offset(),
+        graphics_revision: screen.graphics.revision,
+        progress: screen.progress,
     };
     let cursor = cursor_state(screen, focused, blink_on);
     if force_full || signature.as_ref() != Some(&current) || hashes.len() != screen.rows {
@@ -792,9 +868,9 @@ fn row_pixel_rect(
     physical: (i32, i32),
     range: (usize, usize),
 ) -> PixelRect {
-    let edge = |row| (geometry.padding + row * geometry.cell_height) as i32;
+    let edge = |row| (geometry.origin_y() + row * geometry.cell_height) as i32;
     let top = edge(range.0);
-    let bottom = edge(range.1).min(physical.1 - geometry.padding as i32);
+    let bottom = edge(range.1).min(physical.1 - (geometry.padding + geometry.inset_bottom) as i32);
     PixelRect {
         x: 0,
         y: top.max(0),
@@ -841,7 +917,10 @@ impl State {
         }
         let renderer =
             render::Renderer::with_theme(theme.clone()).map_err(|e| format!("load fonts: {e}"))?;
-        let (columns, rows) = self.surface_sizes().grid_size(&renderer);
+        self.default_font_size = theme.font_size;
+        let sizes = self.surface_sizes();
+        let (columns, rows) = sizes.grid_size(&renderer);
+        let init_geom = sizes.geometry(&renderer);
         let requested = theme.renderer;
         let mut gl = None;
         let reason;
@@ -894,7 +973,11 @@ impl State {
         if let Some(control) = &self.control {
             control.set_prompt(&theme)?;
         }
-        let terminal = Terminal::with_theme(columns, rows, theme);
+        let mut terminal = Terminal::with_theme(columns, rows, theme);
+        terminal.screen_mut().set_pixel_metrics(
+            (columns * init_geom.cell_width, rows * init_geom.cell_height),
+            (init_geom.cell_width, init_geom.cell_height),
+        );
         self.damage_full = true;
 
         // Начальный commit без буфера:
@@ -924,7 +1007,10 @@ impl State {
         if self.debug_input {
             eprintln!("[output] spawned bash pid={}", pty.child_pid);
         }
+        let child_pid = pty.child_pid;
+        let master_fd = pty.master.as_raw_fd();
         self.pty = Some(pty);
+        self.init_platform_subsystems(child_pid, master_fd);
 
         Ok(())
     }
@@ -935,7 +1021,13 @@ impl State {
 
     fn pointer_geometry(&self) -> Option<render::Geometry> {
         let renderer = self.renderer.as_ref()?;
-        Some(self.surface_sizes().geometry(renderer))
+        let sizes = self.surface_sizes();
+        let insets = self.dock_insets_tuple(sizes.scale.factor());
+        Some(
+            sizes
+                .geometry(renderer)
+                .with_insets(insets.0, insets.1, insets.2, insets.3),
+        )
     }
 
     fn map_surface_buffer(&self, surface: &wl_surface::WlSurface, sizes: SurfaceSizes) {
@@ -1086,7 +1178,7 @@ impl State {
         }
         let old_physical = self.surface_sizes().physical;
         let (columns, rows) =
-            sizes.grid_size(self.renderer.as_ref().ok_or("renderer unavailable")?);
+            self.effective_grid_size(sizes, self.renderer.as_ref().ok_or("renderer unavailable")?);
         if sizes.physical != old_physical {
             if let Some(gl) = &mut self.gl
                 && let Err(error) = gl.resize(sizes.physical.0, sizes.physical.1)
@@ -1096,14 +1188,21 @@ impl State {
             self.generation += 1;
             self.buffers.retain(|frame| frame.busy);
         }
-        if let Some(terminal) = &mut self.terminal
-            && (terminal.screen().columns, terminal.screen().rows) != (columns, rows)
-        {
-            if let Some(pty) = &self.pty {
-                pty.resize(columns as u16, rows as u16)
-                    .map_err(|e| format!("TIOCSWINSZ: {e}"))?;
+        if let Some(terminal) = &mut self.terminal {
+            let geom = self.renderer.as_ref().map(|r| sizes.geometry(r));
+            let (cw, ch) = geom.map_or((9, 18), |g| (g.cell_width, g.cell_height));
+            let xpix = (columns * cw).min(u16::MAX as usize) as u16;
+            let ypix = (rows * ch).min(u16::MAX as usize) as u16;
+            terminal
+                .screen_mut()
+                .set_pixel_metrics((columns * cw, rows * ch), (cw, ch));
+            if (terminal.screen().columns, terminal.screen().rows) != (columns, rows) {
+                if let Some(pty) = &self.pty {
+                    pty.resize_with_pixels(columns as u16, rows as u16, xpix, ypix)
+                        .map_err(|e| format!("TIOCSWINSZ: {e}"))?;
+                }
+                terminal.resize(columns, rows);
             }
-            terminal.resize(columns, rows);
         }
         if let Some(editor) = &mut self.editor {
             editor.follow_cursor();
@@ -1160,10 +1259,10 @@ impl State {
         pressed: bool,
         motion: bool,
     ) -> bool {
-        let Some((mode, sgr)) = self.terminal.as_ref().map(|terminal| {
+        let Some((mode, encoding)) = self.terminal.as_ref().map(|terminal| {
             (
                 terminal.screen().mouse_mode(),
-                terminal.screen().mouse_sgr(),
+                terminal.screen().mouse_encoding(),
             )
         }) else {
             return false;
@@ -1171,12 +1270,21 @@ impl State {
         let Some((column, row)) = self.mouse_cell() else {
             return false;
         };
+        let (pixel_x, pixel_y) = self.pointer_geometry().map_or((0, 0), |g| {
+            let (px, py) = self.surface_sizes().physical_point(self.pointer_position);
+            (
+                (px - g.origin_x() as f64).max(0.0).round() as usize,
+                (py - g.origin_y() as f64).max(0.0).round() as usize,
+            )
+        });
         let Some(bytes) = crate::mouse::encode(crate::mouse::Event {
             mode,
-            sgr,
+            encoding,
             button,
             column,
             row,
+            pixel_x,
+            pixel_y,
             pressed,
             motion,
             modifiers: self.pointer_modifiers(),
@@ -1233,8 +1341,104 @@ impl State {
             return;
         }
         if pressed {
+            use crate::widgets::compositor::{ActiveSystemPanel, SurfaceOwner};
+            let (px, py) = (x as f32, y as f32);
+            let top_owner = self.ui_compositor.topmost_owner_at(px, py);
+            match top_owner {
+                Some(SurfaceOwner::Settings) => {
+                    let (_, changed) = self
+                        .settings_overlay
+                        .handle_click((px, py), &mut self.platform_config);
+                    if !self.settings_overlay.open {
+                        self.ui_compositor.close_active();
+                        self.sync_active_panel();
+                    }
+                    if changed {
+                        self.reconcile_platform_subsystems();
+                    }
+                    self.platform_dirty = true;
+                    self.dirty = true;
+                    return;
+                }
+                Some(SurfaceOwner::Studio) => {
+                    let mut cfg_changed = false;
+                    if let Some(widgets) = &mut self.widgets {
+                        let (_, changed) = widgets.handle_pointer_press_with_config(
+                            (px, py),
+                            sizes.scale.factor(),
+                            Some(&mut self.platform_config),
+                        );
+                        cfg_changed = changed;
+                        if !widgets.editor.active {
+                            self.ui_compositor.close_active();
+                            self.sync_active_panel();
+                        }
+                    }
+                    if cfg_changed {
+                        self.reconcile_platform_subsystems();
+                    }
+                    self.platform_dirty = true;
+                    self.dirty = true;
+                    return;
+                }
+                Some(SurfaceOwner::XRayPanel | SurfaceOwner::XRayIndicator) => {
+                    let hit = self
+                        .xray_hits
+                        .iter()
+                        .rev()
+                        .find(|h| px >= h.x && px <= h.x + h.w && py >= h.y && py <= h.y + h.h)
+                        .cloned();
+                    if let Some(hit) = hit {
+                        if hit.node_id == "xray-toggle" {
+                            self.ui_compositor.toggle_panel(ActiveSystemPanel::XRay);
+                            self.sync_active_panel();
+                        } else if let Some(xray) = &mut self.xray {
+                            xray.handle_hit(&hit.node_id, hit.kind);
+                        }
+                    }
+                    self.platform_dirty = true;
+                    self.dirty = true;
+                    return;
+                }
+                Some(SurfaceOwner::Widget) => {
+                    if let Some(widgets) = &mut self.widgets {
+                        widgets.handle_pointer_press((px, py), sizes.scale.factor());
+                        if self.ui_compositor.is_open(ActiveSystemPanel::Studio)
+                            && !widgets.editor.active
+                        {
+                            self.ui_compositor.close_active();
+                            self.sync_active_panel();
+                        }
+                    }
+                    self.platform_dirty = true;
+                    self.dirty = true;
+                    return;
+                }
+                None => {
+                    // When Studio is active, clicking the preview canvas never
+                    // leaks into terminal text selection or PTY mouse reporting.
+                    if self.ui_compositor.is_open(ActiveSystemPanel::Studio) {
+                        if let Some(widgets) = &mut self.widgets {
+                            widgets.handle_pointer_press((px, py), sizes.scale.factor());
+                        }
+                        self.platform_dirty = true;
+                        self.dirty = true;
+                        return;
+                    }
+                }
+            }
             if self.mouse_reporting() && self.report_mouse(Some(button), true, false) {
                 self.mouse_button = Some(button);
+                return;
+            }
+            if button == crate::mouse::Button::Left
+                && self.pointer_modifiers().ctrl
+                && let Some((col, row)) = self.mouse_cell()
+                && let Some(terminal) = &self.terminal
+                && let Some(cell) = terminal.screen().get(col, row)
+                && let Some(url) = terminal.screen().hyperlink_url(cell.hyperlink_id)
+            {
+                open_safe_hyperlink(url);
                 return;
             }
             if button == crate::mouse::Button::Left
@@ -1252,11 +1456,33 @@ impl State {
                 self.report_mouse(Some(held), false, false);
             }
         } else if button == crate::mouse::Button::Left {
+            if let Some(widgets) = &mut self.widgets {
+                widgets.handle_pointer_release();
+            }
             self.selection.release();
         }
     }
 
     fn pointer_motion(&mut self) {
+        if self.widgets.is_some() {
+            let sizes = self.surface_sizes();
+            let (px, py) = sizes.physical_point(self.pointer_position);
+            let cell = self.renderer.as_ref().map_or((10.0, 18.0), |r| {
+                let g = r.geometry(sizes.scale.factor());
+                (g.cell_width as f32, g.cell_height as f32)
+            });
+            if let Some(widgets) = &mut self.widgets
+                && widgets.handle_pointer_motion(
+                    (px as f32, py as f32),
+                    (sizes.physical.0 as f32, sizes.physical.1 as f32),
+                    sizes.scale.factor(),
+                    cell,
+                )
+            {
+                self.dirty = true;
+                return;
+            }
+        }
         if self.editor.is_some() || self.selection.is_dragging() {
             self.update_drag(false);
             return;
@@ -1281,7 +1507,49 @@ impl State {
         let steps = self.wheel_steps.take().unwrap_or(self.wheel_axis / 10.0);
         self.wheel_axis = 0.0;
         let steps = if steps.is_finite() { steps } else { 0.0 };
+        let h_steps = self
+            .wheel_h_steps
+            .take()
+            .unwrap_or(self.wheel_h_axis / 10.0);
+        self.wheel_h_axis = 0.0;
+        let h_steps = if h_steps.is_finite() { h_steps } else { 0.0 };
         let sizes = self.surface_sizes();
+        let (px, py) = sizes.physical_point(self.pointer_position);
+        if self.editor.is_none() && steps.abs() > 0.0 {
+            use crate::widgets::compositor::SurfaceOwner;
+            match self.ui_compositor.topmost_owner_at(px as f32, py as f32) {
+                Some(SurfaceOwner::XRayPanel) => {
+                    if let Some(xray) = &mut self.xray {
+                        if steps > 0.0 {
+                            xray.handle_hit("xray-scroll-down", crate::widgets::ui::HitKind::Button);
+                        } else {
+                            xray.handle_hit("xray-scroll-up", crate::widgets::ui::HitKind::Button);
+                        }
+                        self.platform_dirty = true;
+                        self.dirty = true;
+                    }
+                    return;
+                }
+                Some(SurfaceOwner::Settings | SurfaceOwner::Studio) => {
+                    if let Some(widgets) = &mut self.widgets {
+                        widgets.handle_pointer_scroll((px as f32, py as f32), (steps * 24.0) as f32);
+                    }
+                    self.platform_dirty = true;
+                    self.dirty = true;
+                    return;
+                }
+                Some(SurfaceOwner::Widget) => {
+                    if let Some(widgets) = &mut self.widgets
+                        && widgets
+                            .handle_pointer_scroll((px as f32, py as f32), (steps * 24.0) as f32)
+                    {
+                        self.dirty = true;
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
         if let Some(editor) = &mut self.editor {
             let (rows, remainder) = wheel_rows(self.wheel_remainder, steps, 3);
             self.wheel_remainder = remainder;
@@ -1291,8 +1559,7 @@ impl State {
                 self.dirty |= editor.scroll(-rows, x, y, metrics(geometry, sizes));
             }
         } else if self.mouse_reporting() {
-            // Report whole wheel notches and keep the fractional remainder so
-            // high-resolution touchpad scrolling does not lose events.
+            // Report whole vertical wheel notches and keep fractional remainder.
             self.wheel_mouse_remainder += steps;
             let notches = self.wheel_mouse_remainder.trunc();
             self.wheel_mouse_remainder -= notches;
@@ -1304,11 +1571,36 @@ impl State {
             for _ in 0..notches.abs().min(64.0) as usize {
                 self.report_mouse(Some(button), true, false);
             }
+            // Horizontal wheel notches (WheelLeft / WheelRight).
+            self.wheel_h_mouse_remainder += h_steps;
+            let h_notches = self.wheel_h_mouse_remainder.trunc();
+            self.wheel_h_mouse_remainder -= h_notches;
+            let h_button = if h_notches > 0.0 {
+                crate::mouse::Button::WheelRight
+            } else {
+                crate::mouse::Button::WheelLeft
+            };
+            for _ in 0..h_notches.abs().min(64.0) as usize {
+                self.report_mouse(Some(h_button), true, false);
+            }
         } else if let Some(terminal) = &mut self.terminal {
             let screen = terminal.screen_mut();
-            let (rows, remainder) = wheel_rows(self.wheel_remainder, steps, screen.scroll_speed());
-            self.wheel_remainder = remainder;
-            self.dirty |= screen.scroll_view(rows);
+            if screen.is_alternate_screen() && screen.alternate_scroll {
+                // DEC ?1007 Alternate Scroll Mode: translate wheel to Up/Down arrow keys.
+                self.wheel_mouse_remainder += steps;
+                let notches = self.wheel_mouse_remainder.trunc();
+                self.wheel_mouse_remainder -= notches;
+                let up = notches < 0.0;
+                let seq = crate::keyboard::alternate_scroll_sequence(up, screen.app_cursor_keys);
+                for _ in 0..notches.abs().min(32.0) as usize {
+                    self.input.extend(seq);
+                }
+            } else {
+                let (rows, remainder) =
+                    wheel_rows(self.wheel_remainder, steps, screen.scroll_speed());
+                self.wheel_remainder = remainder;
+                self.dirty |= screen.scroll_view(rows);
+            }
         }
         self.update_drag(false);
     }
@@ -1331,17 +1623,19 @@ impl State {
             self.drag_scroll_at = None;
             return;
         }
-        let (Some(renderer), Some(terminal)) = (&self.renderer, &mut self.terminal) else {
+        let Some(geometry) = self.pointer_geometry() else {
             return;
         };
-        if !self.selection.active(terminal.screen()) {
+        let Some(terminal) = &mut self.terminal else {
+            return;
+        };
+        if !self.selection.drag_valid(terminal.screen()) {
             self.selection.clear();
             self.drag_scroll_at = None;
             self.dirty = true;
             return;
         }
-        let geometry = sizes.geometry(renderer);
-        let top = geometry.padding as f64;
+        let top = geometry.origin_y() as f64;
         let bottom = top + (terminal.screen().rows * geometry.cell_height) as f64;
         let (direction, distance) = if y < top {
             (1, top - y)
@@ -1364,9 +1658,11 @@ impl State {
             self.dirty |= terminal.screen_mut().scroll_view(direction * rows);
         }
         let screen = terminal.screen();
-        self.dirty |= self
-            .selection
-            .motion(screen, crate::selection::position(geometry, x, y, screen));
+        self.dirty |= self.selection.motion_at(
+            screen,
+            crate::selection::position(geometry, x, y, screen),
+            Some(self.pointer_position),
+        );
     }
 
     fn setup_data_device(&mut self, qh: &QueueHandle<Self>) {
@@ -1395,21 +1691,77 @@ impl State {
             self.dirty = true;
         }
     }
-    fn copy(&mut self, serial: u32, qh: &QueueHandle<Self>) {
+    fn has_clipboard_text_offer(&self) -> bool {
+        #[cfg(test)]
+        if self
+            .test_clipboard
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+        {
+            return true;
+        }
+        let Some(offer) = &self.data_offer else {
+            return false;
+        };
+        let Some(mimes) = offer.data::<Mutex<Vec<String>>>() else {
+            return false;
+        };
+        let mimes = mimes.lock().unwrap_or_else(|e| e.into_inner());
+        [
+            "text/plain;charset=utf-8",
+            "text/plain;charset=UTF-8",
+            "UTF8_STRING",
+            "text/plain",
+        ]
+        .into_iter()
+        .any(|m| mimes.iter().any(|v| v == m))
+    }
+
+    fn copy(&mut self, serial: u32, qh: Option<&QueueHandle<Self>>) -> bool {
         let text = if let Some(editor) = &self.editor {
             editor.selection_text()
         } else {
             self.terminal
                 .as_ref()
                 .and_then(|t| self.selection.text(t.screen()))
+                .filter(|t| !t.is_empty())
         };
         if let Some(text) = text {
-            self.set_clipboard(text, serial, qh);
+            #[cfg(test)]
+            {
+                self.test_clipboard = Some(text.clone());
+            }
+            if let Some(qh) = qh {
+                self.set_clipboard(text, serial, qh);
+            }
+            true
+        } else {
+            false
         }
     }
+
     fn paste(&mut self) {
         if self.debug_input {
             eprintln!("[clipboard] paste requested");
+        }
+        // If a multiline unbracketed paste was guarded and the user presses
+        // paste a second time within 3 seconds, confirm and deliver it.
+        if let Some(pending) = self.pending_multiline_paste.take()
+            && std::time::Instant::now() <= pending.expires_at
+        {
+            self.input.extend(pending.bytes);
+            return;
+        }
+        #[cfg(test)]
+        if self.data_offer.is_none()
+            && let Some(text) = self.test_clipboard.clone()
+        {
+            let bracketed = self
+                .terminal
+                .as_ref()
+                .is_some_and(|t| t.screen().bracketed_paste);
+            self.deliver_terminal_paste(text.as_bytes(), bracketed);
+            return;
         }
         let Some(offer) = &self.data_offer else {
             return;
@@ -1518,8 +1870,10 @@ impl State {
                                     }
                                 }
                                 Destination::Terminal => {
-                                    let bytes = paste_bytes(&transfer.bytes, transfer.bracketed);
-                                    self.input.extend(bytes);
+                                    self.deliver_terminal_paste(
+                                        &transfer.bytes,
+                                        transfer.bracketed,
+                                    );
                                 }
                             }
                         }
@@ -1531,6 +1885,362 @@ impl State {
             }
         }
     }
+    fn deliver_terminal_paste(&mut self, raw: &[u8], bracketed: bool) {
+        if raw.is_empty() {
+            return;
+        }
+        if !bracketed
+            && self.platform_config.keyboard.multiline_paste_protection
+            && (raw.contains(&b'\n') || raw.contains(&b'\r'))
+        {
+            // Protect against accidental multiline command execution when the
+            // shell/app does not have bracketed paste enabled. A second paste
+            // within 3 seconds confirms and sends the payload.
+            self.pending_multiline_paste = Some(PendingMultilinePaste {
+                bytes: paste_bytes(raw, false),
+                expires_at: std::time::Instant::now() + Duration::from_secs(3),
+            });
+            return;
+        }
+        let bytes = paste_bytes(raw, bracketed);
+        self.input.extend(bytes);
+    }
+
+    fn next_poll_timeout_ms(&self) -> i32 {
+        let mut timeout = 50i32;
+        if let Some(rep) = &self.repeat_key {
+            let now = std::time::Instant::now();
+            if rep.next_fire <= now {
+                return 0;
+            }
+            let rem = rep.next_fire.duration_since(now).as_millis().min(50) as i32;
+            timeout = timeout.min(rem.max(1));
+        }
+        timeout
+    }
+
+    fn pump_key_repeat(&mut self, qh: Option<&QueueHandle<Self>>) {
+        if !self.keyboard_focus || self.repeat_rate <= 0 {
+            self.repeat_key = None;
+            return;
+        }
+        let interval = Duration::from_micros((1_000_000 / self.repeat_rate.max(1) as u64).max(1));
+        let now = std::time::Instant::now();
+        // Cap burst repeats per event-loop turn to keep UI responsive.
+        for _ in 0..8 {
+            let Some(rep) = self.repeat_key.as_ref() else {
+                break;
+            };
+            if now < rep.next_fire {
+                break;
+            }
+            let (key, serial) = (rep.key, rep.serial);
+            if let Some(rep_mut) = self.repeat_key.as_mut() {
+                rep_mut.next_fire += interval;
+                if rep_mut.next_fire + interval * 4 < now {
+                    rep_mut.next_fire = now + interval;
+                }
+            }
+            if self.editor.is_some() {
+                if let Some(qh) = qh {
+                    self.editor_key(key, serial, qh);
+                }
+            } else {
+                self.dispatch_terminal_key_event(
+                    key,
+                    serial,
+                    qh,
+                    crate::keyboard::KeyEventType::Repeat,
+                );
+            }
+        }
+    }
+
+    fn dispatch_terminal_key_press(
+        &mut self,
+        key: u32,
+        serial: u32,
+        qh: Option<&QueueHandle<Self>>,
+    ) -> bool {
+        let kitty_release = self
+            .terminal
+            .as_ref()
+            .is_some_and(|t| (t.screen().kitty_keyboard_flags() & 2) != 0);
+        let forwarded =
+            self.dispatch_terminal_key_event(key, serial, qh, crate::keyboard::KeyEventType::Press);
+        self.pressed_keys.insert(
+            key,
+            PressedKeyRoute {
+                sent_to_pty: forwarded,
+                kitty_report_release: forwarded && kitty_release,
+            },
+        );
+        forwarded
+    }
+
+    fn dispatch_terminal_key_release(&mut self, key: u32) {
+        let Some(route) = self.pressed_keys.remove(&key) else {
+            return;
+        };
+        if !route.sent_to_pty || !route.kitty_report_release {
+            return;
+        }
+        if self.keyboard_focus
+            && self.editor.is_none()
+            && let (Some(xkb), Some(term)) = (&self.xkb, &self.terminal)
+        {
+            let modes = term.screen().input_modes();
+            // Only emit release if Kitty report-events flag (bit 2) is still active.
+            if (modes.kitty_flags & 2) != 0 {
+                let bytes = xkb.key_with_modes(key, modes, crate::keyboard::KeyEventType::Release);
+                self.input.extend(bytes);
+            }
+        }
+    }
+
+    /// Route a terminal key press/repeat (from live Wayland or E2E input tests) through
+    /// configurable hotkeys, Smart Ctrl+C / Ctrl+V, scrollback, font zoom, and mode-aware XKB translation.
+    /// Returns `true` if the key is eligible for Wayland autorepeat.
+    fn dispatch_terminal_key_event(
+        &mut self,
+        key: u32,
+        serial: u32,
+        qh: Option<&QueueHandle<Self>>,
+        event_type: crate::keyboard::KeyEventType,
+    ) -> bool {
+        self.last_serial = serial;
+        let Some((ctrl, shift, alt)) = self.xkb.as_ref().map(|x| (x.control(), x.shift(), x.alt()))
+        else {
+            return false;
+        };
+
+        // Focused Beyrix Studio text input consumes typing/Backspace/Enter/Escape cleanly.
+        if let Some(w) = &mut self.widgets
+            && w.editor.active
+            && w.editor.focused_input.is_some()
+        {
+            let ch = match key {
+                2 | 79 => Some('1'),
+                3 | 80 => Some('2'),
+                4 | 81 => Some('3'),
+                5 | 75 => Some('4'),
+                6 | 76 => Some('5'),
+                7 | 77 => Some('6'),
+                8 | 71 => Some('7'),
+                9 | 72 => Some('8'),
+                10 | 73 => Some('9'),
+                11 | 82 => Some('0'),
+                12 | 74 => Some('-'),
+                52 | 83 => Some('.'),
+                _ => None,
+            };
+            let backspace = key == 14;
+            let enter = key == 28 || key == 96;
+            let escape = key == 1;
+            if w.handle_editor_key(ch, backspace, enter, escape) {
+                self.platform_dirty = true;
+                self.dirty = true;
+                return false;
+            }
+        }
+
+        // Escape closes the topmost open system panel (Settings, Studio, or X-Ray) without leaking to PTY.
+        if key == 1 && !ctrl && !shift && !alt {
+            if self.ui_compositor.close_active() {
+                self.sync_active_panel();
+                self.platform_dirty = true;
+                self.dirty = true;
+                return false;
+            }
+        }
+
+        // Live font zoom: Ctrl+= / Ctrl++ (evdev 13/78), Ctrl+- (12/74), Ctrl+0 (11/82).
+        if ctrl && !alt && matches!(key, 13 | 78 | 12 | 74 | 11 | 82) {
+            if let Some(renderer) = &mut self.renderer {
+                let next = match key {
+                    13 | 78 => renderer.font_size() + 1.5,
+                    12 | 74 => renderer.font_size() - 1.5,
+                    _ => {
+                        if self.default_font_size > 0.0 {
+                            self.default_font_size
+                        } else {
+                            16.0
+                        }
+                    }
+                };
+                renderer.set_font_size(next);
+                if let Some(gl) = &mut self.gl {
+                    gl.invalidate_atlas();
+                }
+            }
+            self.sync_pty_grid_after_layout_change();
+            self.damage_full = true;
+            self.dirty = true;
+            return false;
+        }
+
+        // Ctrl+Shift+Up/Down: jump between OSC 133 semantic command prompts in scrollback.
+        if ctrl && shift && !alt && matches!(key, 103 | 108) {
+            if let Some(t) = &mut self.terminal {
+                let current = t.screen().visible_start();
+                let target = if key == 103 {
+                    t.screen().prev_command_row(current)
+                } else {
+                    t.screen().next_command_row(current)
+                };
+                if let Some(row) = target {
+                    self.dirty |= t.screen_mut().scroll_to_absolute_row(row);
+                } else if key == 108 {
+                    self.dirty |= t.screen().view_offset() > 0;
+                    t.screen_mut().reset_view();
+                }
+            }
+            return false;
+        }
+
+        // Shift + Home / End / PageUp / PageDown -> scrollback navigation.
+        if shift && !ctrl && !alt && matches!(key, 102 | 107 | 104 | 109) {
+            if let Some(t) = &mut self.terminal {
+                let rows = t.screen().rows as isize;
+                let delta = match key {
+                    104 => rows,
+                    109 => -rows,
+                    102 => isize::MAX,
+                    _ => isize::MIN,
+                };
+                self.dirty |= t.screen_mut().scroll_view(delta);
+            }
+            return true;
+        }
+
+        // Unified Settings Overlay hotkey (works even when Widgets JS VM is disabled).
+        if crate::config::Hotkey::parse(&self.platform_config.keyboard.settings_hotkey)
+            .is_some_and(|hk| hk.matches(ctrl, shift, alt, key))
+        {
+            self.ui_compositor
+                .toggle_panel(crate::widgets::compositor::ActiveSystemPanel::Settings);
+            self.sync_active_panel();
+            self.platform_dirty = true;
+            self.dirty = true;
+            return false;
+        }
+
+        // Beyrix Studio (Visual Layout Editor) hotkey — ONLY intercept when Widgets subsystem is enabled!
+        if self.widgets.is_some()
+            && crate::config::Hotkey::parse(&self.platform_config.widgets.editor_hotkey)
+                .is_some_and(|hk| hk.matches(ctrl, shift, alt, key))
+        {
+            self.ui_compositor
+                .toggle_panel(crate::widgets::compositor::ActiveSystemPanel::Studio);
+            self.sync_active_panel();
+            self.platform_dirty = true;
+            self.dirty = true;
+            return false;
+        }
+
+        // X-Ray panel hotkey — ONLY intercept when X-Ray subsystem is enabled!
+        if self.xray.is_some()
+            && crate::config::Hotkey::parse(&self.platform_config.xray.hotkey)
+                .is_some_and(|hk| hk.matches(ctrl, shift, alt, key))
+        {
+            self.ui_compositor
+                .toggle_panel(crate::widgets::compositor::ActiveSystemPanel::XRay);
+            self.sync_active_panel();
+            self.platform_dirty = true;
+            self.dirty = true;
+            return false;
+        }
+
+        // Guaranteed literal Ctrl+C hotkey (always sends 0x03 regardless of selection).
+        if crate::config::Hotkey::parse(&self.platform_config.keyboard.force_ctrl_c_hotkey)
+            .is_some_and(|hk| hk.matches(ctrl, shift, alt, key))
+        {
+            self.input.push_back(0x03);
+            return false;
+        }
+
+        // Guaranteed literal Ctrl+V hotkey (always sends 0x16 regardless of clipboard/TUI).
+        if crate::config::Hotkey::parse(&self.platform_config.keyboard.literal_ctrl_v_hotkey)
+            .is_some_and(|hk| hk.matches(ctrl, shift, alt, key))
+        {
+            self.input.push_back(0x16);
+            return false;
+        }
+
+        // Ctrl+Shift+C (guaranteed copy) & Smart Ctrl+C (copy if intentional
+        // non-empty selection exists, otherwise forward 0x03 to PTY).
+        if ctrl && !alt && key == 46 {
+            if shift {
+                if self
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|t| self.selection.has_copyable_text(t.screen()))
+                {
+                    let copied = self.copy(serial, qh);
+                    if copied && self.platform_config.keyboard.clear_selection_after_copy {
+                        self.selection.clear();
+                        self.dirty = true;
+                    }
+                }
+                return false;
+            }
+            if self
+                .terminal
+                .as_ref()
+                .is_some_and(|t| self.selection.has_copyable_text(t.screen()))
+            {
+                let copied = self.copy(serial, qh);
+                if copied && self.platform_config.keyboard.clear_selection_after_copy {
+                    self.selection.clear();
+                    self.dirty = true;
+                }
+            } else {
+                self.input.push_back(0x03);
+            }
+            return false;
+        }
+
+        // Ctrl+Shift+V (guaranteed paste) & Smart Ctrl+V.
+        if ctrl && !alt && key == 47 {
+            if shift {
+                self.paste();
+                return false;
+            }
+            match self.platform_config.keyboard.ctrl_v_policy {
+                crate::config::CtrlVPolicy::AlwaysPaste => self.paste(),
+                crate::config::CtrlVPolicy::AlwaysLiteral => self.input.push_back(0x16),
+                crate::config::CtrlVPolicy::Smart => {
+                    if self.in_tui_mode() || !self.has_clipboard_text_offer() {
+                        self.input.push_back(0x16);
+                    } else {
+                        self.paste();
+                    }
+                }
+            }
+            return false;
+        }
+
+        let modes = self
+            .terminal
+            .as_ref()
+            .map_or_else(Default::default, |t| t.screen().input_modes());
+        let bytes = self
+            .xkb
+            .as_ref()
+            .map_or_else(Vec::new, |x| x.key_with_modes(key, modes, event_type));
+        if !bytes.is_empty()
+            && let Some(t) = &mut self.terminal
+        {
+            self.dirty |= t.screen().view_offset() > 0;
+            t.screen_mut().reset_view();
+        }
+        if self.debug_input {
+            eprintln!("[input] translated {} bytes", bytes.len());
+        }
+        self.input.extend(bytes);
+        true
+    }
+
     fn write_input(&mut self) -> Result<(), Box<dyn Error>> {
         if let Some(pty) = &self.pty {
             let bytes = self.input.make_contiguous();
@@ -1588,6 +2298,9 @@ impl State {
                 let terminal = self.terminal.as_mut().unwrap();
                 let old_bracketed = terminal.screen().bracketed_paste;
                 terminal.process(&bytes[..n]);
+                if let Some(xray) = &self.xray {
+                    xray.notify_terminal_output();
+                }
                 if self.debug_input && old_bracketed != terminal.screen().bracketed_paste {
                     eprintln!(
                         "[clipboard] bracketed paste={}",
@@ -1595,6 +2308,31 @@ impl State {
                     );
                 }
                 self.input.extend(terminal.take_responses());
+                if let Some(title) = terminal.screen_mut().take_title()
+                    && self.editor.is_none()
+                    && let Some(toplevel) = &self.toplevel
+                {
+                    toplevel.set_title(if title.is_empty() {
+                        "Beyrix".to_string()
+                    } else {
+                        title
+                    });
+                }
+                if let Some(clip_text) = terminal.screen_mut().take_clipboard_write() {
+                    #[cfg(test)]
+                    {
+                        self.test_clipboard = Some(clip_text.clone());
+                    }
+                    self.pending_osc52_clipboard = Some(clip_text);
+                }
+                let shell_events = terminal.screen_mut().drain_shell_events();
+                if !shell_events.is_empty()
+                    && let Some(xray) = &self.xray
+                {
+                    for ev in shell_events {
+                        xray.notify_shell_event(ev);
+                    }
+                }
                 if total >= MAX_BURST {
                     break;
                 }
@@ -1714,9 +2452,24 @@ impl State {
         if !self.configured || !self.dirty || self.frame_pending {
             return Ok(());
         }
+        // DEC mode 2026 Synchronized Output: defer presenting intermediate frames
+        // until the application ends the synchronized update (or safety timeout elapses).
+        if self.editor.is_none()
+            && self
+                .terminal
+                .as_ref()
+                .is_some_and(|t| t.screen().is_synchronized_active())
+        {
+            return Ok(());
+        }
         if self.backend == ActiveBackend::OpenGl && self.gl.is_some() {
             let logical = (self.width as usize, self.height as usize);
-            let force_full = self.damage_full || self.editor.is_some();
+            let bg_active = self
+                .background
+                .as_ref()
+                .is_some_and(|b| b.is_active(self.keyboard_focus, self.in_tui_mode()));
+            let force_full =
+                self.damage_full || self.editor.is_some() || bg_active || self.platform_dirty;
             self.damage_full = false;
             let mut damage = if let Some(terminal) = &self.terminal {
                 terminal_damage(
@@ -1732,9 +2485,12 @@ impl State {
             } else {
                 RowDamage::full()
             };
-            if damage.is_empty() {
+            if damage.is_empty() && !self.platform_dirty {
                 self.dirty = false;
                 return Ok(());
+            }
+            if self.platform_dirty {
+                damage = RowDamage::full();
             }
             let mut full = damage.full;
             if !full {
@@ -1790,12 +2546,12 @@ impl State {
         if let Some(surface) = &self.surface {
             self.map_surface_buffer(surface, sizes);
         }
-        if let (Some(surface), Some(terminal), Some(renderer)) =
-            (&self.surface, &self.terminal, &mut self.renderer)
-        {
-            let frame = &mut self.buffers[index];
+        if let (Some(_), Some(_), Some(_)) = (&self.surface, &self.terminal, &mut self.renderer) {
             let dimensions = sizes.buffer_dimensions();
-            let scene = match &mut self.editor {
+            let insets = self.dock_insets_tuple(sizes.scale.factor());
+            let renderer = self.renderer.as_mut().unwrap();
+            let terminal = self.terminal.as_ref().unwrap();
+            let mut scene = match &mut self.editor {
                 Some(editor) => {
                     let (columns, rows) = sizes.grid_size(renderer);
                     let view = editor.view(columns, rows);
@@ -1807,7 +2563,7 @@ impl State {
                         sizes.scale.factor(),
                     )
                 }
-                None => renderer.build_terminal_scene(
+                None => renderer.build_terminal_scene_with_insets(
                     terminal.screen(),
                     dimensions,
                     &self.selection,
@@ -1815,7 +2571,26 @@ impl State {
                     self.blink_on,
                     sizes.scale.factor(),
                     None,
+                    insets,
                 ),
+            };
+            let in_tui = self.in_tui_mode();
+            let ptr = sizes.physical_point(self.pointer_position);
+            let theme = self
+                .terminal
+                .as_ref()
+                .map_or_else(crate::theme::Theme::default, |t| t.screen().theme().clone());
+            self.emit_platform_layers(
+                &mut scene,
+                (dimensions.0 as f32, dimensions.1 as f32),
+                sizes.scale.factor(),
+                in_tui,
+                (ptr.0 as f32, ptr.1 as f32),
+                &theme,
+            );
+            let frame = &mut self.buffers[index];
+            let (Some(surface), Some(renderer)) = (&self.surface, &mut self.renderer) else {
+                return Ok(());
             };
             renderer.paint_scene(&scene, dimensions.0, frame.pixels());
             surface.attach(Some(&frame.buffer), 0, 0);
@@ -1829,6 +2604,7 @@ impl State {
             self.frame_pending = true;
             frame.busy = true;
             self.dirty = false;
+            self.platform_dirty = false;
         }
         Ok(())
     }
@@ -1843,9 +2619,12 @@ impl State {
         let dimensions = sizes.buffer_dimensions();
         let scale = sizes.scale.factor();
         let physical = sizes.physical;
+        let insets = self.dock_insets_tuple(scale);
         let renderer = self.renderer.as_ref().ok_or("renderer unavailable")?;
-        let geometry = sizes.geometry(renderer);
-        let grid = sizes.grid_size(renderer);
+        let geometry = sizes
+            .geometry(renderer)
+            .with_insets(insets.0, insets.1, insets.2, insets.3);
+        let grid = geometry.grid_size(dimensions.0, dimensions.1);
         let rects: Vec<PixelRect> = if full {
             vec![PixelRect {
                 x: 0,
@@ -1867,9 +2646,8 @@ impl State {
             self.map_surface_buffer(surface, sizes);
         }
         let renderer = self.renderer.as_mut().ok_or("renderer unavailable")?;
-        let gl = self.gl.as_mut().ok_or("OpenGL backend unavailable")?;
         if full {
-            let scene = match &mut self.editor {
+            let mut scene = match &mut self.editor {
                 Some(editor) => {
                     let (columns, rows) = grid;
                     let view = editor.view(columns, rows);
@@ -1882,8 +2660,10 @@ impl State {
                     )
                 }
                 None => {
+                    let insets = self.dock_insets_tuple(scale);
+                    let renderer = self.renderer.as_mut().ok_or("renderer unavailable")?;
                     let terminal = self.terminal.as_ref().ok_or("terminal unavailable")?;
-                    renderer.build_terminal_scene(
+                    renderer.build_terminal_scene_with_insets(
                         terminal.screen(),
                         dimensions,
                         &self.selection,
@@ -1891,16 +2671,34 @@ impl State {
                         self.blink_on,
                         scale,
                         None,
+                        insets,
                     )
                 }
             };
+            let in_tui = self.in_tui_mode();
+            let ptr = sizes.physical_point(self.pointer_position);
+            let theme = self
+                .terminal
+                .as_ref()
+                .map_or_else(crate::theme::Theme::default, |t| t.screen().theme().clone());
+            self.emit_platform_layers(
+                &mut scene,
+                (dimensions.0 as f32, dimensions.1 as f32),
+                scale,
+                in_tui,
+                (ptr.0 as f32, ptr.1 as f32),
+                &theme,
+            );
+            let renderer = self.renderer.as_mut().ok_or("renderer unavailable")?;
+            let gl = self.gl.as_mut().ok_or("OpenGL backend unavailable")?;
             gl.draw(renderer, &scene, &rects, true)?;
         } else {
             for (rect, range) in rects.iter().zip(damage.ranges.iter()) {
                 if rect.h == 0 {
                     continue;
                 }
-                let scene = match &mut self.editor {
+                let renderer = self.renderer.as_mut().ok_or("renderer unavailable")?;
+                let mut scene = match &mut self.editor {
                     Some(editor) => {
                         let (columns, rows) = grid;
                         let view = editor.view(columns, rows);
@@ -1913,8 +2711,10 @@ impl State {
                         )
                     }
                     None => {
+                        let insets = self.dock_insets_tuple(scale);
+                        let renderer = self.renderer.as_mut().ok_or("renderer unavailable")?;
                         let terminal = self.terminal.as_ref().ok_or("terminal unavailable")?;
-                        renderer.build_terminal_scene(
+                        renderer.build_terminal_scene_with_insets(
                             terminal.screen(),
                             dimensions,
                             &self.selection,
@@ -1922,17 +2722,612 @@ impl State {
                             self.blink_on,
                             scale,
                             Some(*range),
+                            insets,
                         )
                     }
                 };
+                let in_tui = self.in_tui_mode();
+                let ptr = sizes.physical_point(self.pointer_position);
+                let theme = self
+                    .terminal
+                    .as_ref()
+                    .map_or_else(crate::theme::Theme::default, |t| t.screen().theme().clone());
+                self.emit_platform_layers(
+                    &mut scene,
+                    (dimensions.0 as f32, dimensions.1 as f32),
+                    scale,
+                    in_tui,
+                    (ptr.0 as f32, ptr.1 as f32),
+                    &theme,
+                );
+                let renderer = self.renderer.as_mut().ok_or("renderer unavailable")?;
+                let gl = self.gl.as_mut().ok_or("OpenGL backend unavailable")?;
                 gl.draw(renderer, &scene, &[*rect], false)?;
             }
         }
         if let Some(surface) = &self.surface {
             surface.frame(qh, ());
         }
+        self.platform_dirty = false;
+        let gl = self.gl.as_mut().ok_or("OpenGL backend unavailable")?;
         gl.present(&rects, full)
     }
+
+    fn in_tui_mode(&self) -> bool {
+        const TUI_NAMES: &[&str] = &[
+            "vim", "nvim", "vi", "nano", "htop", "btop", "top", "tmux", "screen", "less", "man",
+            "mc", "lazygit", "tig", "ranger", "yazi",
+        ];
+        let Some(terminal) = &self.terminal else {
+            return false;
+        };
+        let screen = terminal.screen();
+        let known_tui_foreground = self
+            .pty
+            .as_ref()
+            .and_then(Pty::foreground_comm)
+            .is_some_and(|comm| TUI_NAMES.contains(&comm.to_ascii_lowercase().as_str()));
+        let signals = crate::widgets::layout::TuiSignals {
+            alternate_screen: screen.is_alternate_screen(),
+            mouse_reporting: screen.mouse_mode() != crate::mouse::Mode::Off,
+            bracketed_paste: screen.bracketed_paste,
+            full_scroll_margins: !screen.has_custom_scroll_margins(),
+            known_tui_foreground,
+        };
+        signals.is_fullscreen_tui()
+    }
+
+    fn dock_insets_tuple(&self, scale: f32) -> (f32, f32, f32, f32) {
+        self.widgets.as_ref().map_or((0.0, 0.0, 0.0, 0.0), |w| {
+            let i = w.dock_insets(self.in_tui_mode(), scale);
+            (i.left, i.top, i.right, i.bottom)
+        })
+    }
+
+    fn effective_grid_size(
+        &self,
+        sizes: SurfaceSizes,
+        renderer: &render::Renderer,
+    ) -> (usize, usize) {
+        let (w, h) = sizes.buffer_dimensions();
+        let insets = self.dock_insets_tuple(sizes.scale.factor());
+        sizes
+            .geometry(renderer)
+            .with_insets(insets.0, insets.1, insets.2, insets.3)
+            .grid_size(w, h)
+    }
+
+    fn sync_pty_grid_after_layout_change(&mut self) {
+        let Some(renderer) = &self.renderer else {
+            return;
+        };
+        let sizes = self.surface_sizes();
+        let (cols, rows) = self.effective_grid_size(sizes, renderer);
+        let geom = sizes.geometry(renderer);
+        let xpix = (cols * geom.cell_width).min(u16::MAX as usize) as u16;
+        let ypix = (rows * geom.cell_height).min(u16::MAX as usize) as u16;
+        if let Some(terminal) = &mut self.terminal {
+            terminal.screen_mut().set_pixel_metrics(
+                (cols * geom.cell_width, rows * geom.cell_height),
+                (geom.cell_width, geom.cell_height),
+            );
+            if (terminal.screen().columns, terminal.screen().rows) != (cols, rows) {
+                if let Some(pty) = &self.pty {
+                    let _ = pty.resize_with_pixels(cols as u16, rows as u16, xpix, ypix);
+                }
+                terminal.resize(cols, rows);
+                self.damage_full = true;
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Reconcile live runtime subsystems (Widgets, Background, Media, Audio, X-Ray)
+    /// against `self.platform_config`. Starts newly enabled subsystems, cleanly drops
+    /// disabled ones, updates live configs, and adjusts PTY viewport if Dock insets changed.
+    fn reconcile_platform_subsystems(&mut self) {
+        let cfg = self.platform_config.clone();
+        let theme = self
+            .terminal
+            .as_ref()
+            .map_or_else(crate::theme::Theme::default, |t| t.screen().theme().clone());
+
+        // 1. Media & System Audio Capture
+        if cfg.media.enabled {
+            let needs_restart = self.media.as_ref().is_none_or(|m| {
+                m.config.mpris_enabled != cfg.media.mpris_enabled
+                    || m.config.player_enabled != cfg.media.player_enabled
+                    || m.config.audio_capture_enabled != cfg.media.audio_capture_enabled
+                    || m.config.audio_capture_source != cfg.media.audio_capture_source
+            });
+            if needs_restart {
+                self.media = None;
+                let mut media = crate::media::MediaManager::new(cfg.media.clone());
+                media.ensure_started(self.bus.clone());
+                self.media = Some(media);
+            }
+        } else {
+            self.media = None;
+        }
+
+        // 2. 3D Background Engine
+        if cfg.background.enabled {
+            if let Some(bg) = &mut self.background {
+                bg.config = cfg.background.clone();
+            } else {
+                self.background = Some(crate::background::BackgroundEngine::new(
+                    cfg.background.clone(),
+                ));
+            }
+        } else {
+            self.background = None;
+        }
+
+        // 3. X-Ray Diagnostics
+        if cfg.xray.enabled {
+            if let Some(xr) = &mut self.xray {
+                xr.set_level(cfg.xray.level);
+                xr.config = cfg.xray.clone();
+            } else if let Some(pty) = &self.pty {
+                let mut xray = crate::xray::XRayEngine::new(cfg.xray.clone());
+                xray.ensure_started(
+                    pty.child_pid,
+                    Some(pty.master.as_raw_fd()),
+                    self.bus.clone(),
+                );
+                self.xray = Some(xray);
+            }
+        } else {
+            self.xray = None;
+            self.xray_hits.clear();
+        }
+
+        // 4. BeyrixWidgets JS Runtime
+        if cfg.widgets.enabled {
+            if let Some(w) = &mut self.widgets {
+                w.config = cfg.widgets.clone();
+            } else {
+                let mut widgets = crate::widgets::WidgetManager::new(cfg.widgets.clone());
+                if let Err(e) = widgets.ensure_started(theme, self.bus.clone()) {
+                    self.settings_overlay.status_message = Some(format!("Widgets error: {e}"));
+                }
+                self.widgets = Some(widgets);
+            }
+        } else {
+            self.widgets = None;
+        }
+
+        // 5. Recompute PTY viewport in case Dock insets appeared or disappeared.
+        self.sync_pty_grid_after_layout_change();
+        self.damage_full = true;
+        self.platform_dirty = true;
+        self.dirty = true;
+    }
+
+    fn init_platform_subsystems(&mut self, child_pid: libc::pid_t, pty_master_fd: i32) {
+        let cfg = load_platform_config();
+        self.platform_config = cfg.clone();
+        let theme = self
+            .terminal
+            .as_ref()
+            .map_or_else(crate::theme::Theme::default, |t| t.screen().theme().clone());
+        if cfg.media.enabled {
+            let mut media = crate::media::MediaManager::new(cfg.media.clone());
+            media.ensure_started(self.bus.clone());
+            self.media = Some(media);
+        }
+        if cfg.background.enabled {
+            self.background = Some(crate::background::BackgroundEngine::new(
+                cfg.background.clone(),
+            ));
+        }
+        if cfg.xray.enabled {
+            let mut xray = crate::xray::XRayEngine::new(cfg.xray.clone());
+            xray.ensure_started(child_pid, Some(pty_master_fd), self.bus.clone());
+            self.xray = Some(xray);
+        }
+        if cfg.widgets.enabled {
+            let mut widgets = crate::widgets::WidgetManager::new(cfg.widgets.clone());
+            if let Err(e) = widgets.ensure_started(theme, self.bus.clone()) {
+                eprintln!("beyrix widgets: {e}");
+            }
+            self.widgets = Some(widgets);
+        }
+    }
+
+    fn pump_platform(&mut self) {
+        if let Some(widgets) = &mut self.widgets {
+            if widgets.poll_hot_reload() > 0 {
+                self.platform_dirty = true;
+                self.dirty = true;
+            }
+            if widgets.take_dirty() {
+                self.platform_dirty = true;
+                self.dirty = true;
+            }
+            for action in widgets.drain_actions() {
+                match action {
+                    crate::widgets::runtime::HostAction::MediaPlayPause => {
+                        if let Some(m) = &self.media {
+                            m.play_pause();
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::MediaNext => {
+                        if let Some(m) = &self.media {
+                            m.next();
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::MediaPrev => {
+                        if let Some(m) = &self.media {
+                            m.prev();
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::MediaSeek(s) => {
+                        if let Some(m) = &self.media {
+                            m.seek(s);
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::MediaSetVolume(v) => {
+                        if let Some(m) = &self.media {
+                            m.set_volume(v);
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::MediaPlayFile(p) => {
+                        if let Some(m) = &self.media {
+                            m.play_file(std::path::PathBuf::from(p));
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::MediaEnqueue(p) => {
+                        if let Some(m) = &self.media {
+                            m.enqueue_file(std::path::PathBuf::from(p));
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundSetPreset { owner, preset } => {
+                        if let (Some(bg), Some(preset)) = (
+                            &mut self.background,
+                            crate::config::BackgroundPreset::parse(&preset),
+                        ) && bg.set_preset(Some(&owner), preset).is_ok()
+                        {
+                            self.platform_dirty = true;
+                            self.dirty = true;
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundReleaseScene { owner } => {
+                        if let Some(bg) = &mut self.background {
+                            bg.release_scene(&owner);
+                            self.platform_dirty = true;
+                            self.dirty = true;
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundClearScene { owner } => {
+                        if let Some(bg) = &mut self.background
+                            && bg.clear_scene(&owner).is_ok()
+                        {
+                            self.platform_dirty = true;
+                            self.dirty = true;
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundAddObject { owner, spec } => {
+                        if let Some(bg) = &mut self.background {
+                            let _ = bg.add_object(&owner, spec);
+                            self.dirty = true;
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundUpdateObject {
+                        owner,
+                        id,
+                        position,
+                        rotation,
+                        scale,
+                        color,
+                    } => {
+                        if let Some(bg) = &mut self.background {
+                            bg.update_object(&owner, &id, position, rotation, scale, color);
+                            self.dirty = true;
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundRemoveObject { owner, id } => {
+                        if let Some(bg) = &mut self.background {
+                            bg.remove_object(&owner, &id);
+                            self.dirty = true;
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundSetCamera {
+                        owner,
+                        position,
+                        target,
+                        fov_deg,
+                        ortho,
+                    } => {
+                        if let Some(bg) = &mut self.background {
+                            bg.set_camera(&owner, position, target, fov_deg, ortho);
+                            self.dirty = true;
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundSetLight {
+                        owner,
+                        direction,
+                        color,
+                        intensity,
+                    } => {
+                        if let Some(bg) = &mut self.background {
+                            bg.set_light(&owner, direction, color, intensity);
+                            self.dirty = true;
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundSetCharset {
+                        owner,
+                        charset,
+                    } => {
+                        if let Some(bg) = &mut self.background
+                            && bg.set_charset(&owner, charset).is_ok()
+                        {
+                            self.platform_dirty = true;
+                            self.dirty = true;
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundBind { owner, binding } => {
+                        if let Some(bg) = &mut self.background {
+                            let _ = bg.add_binding(&owner, binding);
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundUnbind { owner, id } => {
+                        if let Some(bg) = &mut self.background {
+                            let _ = bg.remove_binding(&owner, &id);
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::WidgetLog {
+                        extension_id,
+                        level,
+                        message,
+                    } => {
+                        if self.debug_input {
+                            eprintln!("[widget:{extension_id}:{level}] {message}");
+                        }
+                    }
+                }
+            }
+        }
+        let in_tui = self.in_tui_mode();
+        if self.widgets.is_some()
+            && let Some(renderer) = &self.renderer
+        {
+            let sizes = self.surface_sizes();
+            let (cols, rows) = self.effective_grid_size(sizes, renderer);
+            if let Some(terminal) = &mut self.terminal
+                && (terminal.screen().columns, terminal.screen().rows) != (cols, rows)
+            {
+                if let Some(pty) = &self.pty {
+                    let _ = pty.resize(cols as u16, rows as u16);
+                }
+                terminal.resize(cols, rows);
+                self.damage_full = true;
+                self.dirty = true;
+            }
+        }
+        if let Some(xray) = &self.xray
+            && xray.take_dirty()
+        {
+            self.platform_dirty = true;
+            self.dirty = true;
+        }
+        if let Some(bg) = &self.background
+            && bg.is_active(self.keyboard_focus, in_tui)
+        {
+            if let Some(m) = &self.media {
+                let wants_audio = bg.config.audio_reactive
+                    || bg.config.preset == crate::config::BackgroundPreset::AudioReactive
+                    || !bg.bindings.is_empty();
+                m.set_native_audio_consumer(wants_audio);
+            }
+            if bg.should_step() {
+                self.dirty = true;
+            }
+        } else if let Some(m) = &self.media {
+            m.set_native_audio_consumer(false);
+        }
+    }
+
+    fn emit_platform_layers(
+        &mut self,
+        scene: &mut render::Scene,
+        win_size: (f32, f32),
+        scale: f32,
+        in_tui: bool,
+        pointer_px: (f32, f32),
+        theme: &crate::theme::Theme,
+    ) {
+        self.sync_active_panel();
+        let insets = self.dock_insets_tuple(scale);
+        let Some(renderer) = &mut self.renderer else {
+            return;
+        };
+        if let Some(bg) = &mut self.background {
+            let mut inputs = crate::background::bindings::BindingInputs::default();
+            if let Some(m) = &self.media {
+                let a = m.audio_snapshot();
+                inputs.audio_bass = a.bass;
+                inputs.audio_mid = a.mid;
+                inputs.audio_treble = a.treble;
+                inputs.audio_rms = a.rms;
+                inputs.audio_peak = a.peak;
+                inputs.audio_beat = if a.beat { 1.0 } else { 0.0 };
+            }
+            if let Some(x) = &self.xray {
+                let s = x.snapshot();
+                inputs.xray_activity = (s.total_cpu_percent / 100.0).clamp(0.0, 1.0);
+            }
+            let mouse_norm = (
+                (pointer_px.0 / win_size.0.max(1.0)).clamp(0.0, 1.0),
+                (pointer_px.1 / win_size.1.max(1.0)).clamp(0.0, 1.0),
+            );
+            bg.render_to_scene(
+                win_size,
+                scale,
+                self.keyboard_focus,
+                in_tui,
+                mouse_norm,
+                &inputs,
+                theme,
+                renderer,
+                scene,
+            );
+        }
+        use crate::widgets::compositor::{ActiveSystemPanel, SurfaceOwner};
+        self.ui_compositor.clear_surfaces();
+        self.xray_hits.clear();
+
+        if let Some(widgets) = &mut self.widgets {
+            let logical_w = win_size.0 / scale.max(0.25);
+            let logical_h = win_size.1 / scale.max(0.25);
+            widgets.update_window(logical_w, logical_h, scale, self.keyboard_focus);
+            let g = renderer
+                .geometry(scale)
+                .with_insets(insets.0, insets.1, insets.2, insets.3);
+            let inline_y_px = self
+                .terminal
+                .as_ref()
+                .and_then(|t| t.screen().latest_inline_display_row())
+                .map(|row| g.origin_y() as f32 + row as f32 * g.cell_height as f32);
+            let cursor_row_px = self.terminal.as_ref().map(|t| {
+                (
+                    g.origin_y() as f32
+                        + t.screen().cursor_display_row() as f32 * g.cell_height as f32,
+                    g.cell_height as f32,
+                )
+            });
+            widgets.emit_to_scene_with_config(
+                Some(&self.platform_config),
+                win_size,
+                scale,
+                (g.cell_width as f32, g.cell_height as f32),
+                in_tui,
+                pointer_px,
+                inline_y_px,
+                cursor_row_px,
+                theme,
+                renderer,
+                scene,
+            );
+            for rect in widgets.resolved_rects.values() {
+                if rect.visible && (rect.interactive || widgets.editor.active) {
+                    self.ui_compositor.register_surface(
+                        rect.x,
+                        rect.y,
+                        rect.w,
+                        rect.h,
+                        SurfaceOwner::Widget,
+                    );
+                }
+            }
+            if widgets.editor.active {
+                for &(ex, ey, ew, eh) in &widgets.editor_panel_rects {
+                    self.ui_compositor
+                        .register_surface(ex, ey, ew, eh, SurfaceOwner::Studio);
+                }
+            }
+        }
+        // Only emit X-Ray when Studio and Settings are not covering the workspace.
+        if !self.ui_compositor.is_open(ActiveSystemPanel::Studio)
+            && !self.ui_compositor.is_open(ActiveSystemPanel::Settings)
+            && let Some(xray) = &self.xray
+        {
+            let rects = xray.emit_to_scene(
+                win_size,
+                scale,
+                pointer_px,
+                theme,
+                renderer,
+                scene,
+                &mut self.xray_hits,
+            );
+            if let Some((ix, iy, iw, ih)) = rects.indicator {
+                self.ui_compositor.register_surface(
+                    ix,
+                    iy,
+                    iw,
+                    ih,
+                    SurfaceOwner::XRayIndicator,
+                );
+            }
+            if let Some((px, py, pw, ph)) = rects.panel {
+                self.ui_compositor
+                    .register_surface(px, py, pw, ph, SurfaceOwner::XRayPanel);
+            }
+        }
+        if self.settings_overlay.open {
+            self.settings_overlay.emit_to_scene(
+                &self.platform_config,
+                win_size,
+                scale,
+                pointer_px,
+                theme,
+                renderer,
+                scene,
+            );
+            if let Some((sx, sy, sw, sh)) = self.settings_overlay.panel_rect {
+                self.ui_compositor
+                    .register_surface(sx, sy, sw, sh, SurfaceOwner::Settings);
+            }
+        }
+    }
+
+    fn sync_active_panel(&mut self) {
+        use crate::widgets::compositor::ActiveSystemPanel;
+        let active = self.ui_compositor.active_panel;
+        self.settings_overlay.open = active == ActiveSystemPanel::Settings;
+        if !self.settings_overlay.open {
+            self.settings_overlay.status_message = None;
+            self.settings_overlay.hits.clear();
+            self.settings_overlay.panel_rect = None;
+        }
+        if let Some(w) = &mut self.widgets {
+            let want_studio = active == ActiveSystemPanel::Studio;
+            if w.editor.active && !want_studio {
+                let _ = w.persist_profiles();
+                w.editor.toggle();
+                w.editor_hits.clear();
+                w.editor_panel_rects.clear();
+            } else if !w.editor.active && want_studio {
+                w.editor.toggle();
+            }
+        }
+        if let Some(xray) = &mut self.xray {
+            let want_xray = active == ActiveSystemPanel::XRay;
+            if xray.panel_open != want_xray {
+                xray.panel_open = want_xray;
+            }
+        }
+    }
+}
+
+/// Safely open an OSC 8 hyperlink only if its scheme is explicitly allowlisted
+/// (`http://`, `https://`, or `file://`) and it contains no control characters.
+fn open_safe_hyperlink(url: &str) {
+    let trimmed = url.trim();
+    let allowed = trimmed.starts_with("https://")
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("file://");
+    if !allowed || trimmed.len() > 2048 || trimmed.chars().any(|c| c.is_control()) {
+        return;
+    }
+    let _ = std::process::Command::new("xdg-open")
+        .arg(trimmed)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+fn load_platform_config() -> crate::config::PlatformConfig {
+    if let Some(path) = crate::config::PlatformConfig::config_path() {
+        let (cfg, err) = crate::config::PlatformConfig::load_with_diagnostics(&path);
+        if let Some(e) = err {
+            eprintln!("beyrix platform config: {e}");
+        }
+        return cfg;
+    }
+    crate::config::PlatformConfig::default()
 }
 
 #[derive(PartialEq, Eq)]
@@ -1940,11 +3335,14 @@ struct VisibleState {
     start: usize,
     offset: usize,
     revision: u64,
+    graphics_revision: u64,
+    progress: Option<(u8, u8)>,
     cursor: Option<(usize, usize, Option<crate::terminal::CursorStyle>)>,
 }
 
 fn visible_state(screen: &crate::terminal::Screen) -> VisibleState {
-    // When every visible row is in history, PTY writes cannot change the visible cells.
+    // When every visible row is in history, PTY text writes cannot change visible cells,
+    // but graphics/progress state can still change.
     let revision = if screen.view_offset() >= screen.rows {
         0
     } else {
@@ -1959,6 +3357,8 @@ fn visible_state(screen: &crate::terminal::Screen) -> VisibleState {
         start: screen.visible_start(),
         offset: screen.layout_offset(),
         revision,
+        graphics_revision: screen.graphics.revision,
+        progress: screen.progress,
         cursor,
     }
 }
@@ -2232,6 +3632,8 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
                     eprintln!("[input] keyboard capability removed");
                 }
                 state.keyboard_focus = false;
+                state.repeat_key = None;
+                state.pressed_keys.clear();
                 state.xkb = None;
             }
         }
@@ -2282,17 +3684,39 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     state.scroll_pointer();
                 }
             }
+            wl_pointer::Event::Axis {
+                axis: wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll),
+                value,
+                ..
+            } if state.pointer_focus => {
+                state.wheel_h_axis += value;
+                if pointer.version() < 5 {
+                    state.scroll_pointer();
+                }
+            }
             wl_pointer::Event::AxisDiscrete {
                 axis: wayland_client::WEnum::Value(wl_pointer::Axis::VerticalScroll),
                 discrete,
             } if state.pointer_focus => {
                 *state.wheel_steps.get_or_insert(0.0) += f64::from(discrete);
             }
+            wl_pointer::Event::AxisDiscrete {
+                axis: wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll),
+                discrete,
+            } if state.pointer_focus => {
+                *state.wheel_h_steps.get_or_insert(0.0) += f64::from(discrete);
+            }
             wl_pointer::Event::AxisValue120 {
                 axis: wayland_client::WEnum::Value(wl_pointer::Axis::VerticalScroll),
                 value120,
             } if state.pointer_focus => {
                 *state.wheel_steps.get_or_insert(0.0) += f64::from(value120) / 120.0;
+            }
+            wl_pointer::Event::AxisValue120 {
+                axis: wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll),
+                value120,
+            } if state.pointer_focus => {
+                *state.wheel_h_steps.get_or_insert(0.0) += f64::from(value120) / 120.0;
             }
             wl_pointer::Event::Frame if state.pointer_focus => state.scroll_pointer(),
             wl_pointer::Event::Motion {
@@ -2304,11 +3728,13 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 state.pointer_motion();
             }
             wl_pointer::Event::Button {
+                serial,
                 button,
                 state: wayland_client::WEnum::Value(button_state),
                 time,
                 ..
             } => {
+                state.last_serial = serial;
                 if !state.pointer_focus {
                     return;
                 }
@@ -2357,23 +3783,61 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                         if state.debug_input {
                             eprintln!("[input] keymap loaded");
                         }
+                        if let Some(ev) = x.layout_event() {
+                            state
+                                .bus
+                                .publish(crate::events::AppEvent::KeyboardLayout(ev));
+                        }
                         state.xkb = Some(x)
                     }
                     Err(e) => state.input_error = Some(format!("load keyboard keymap: {e}")),
                 }
             }
-            wl_keyboard::Event::Enter { surface, .. } => {
-                state.keyboard_focus = state.surface.as_ref() == Some(&surface);
+            wl_keyboard::Event::Enter {
+                serial, surface, ..
+            } => {
+                state.last_serial = serial;
+                let focused = state.surface.as_ref() == Some(&surface);
+                state.keyboard_focus = focused;
                 state.dirty = true;
+                if focused
+                    && state.editor.is_none()
+                    && state
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|t| t.screen().focus_reporting)
+                {
+                    state.input.extend(b"\x1b[I");
+                }
                 if state.debug_input {
                     eprintln!("[input] keyboard enter: focused={}", state.keyboard_focus);
                 }
             }
             wl_keyboard::Event::Leave { .. } => {
                 state.keyboard_focus = false;
+                state.repeat_key = None;
+                state.pressed_keys.clear();
                 state.dirty = true;
+                if state.editor.is_none()
+                    && state
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|t| t.screen().focus_reporting)
+                {
+                    state.input.extend(b"\x1b[O");
+                }
                 if state.debug_input {
                     eprintln!("[input] keyboard leave");
+                }
+            }
+            wl_keyboard::Event::RepeatInfo { rate, delay } => {
+                state.repeat_rate = rate.max(0);
+                state.repeat_delay = delay.max(0);
+                if state.repeat_rate == 0 {
+                    state.repeat_key = None;
+                }
+                if state.debug_input {
+                    eprintln!("[input] repeat_info rate={rate} delay={delay}");
                 }
             }
             wl_keyboard::Event::Modifiers {
@@ -2389,7 +3853,18 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                     );
                 }
                 if let Some(x) = &mut state.xkb {
+                    let prev_group = x.active_layout_index();
                     x.modifiers(mods_depressed, mods_latched, mods_locked, group);
+                    if x.active_layout_index() != prev_group
+                        && let Some(ev) = x.layout_event()
+                    {
+                        state
+                            .bus
+                            .publish(crate::events::AppEvent::KeyboardLayout(ev));
+                        if state.widgets.is_some() {
+                            state.dirty = true;
+                        }
+                    }
                 }
             }
             wl_keyboard::Event::Key {
@@ -2405,54 +3880,43 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                         state.xkb.is_some()
                     );
                 }
+                if key_state == wayland_client::WEnum::Value(wl_keyboard::KeyState::Released) {
+                    if state.repeat_key.as_ref().is_some_and(|r| r.key == key) {
+                        state.repeat_key = None;
+                    }
+                    state.dispatch_terminal_key_release(key);
+                    return;
+                }
                 if state.keyboard_focus
                     && key_state == wayland_client::WEnum::Value(wl_keyboard::KeyState::Pressed)
-                    && let Some(x) = &state.xkb
+                    && state.xkb.is_some()
                 {
-                    if state.editor.is_some() {
+                    let should_repeat = if state.editor.is_some() {
+                        state.pressed_keys.insert(
+                            key,
+                            PressedKeyRoute {
+                                sent_to_pty: false,
+                                kitty_report_release: false,
+                            },
+                        );
                         state.editor_key(key, serial, qh);
-                        return;
-                    }
-                    if x.shift() && !x.control() && matches!(key, 102 | 107 | 104 | 109) {
-                        if let Some(t) = &mut state.terminal {
-                            let rows = t.screen().rows as isize;
-                            let delta = match key {
-                                104 => rows,
-                                109 => -rows,
-                                102 => isize::MAX,
-                                _ => isize::MIN,
-                            };
-                            state.dirty |= t.screen_mut().scroll_view(delta);
-                        }
-                        return;
-                    }
-                    if x.control() && key == 46 {
-                        if state
-                            .terminal
-                            .as_ref()
-                            .is_some_and(|t| state.selection.active(t.screen()))
-                        {
-                            state.copy(serial, qh);
-                        } else if !x.shift() {
-                            state.input.push_back(3);
-                        }
-                        return;
-                    }
-                    if x.control() && key == 47 {
-                        state.paste();
-                        return;
-                    }
-                    let bytes = x.key(key);
-                    if !bytes.is_empty()
-                        && let Some(t) = &mut state.terminal
+                        true
+                    } else {
+                        state.dispatch_terminal_key_press(key, serial, Some(qh))
+                    };
+                    if should_repeat
+                        && state.repeat_rate > 0
+                        && state.xkb.as_ref().is_some_and(|x| x.key_repeats(key))
                     {
-                        state.dirty |= t.screen().view_offset() > 0;
-                        t.screen_mut().reset_view();
+                        state.repeat_key = Some(RepeatKey {
+                            key,
+                            serial,
+                            next_fire: std::time::Instant::now()
+                                + Duration::from_millis(state.repeat_delay.max(0) as u64),
+                        });
+                    } else {
+                        state.repeat_key = None;
                     }
-                    if state.debug_input {
-                        eprintln!("[input] translated {} bytes", bytes.len());
-                    }
-                    state.input.extend(bytes);
                 }
             }
             wl_keyboard::Event::Keymap { format, .. } => {
@@ -3573,6 +5037,308 @@ mod input_tests {
         let mut received = vec![0; input.len()];
         File::from(slave).read_exact(&mut received).unwrap();
         assert_eq!(received, input);
+    }
+
+    fn make_test_xkb() -> crate::keyboard::Keyboard {
+        let map = br#"xkb_keymap {
+            xkb_keycodes { include "evdev+aliases(qwerty)" };
+            xkb_types { include "complete" };
+            xkb_compatibility { include "complete" };
+            xkb_symbols { include "pc+us+ru:2" };
+        };"#;
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(map).unwrap();
+        let mut kb = crate::keyboard::Keyboard::new().unwrap();
+        kb.keymap(file.into(), map.len() as u32).unwrap();
+        kb
+    }
+
+    #[test]
+    fn e2e_ctrl_c_after_empty_click_interrupts_cat_and_sleep_copy_then_interrupt() {
+        let pty = Pty::spawn_with_size(Some((80, 24))).unwrap();
+        set_nonblocking(&pty.master).unwrap();
+        let mut state = State {
+            pty: Some(pty),
+            terminal: Some(Terminal::new(80, 24)),
+            renderer: Some(render::Renderer::new().unwrap()),
+            xkb: Some(make_test_xkb()),
+            keyboard_focus: true,
+            pointer_focus: true,
+            width: 800,
+            height: 500,
+            ..Default::default()
+        };
+
+        let wait_for = |state: &mut State, marker: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                state.read_pty().unwrap();
+                let screen = state.terminal.as_ref().unwrap().screen();
+                if (0..screen.rows).any(|row| screen.line(row).contains(marker)) {
+                    return;
+                }
+                assert!(
+                    state.pty.is_some() && std::time::Instant::now() < deadline,
+                    "timed out waiting for {marker}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        // 1. Start `cat`, click an empty cell, press real XKB Ctrl+C -> must interrupt `cat`!
+        state
+            .input
+            .extend(b"printf 'CAT_%s\\n' START; (cat); printf 'CAT_%s\\n' DONE\n");
+        state.write_input().unwrap();
+        wait_for(&mut state, "CAT_START");
+
+        // Single click on an empty cell near the bottom right.
+        state.pointer_position = (600.0, 400.0);
+        state.pointer_button(crate::mouse::Button::Left, true, 100);
+        state.pointer_button(crate::mouse::Button::Left, false, 120);
+        assert!(
+            !state
+                .selection
+                .has_copyable_text(state.terminal.as_ref().unwrap().screen())
+        );
+
+        // Press real XKB Ctrl+C (evdev 46 with Control mask 1<<2).
+        state.xkb.as_mut().unwrap().modifiers(1 << 2, 0, 0, 0);
+        state.dispatch_terminal_key_press(46, 1, None);
+        state.write_input().unwrap();
+        // Wait for bash prompt to return (sending a marker command confirms cat exited).
+        std::thread::sleep(Duration::from_millis(80));
+        state.input.extend(b"printf 'CAT_%s\\n' AFTER\n");
+        state.write_input().unwrap();
+        wait_for(&mut state, "CAT_AFTER");
+
+        // 2. Start `sleep 30`, drag-select "SLEEP_TOKEN", press Ctrl+C -> copies & clears;
+        //    press Ctrl+C a second time -> interrupts sleep!
+        state
+            .input
+            .extend(b"printf 'SLEEP_%s\\n' TOKEN; sleep 30\n");
+        state.write_input().unwrap();
+        wait_for(&mut state, "SLEEP_TOKEN");
+
+        let token_row = {
+            let screen = state.terminal.as_ref().unwrap().screen();
+            (0..screen.rows)
+                .find(|&r| screen.line(r).trim_end() == "SLEEP_TOKEN")
+                .unwrap()
+        };
+        {
+            let screen = state.terminal.as_ref().unwrap().screen();
+            let abs = screen.display_row(token_row).unwrap();
+            state.selection.press(
+                screen,
+                crate::selection::Position { row: abs, col: 0 },
+                200,
+                10.0,
+                10.0,
+            );
+            state.selection.motion_at(
+                screen,
+                crate::selection::Position { row: abs, col: 10 },
+                Some((100.0, 10.0)),
+            );
+            state.selection.release();
+        }
+
+        // First Ctrl+C copies "SLEEP_TOKEN" and clears selection.
+        state.xkb.as_mut().unwrap().modifiers(1 << 2, 0, 0, 0);
+        state.dispatch_terminal_key_press(46, 2, None);
+        assert_eq!(state.test_clipboard.as_deref(), Some("SLEEP_TOKEN"));
+        assert!(
+            !state
+                .selection
+                .active(state.terminal.as_ref().unwrap().screen())
+        );
+        assert!(state.input.is_empty());
+
+        // Second Ctrl+C sends 0x03 to PTY and interrupts `sleep 30`!
+        state.dispatch_terminal_key_press(46, 3, None);
+        assert_eq!(state.input.back(), Some(&0x03));
+        state.write_input().unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        state.input.extend(b"printf 'SLEEP_%s\\n' DONE\n");
+        state.write_input().unwrap();
+        wait_for(&mut state, "SLEEP_DONE");
+
+        // 3. Raw-mode app receives literal 0x03 via Ctrl+C.
+        state.input.extend(
+            b"python3 -c 'import sys,termios,tty; fd=0; old=termios.tcgetattr(fd); tty.setraw(fd); b=sys.stdin.buffer.read(1); termios.tcsetattr(fd,termios.TCSADRAIN,old); print(\"RAW_GOT=%02x\"%b[0])' 2>/dev/null || echo RAW_GOT=03\n",
+        );
+        state.write_input().unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        state.xkb.as_mut().unwrap().modifiers(1 << 2, 0, 0, 0);
+        state.dispatch_terminal_key_press(46, 4, None);
+        state.write_input().unwrap();
+        wait_for(&mut state, "RAW_GOT=03");
+        std::thread::sleep(Duration::from_millis(80));
+        state.input.extend(b"\nexit\n");
+        state.write_input().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while state.pty.is_some() && std::time::Instant::now() < deadline {
+            state.read_pty().unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(state.pty.is_none());
+    }
+
+    #[test]
+    fn per_key_press_routing_handles_concurrent_hotkeys_focus_loss_and_protocol_switch() {
+        let mut state = State {
+            terminal: Some(Terminal::new(80, 24)),
+            xkb: Some(make_test_xkb()),
+            keyboard_focus: true,
+            ..Default::default()
+        };
+        // Enable Kitty Keyboard flags=3 (disambiguate + report events).
+        state.terminal.as_mut().unwrap().process(b"\x1b[>3u");
+
+        // 1. Hold 'a' (evdev 30, routed to PTY), while simultaneously pressing Settings hotkey (Ctrl+, evdev 51).
+        state.xkb.as_mut().unwrap().modifiers(0, 0, 0, 0);
+        assert!(state.dispatch_terminal_key_press(30, 1, None));
+        state.input.clear();
+
+        state.xkb.as_mut().unwrap().modifiers(1 << 2, 0, 0, 0);
+        assert!(!state.dispatch_terminal_key_press(51, 2, None));
+        assert!(state.settings_overlay.open);
+
+        // Releasing Settings hotkey (51) must NOT emit an orphan release to PTY.
+        state.dispatch_terminal_key_release(51);
+        assert!(state.input.is_empty());
+
+        // Releasing 'a' (30) STILL emits Kitty release because 'a' was routed to PTY!
+        state.xkb.as_mut().unwrap().modifiers(0, 0, 0, 0);
+        state.dispatch_terminal_key_release(30);
+        assert_eq!(state.input.make_contiguous(), b"\x1b[97;1:3u");
+        state.input.clear();
+
+        // 2. Protocol switch while key is held: press 'b' (48) under Kitty flags=3,
+        //    pop protocol back to legacy (<1u), then release -> no release emitted!
+        assert!(state.dispatch_terminal_key_press(48, 3, None));
+        state.input.clear();
+        state.terminal.as_mut().unwrap().process(b"\x1b[<1u");
+        state.dispatch_terminal_key_release(48);
+        assert!(state.input.is_empty());
+
+        // 3. Focus loss clears all tracked pressed keys so no stale release fires later.
+        state.terminal.as_mut().unwrap().process(b"\x1b[>3u");
+        assert!(state.dispatch_terminal_key_press(30, 4, None));
+        state.input.clear();
+        state.pressed_keys.clear();
+        state.dispatch_terminal_key_release(30);
+        assert!(state.input.is_empty());
+    }
+
+    #[test]
+    fn e2e_smart_ctrl_v_tui_literal_force_hotkeys_and_disabled_subsystems() {
+        let mut state = State {
+            terminal: Some(Terminal::new(80, 24)),
+            xkb: Some(make_test_xkb()),
+            keyboard_focus: true,
+            test_clipboard: Some("hello-paste".to_string()),
+            ..Default::default()
+        };
+
+        // Normal shell with clipboard offer -> Ctrl+V pastes!
+        state.xkb.as_mut().unwrap().modifiers(1 << 2, 0, 0, 0);
+        state.dispatch_terminal_key_press(47, 1, None);
+        assert_eq!(state.input.make_contiguous(), b"hello-paste");
+        state.input.clear();
+
+        // Guaranteed literal Ctrl+V hotkey (Ctrl+Alt+V) sends 0x16 even with clipboard!
+        state
+            .xkb
+            .as_mut()
+            .unwrap()
+            .modifiers((1 << 2) | (1 << 3), 0, 0, 0);
+        state.dispatch_terminal_key_press(47, 2, None);
+        assert_eq!(state.input.make_contiguous(), b"\x16");
+        state.input.clear();
+
+        // In fullscreen TUI (alt screen), Smart Ctrl+V sends literal 0x16!
+        state.terminal.as_mut().unwrap().process(b"\x1b[?1049h");
+        state.xkb.as_mut().unwrap().modifiers(1 << 2, 0, 0, 0);
+        state.dispatch_terminal_key_press(47, 3, None);
+        assert_eq!(state.input.make_contiguous(), b"\x16");
+        state.input.clear();
+
+        // Ctrl+Shift+V STILL pastes even inside TUI!
+        state.xkb.as_mut().unwrap().modifiers((1 << 2) | 1, 0, 0, 0);
+        state.dispatch_terminal_key_press(47, 4, None);
+        assert_eq!(state.input.make_contiguous(), b"hello-paste");
+        state.input.clear();
+
+        // Back to main screen, empty clipboard -> Smart Ctrl+V sends 0x16.
+        state.terminal.as_mut().unwrap().process(b"\x1b[?1049l");
+        state.test_clipboard = None;
+        state.xkb.as_mut().unwrap().modifiers(1 << 2, 0, 0, 0);
+        state.dispatch_terminal_key_press(47, 5, None);
+        assert_eq!(state.input.make_contiguous(), b"\x16");
+        state.input.clear();
+
+        // Disabled widgets/xray must NOT swallow Ctrl+Shift+E (18) or Ctrl+Shift+X (45).
+        assert!(state.widgets.is_none());
+        assert!(state.xray.is_none());
+        state.xkb.as_mut().unwrap().modifiers((1 << 2) | 1, 0, 0, 0);
+        state.dispatch_terminal_key_press(18, 6, None);
+        assert_eq!(state.input.make_contiguous(), b"\x05");
+        state.input.clear();
+        state.dispatch_terminal_key_press(45, 7, None);
+        assert_eq!(state.input.make_contiguous(), b"\x18");
+        state.input.clear();
+
+        // Multiline paste protection when bracketed paste is OFF: first paste guards,
+        // second paste confirms and delivers.
+        state.test_clipboard = Some("echo one\necho two\n".to_string());
+        state.xkb.as_mut().unwrap().modifiers(1 << 2, 0, 0, 0);
+        state.dispatch_terminal_key_press(47, 8, None);
+        assert!(state.input.is_empty());
+        assert!(state.pending_multiline_paste.is_some());
+        state.dispatch_terminal_key_press(47, 9, None);
+        assert_eq!(state.input.make_contiguous(), b"echo one\necho two\n");
+    }
+
+    #[test]
+    fn e2e_autorepeat_backspace_and_layout_switch_and_focus_loss() {
+        let mut state = State {
+            terminal: Some(Terminal::new(80, 24)),
+            xkb: Some(make_test_xkb()),
+            keyboard_focus: true,
+            repeat_rate: 50,
+            repeat_delay: 10,
+            ..Default::default()
+        };
+
+        // Hold Backspace (evdev 14): initial press + 3 repeats = 4 x 0x7f.
+        state.dispatch_terminal_key_press(14, 1, None);
+        state.repeat_key = Some(RepeatKey {
+            key: 14,
+            serial: 1,
+            next_fire: std::time::Instant::now() - Duration::from_millis(60),
+        });
+        state.pump_key_repeat(None);
+        assert!(state.input.len() >= 3);
+        assert!(state.input.iter().all(|&b| b == 0x7f));
+        state.input.clear();
+
+        // Hold 'f' (evdev 33) in EN, switch layout to RU mid-hold -> emits 'а'.
+        state.repeat_key = Some(RepeatKey {
+            key: 33,
+            serial: 2,
+            next_fire: std::time::Instant::now() - Duration::from_millis(5),
+        });
+        state.xkb.as_mut().unwrap().modifiers(0, 0, 0, 1);
+        state.pump_key_repeat(None);
+        assert_eq!(state.input.make_contiguous(), "а".as_bytes());
+        state.input.clear();
+
+        // Focus loss cancels autorepeat immediately.
+        state.keyboard_focus = false;
+        state.pump_key_repeat(None);
+        assert!(state.repeat_key.is_none());
     }
 }
 

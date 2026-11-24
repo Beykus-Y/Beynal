@@ -34,6 +34,7 @@ BuildRequires:  libxkbcommon-devel
 BuildRequires:  fontconfig
 BuildRequires:  dejavu-sans-mono-fonts
 BuildRequires:  git-core
+BuildRequires:  ncurses
 
 Requires:       bash
 Requires:       fontconfig
@@ -67,6 +68,8 @@ install -Dpm0644 %{SOURCE2} %{buildroot}%{_datadir}/applications/io.github.beyku
 install -Dpm0644 %{SOURCE5} %{buildroot}%{_datadir}/applications/io.github.beykus_y.BEdit.desktop
 install -Dpm0644 %{SOURCE3} %{buildroot}%{_metainfodir}/io.github.beykus_y.Beyrix.metainfo.xml
 install -Dpm0644 %{SOURCE4} %{buildroot}%{_mandir}/man1/beyrix.1
+mkdir -p %{buildroot}%{_datadir}/terminfo
+tic -x -o %{buildroot}%{_datadir}/terminfo packaging/beyrix.terminfo
 %{cargo_license} > cargo-license.txt
 %cargo_vendor_manifest
 install -Dpm0644 cargo-license.txt %{buildroot}%{_licensedir}/%{name}/cargo-license.txt
@@ -84,6 +87,8 @@ install -Dpm0644 cargo-vendor.txt %{buildroot}%{_licensedir}/%{name}/cargo-vendo
 %{_datadir}/applications/io.github.beykus_y.BEdit.desktop
 %{_metainfodir}/io.github.beykus_y.Beyrix.metainfo.xml
 %{_mandir}/man1/beyrix.1*
+%{_datadir}/terminfo/b/beyrix
+%{_datadir}/terminfo/b/beyrix-direct
 %{_licensedir}/%{name}/cargo-license.txt
 %{_licensedir}/%{name}/cargo-vendor.txt
 

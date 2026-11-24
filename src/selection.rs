@@ -18,11 +18,21 @@ pub fn position(geometry: Geometry, x: f64, y: f64, screen: &Screen) -> Position
     }
 }
 
+/// Logical-pixel pointer movement threshold before a single click becomes an
+/// intentional drag selection (HiDPI-independent because pointer coordinates
+/// are passed in surface-local logical pixels).
+pub const DRAG_THRESHOLD_LOGICAL: f64 = 4.0;
+
 #[derive(Default)]
 pub struct Selection {
     anchor: Option<Position>,
     end: Option<Position>,
     dragging: bool,
+    /// True only when the user has demonstrated selection intent (dragged past
+    /// threshold or across cells, double-clicked a word, triple-clicked a line,
+    /// or created a keyboard selection). A plain single click leaves this false.
+    committed: bool,
+    press_origin: Option<(f64, f64)>,
     last_click: Option<(u32, f64, f64)>,
     clicks: u8,
     epoch: u64,
@@ -45,12 +55,31 @@ impl Selection {
             _ => 1,
         };
         self.last_click = Some((time, x, y));
+        self.press_origin = Some((x, y));
         self.dragging = true;
         let (a, b) = self.bounds_at(screen, p);
         self.initial = Some((a, b));
         self.anchor = Some(a);
         self.end = Some(b);
+        // Double-click (word) and triple-click (line) immediately express
+        // selection intent; a single click does NOT commit until the pointer
+        // drags past the threshold or enters another cell.
+        self.committed = self.clicks >= 2;
     }
+
+    /// Programmatically create an intentional selection (e.g. keyboard selection).
+    #[allow(dead_code)]
+    pub fn select_range(&mut self, screen: &Screen, a: Position, b: Position) {
+        self.epoch = screen.selection_epoch;
+        self.dragging = false;
+        self.press_origin = None;
+        self.clicks = 0;
+        self.initial = Some((a, b));
+        self.anchor = Some(a);
+        self.end = Some(b);
+        self.committed = true;
+    }
+
     fn bounds_at(&self, screen: &Screen, p: Position) -> (Position, Position) {
         match self.clicks {
             2 => word(screen, p),
@@ -76,8 +105,23 @@ impl Selection {
             _ => (p, p),
         }
     }
+
+    #[allow(dead_code)]
     pub fn motion(&mut self, screen: &Screen, p: Position) -> bool {
-        if !self.dragging || self.range(screen).is_none() {
+        self.motion_at(screen, p, None)
+    }
+
+    /// Update an active drag with optional surface-local logical pointer
+    /// coordinates so dragging across a single character (even within one cell)
+    /// commits an intentional single-character selection once the pointer moves
+    /// at least `DRAG_THRESHOLD_LOGICAL`.
+    pub fn motion_at(
+        &mut self,
+        screen: &Screen,
+        p: Position,
+        logical_pointer: Option<(f64, f64)>,
+    ) -> bool {
+        if !self.dragging || self.raw_range(screen).is_none() {
             return false;
         }
         let Some((first, last)) = self.initial else {
@@ -89,25 +133,46 @@ impl Selection {
         } else {
             (first, last.max(end))
         };
-        let changed = (self.anchor, self.end) != (Some(next.0), Some(next.1));
+        let cell_changed = (self.anchor, self.end) != (Some(next.0), Some(next.1));
+        let moved_past_threshold = match (self.press_origin, logical_pointer) {
+            (Some((ox, oy)), Some((lx, ly))) => {
+                let dx = lx - ox;
+                let dy = ly - oy;
+                (dx * dx + dy * dy).sqrt() >= DRAG_THRESHOLD_LOGICAL
+            }
+            _ => false,
+        };
+        let was_committed = self.committed;
+        if cell_changed || moved_past_threshold {
+            self.committed = true;
+        }
         (self.anchor, self.end) = (Some(next.0), Some(next.1));
-        changed
+        cell_changed || (self.committed != was_committed)
     }
+
     pub fn is_dragging(&self) -> bool {
         self.dragging
     }
     pub fn release(&mut self) {
         self.dragging = false;
+        self.press_origin = None;
+        if !self.committed {
+            self.anchor = None;
+            self.end = None;
+            self.initial = None;
+        }
     }
     pub fn clear(&mut self) {
         self.anchor = None;
         self.end = None;
         self.dragging = false;
+        self.committed = false;
+        self.press_origin = None;
         self.last_click = None;
         self.clicks = 0;
         self.initial = None;
     }
-    fn range(&self, screen: &Screen) -> Option<(Position, Position)> {
+    fn raw_range(&self, screen: &Screen) -> Option<(Position, Position)> {
         let (a, b) = (self.anchor?, self.end?);
         let (start, end) = (a.min(b), a.max(b));
         (self.epoch == screen.selection_epoch
@@ -115,8 +180,25 @@ impl Selection {
             && end.row < screen.newest_row())
         .then_some((start, end))
     }
+    fn range(&self, screen: &Screen) -> Option<(Position, Position)> {
+        if !self.committed {
+            return None;
+        }
+        self.raw_range(screen)
+    }
     pub fn active(&self, screen: &Screen) -> bool {
         self.range(screen).is_some()
+    }
+    /// True only when there is an intentional, valid selection containing at
+    /// least one copyable character (including written spaces, wide glyphs, or
+    /// combining clusters, but excluding unwritten empty cells).
+    pub fn has_copyable_text(&self, screen: &Screen) -> bool {
+        self.text(screen).is_some_and(|t| !t.is_empty())
+    }
+    /// True while a mouse button is down and the drag anchor is still valid for
+    /// the current screen epoch/history.
+    pub fn drag_valid(&self, screen: &Screen) -> bool {
+        self.dragging && self.raw_range(screen).is_some()
     }
     pub fn text(&self, screen: &Screen) -> Option<String> {
         let (start, end) = self.range(screen)?;
@@ -367,16 +449,75 @@ mod tests {
         t.process("hi界 ok".as_bytes());
         let mut s = Selection::default();
         let p = Position { row: 0, col: 3 };
+        // Single click without drag does NOT create a copyable selection.
         s.press(t.screen(), p, 100, 1., 1.);
         s.release();
-        assert!(s.contains(t.screen(), 0, 2));
-        assert!(s.contains(t.screen(), 0, 3));
+        assert!(!s.active(t.screen()));
+        assert!(!s.has_copyable_text(t.screen()));
+        // Double click selects the word (including wide glyph).
         s.press(t.screen(), p, 200, 1., 1.);
         assert!(s.contains(t.screen(), 0, 0));
+        assert!(s.contains(t.screen(), 0, 2));
+        assert!(s.contains(t.screen(), 0, 3));
         assert!(!s.contains(t.screen(), 0, 4));
+        assert_eq!(s.text(t.screen()).as_deref(), Some("hi界"));
         s.release();
+        // Triple click selects the full logical line.
         s.press(t.screen(), p, 300, 1., 1.);
         assert!(s.contains(t.screen(), 0, 9));
         assert!(!s.contains(t.screen(), 1, 0));
+        s.release();
+    }
+
+    #[test]
+    fn single_click_empty_cell_never_activates_selection_but_intentional_single_char_drag_does() {
+        let mut t = Terminal::new(10, 3);
+        t.process("a界e\u{0301}  z".as_bytes());
+        let mut s = Selection::default();
+
+        // Single click on empty cell (row 1, col 4) must not activate selection.
+        s.press(t.screen(), Position { row: 1, col: 4 }, 100, 50.0, 40.0);
+        s.release();
+        assert!(!s.active(t.screen()));
+        assert!(!s.has_copyable_text(t.screen()));
+
+        // Dragging across empty unwritten cells produces empty text -> not copyable.
+        s.press(t.screen(), Position { row: 2, col: 0 }, 200, 10.0, 60.0);
+        s.motion_at(t.screen(), Position { row: 2, col: 5 }, Some((60.0, 60.0)));
+        s.release();
+        assert!(!s.has_copyable_text(t.screen()));
+
+        // Intentional drag past threshold within a single character ('a') commits and copies 'a'.
+        s.press(t.screen(), Position { row: 0, col: 0 }, 300, 10.0, 10.0);
+        s.motion_at(
+            t.screen(),
+            Position { row: 0, col: 0 },
+            Some((10.0 + DRAG_THRESHOLD_LOGICAL + 1.0, 10.0)),
+        );
+        s.release();
+        assert!(s.has_copyable_text(t.screen()));
+        assert_eq!(s.text(t.screen()).as_deref(), Some("a"));
+
+        // Intentional drag on combining cluster 'é' copies the full grapheme.
+        s.press(t.screen(), Position { row: 0, col: 3 }, 400, 30.0, 10.0);
+        s.motion_at(t.screen(), Position { row: 0, col: 3 }, Some((36.0, 10.0)));
+        s.release();
+        assert_eq!(s.text(t.screen()).as_deref(), Some("e\u{0301}"));
+
+        // Intentional drag on written spaces preserves spaces.
+        s.press(t.screen(), Position { row: 0, col: 4 }, 500, 40.0, 10.0);
+        s.motion_at(t.screen(), Position { row: 0, col: 5 }, Some((55.0, 10.0)));
+        s.release();
+        assert!(s.has_copyable_text(t.screen()));
+        assert_eq!(s.text(t.screen()).as_deref(), Some("  "));
+
+        // Programmatic / keyboard range selection commits immediately.
+        s.select_range(
+            t.screen(),
+            Position { row: 0, col: 0 },
+            Position { row: 0, col: 2 },
+        );
+        assert!(s.has_copyable_text(t.screen()));
+        assert_eq!(s.text(t.screen()).as_deref(), Some("a界"));
     }
 }
