@@ -26,7 +26,7 @@ use layout::{
 };
 use manifest::{ExtensionManifest, LoadedExtension};
 use permissions::PermissionSet;
-use runtime::{HostAction, VmCommand, WidgetRuntime};
+use runtime::{HostAction, LifecycleCommand, VmCommand, WidgetRenderState, WidgetRuntime};
 use ui::{HitKind, UiHitTarget, UiLayer, emit_editor_chrome, emit_ui_tree};
 
 /// Host-determined trust level for an extension.
@@ -46,8 +46,10 @@ pub enum ExtensionTrust {
 pub struct WidgetManager {
     pub config: WidgetsConfig,
     pub extensions: BTreeMap<String, LoadedExtension>,
+    pub trust_levels: BTreeMap<String, ExtensionTrust>,
     pub granted_permissions: BTreeMap<String, PermissionSet>,
     pub placements: BTreeMap<String, WidgetPlacementConfig>,
+    pub extension_settings: BTreeMap<String, serde_json::Value>,
     pub editor: VisualLayoutEditor,
     pub hit_targets: Vec<UiHitTarget>,
     pub resolved_rects: BTreeMap<String, ResolvedWidgetRect>,
@@ -61,8 +63,10 @@ impl WidgetManager {
         Self {
             config,
             extensions: BTreeMap::new(),
+            trust_levels: BTreeMap::new(),
             granted_permissions: BTreeMap::new(),
             placements: BTreeMap::new(),
+            extension_settings: BTreeMap::new(),
             editor: VisualLayoutEditor::new(),
             hit_targets: Vec::new(),
             resolved_rects: BTreeMap::new(),
@@ -74,6 +78,21 @@ impl WidgetManager {
 
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
+    }
+
+    /// Host-controlled search paths for bundled official extensions.
+    pub fn official_extensions_dirs() -> Vec<std::path::PathBuf> {
+        let mut dirs = Vec::new();
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(parent) = exe.parent()
+        {
+            dirs.push(parent.join("../share/beyrix/extensions/official"));
+            dirs.push(parent.join("../../extensions/official"));
+        }
+        dirs.push(std::path::PathBuf::from(
+            "/usr/share/beyrix/extensions/official",
+        ));
+        dirs
     }
 
     pub fn ensure_started(&mut self, theme: Theme, bus: EventBus) -> Result<(), String> {
@@ -88,6 +107,14 @@ impl WidgetManager {
             bus,
         )?;
         self.runtime = Some(vm);
+        // Load host-official extensions first from host-controlled paths.
+        for official_dir in Self::official_extensions_dirs() {
+            if official_dir.is_dir() {
+                let _ = self.load_directory(&official_dir, ExtensionTrust::HostOfficial);
+                break;
+            }
+        }
+        // Load third-party user extensions; never allowed to overwrite official IDs.
         if let Some(dir) = self
             .config
             .extensions_dir
@@ -108,16 +135,29 @@ impl WidgetManager {
             if path.is_dir()
                 && path.join("beyrix-ext.toml").is_file()
                 && let Ok(loaded) = ExtensionManifest::load_from_dir(&path)
+                && self.register_extension(loaded, trust).is_ok()
             {
-                self.register_extension(loaded, trust);
                 count += 1;
             }
         }
         Ok(count)
     }
 
-    pub fn register_extension(&mut self, loaded: LoadedExtension, trust: ExtensionTrust) {
+    pub fn register_extension(
+        &mut self,
+        loaded: LoadedExtension,
+        trust: ExtensionTrust,
+    ) -> Result<(), String> {
         let id = loaded.manifest.id.clone();
+        // Prevent third-party extensions from hijacking an already-registered
+        // host-official extension ID.
+        if trust == ExtensionTrust::ThirdParty
+            && self.trust_levels.get(&id) == Some(&ExtensionTrust::HostOfficial)
+        {
+            return Err(format!(
+                "third-party extension cannot overwrite host-official extension {id:?}"
+            ));
+        }
         // Security: Never trust `loaded.manifest.official` from an untrusted manifest!
         let perms = match trust {
             ExtensionTrust::HostOfficial => {
@@ -130,35 +170,38 @@ impl WidgetManager {
         let gen_entry = self.generations.entry(id.clone()).or_insert(0);
         *gen_entry += 1;
         let generation = *gen_entry;
+        self.trust_levels.insert(id.clone(), trust);
         self.granted_permissions.insert(id.clone(), perms.clone());
         self.placements
             .entry(id.clone())
             .or_insert_with(|| loaded.manifest.placement.clone());
         if let Some(vm) = &self.runtime {
-            vm.send_lifecycle(VmCommand::LoadExtension {
+            vm.send_lifecycle(LifecycleCommand::LoadExtension {
                 id: id.clone(),
                 generation,
                 entry_path: loaded.entry_path.clone(),
                 manifest: Box::new(loaded.manifest.clone()),
                 permissions: perms,
-            });
+            })?;
         }
         self.extensions.insert(id, loaded);
+        Ok(())
     }
 
     pub fn unload_extension(&mut self, id: &str) {
         self.extensions.remove(id);
+        self.trust_levels.remove(id);
         self.granted_permissions.remove(id);
         if let Some(g) = self.generations.get_mut(id) {
             *g += 1;
         }
         self.unloaded_extensions.push(id.to_string());
         if let Some(vm) = &self.runtime {
-            vm.send_lifecycle(VmCommand::UnloadExtension { id: id.to_string() });
+            let _ = vm.send_lifecycle(LifecycleCommand::UnloadExtension { id: id.to_string() });
         }
     }
 
-    pub fn reload_extension(&mut self, id: &str) {
+    pub fn reload_extension(&mut self, id: &str) -> Result<(), String> {
         let generation = {
             let entry = self.generations.entry(id.to_string()).or_insert(0);
             *entry += 1;
@@ -166,11 +209,39 @@ impl WidgetManager {
         };
         self.unloaded_extensions.push(id.to_string());
         if let Some(vm) = &self.runtime {
-            vm.send_lifecycle(VmCommand::ReloadExtension {
+            vm.send_lifecycle(LifecycleCommand::ReloadExtension {
                 id: id.to_string(),
                 generation,
-            });
+            })?;
         }
+        Ok(())
+    }
+
+    pub fn update_extension_settings(
+        &mut self,
+        id: &str,
+        values: serde_json::Value,
+    ) -> Result<(), String> {
+        let json =
+            serde_json::to_string(&values).map_err(|e| format!("serialize settings: {e}"))?;
+        self.extension_settings.insert(id.to_string(), values);
+        if let Some(vm) = &self.runtime {
+            vm.send_lifecycle(LifecycleCommand::UpdateSettings {
+                id: id.to_string(),
+                settings_json: json,
+            })?;
+        }
+        Ok(())
+    }
+
+    pub fn render_snapshots(&self) -> std::collections::HashMap<String, WidgetRenderState> {
+        let Some(vm) = &self.runtime else {
+            return std::collections::HashMap::new();
+        };
+        vm.snapshot_renders()
+            .into_iter()
+            .filter(|(id, st)| self.generations.get(id).copied() == Some(st.generation))
+            .collect()
     }
 
     pub fn drain_actions(&mut self) -> Vec<HostAction> {
@@ -223,10 +294,7 @@ impl WidgetManager {
         if !self.config.enabled {
             return;
         }
-        let Some(vm) = &self.runtime else {
-            return;
-        };
-        let renders = vm.snapshot_renders();
+        let renders = self.render_snapshots();
         let mut ordered: Vec<(&String, &WidgetPlacementConfig)> = self.placements.iter().collect();
         ordered.sort_by_key(|(_, cfg)| cfg.z_index);
 
@@ -463,7 +531,8 @@ permissions = ["ui", "background-control"]
         });
         mgr.ensure_started(Theme::default(), bus).unwrap();
         let loaded = ExtensionManifest::load_from_dir(&ext_dir).unwrap();
-        mgr.register_extension(loaded, ExtensionTrust::ThirdParty);
+        mgr.register_extension(loaded, ExtensionTrust::ThirdParty)
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(80));
 
         // Unload before draining actions: stale BackgroundClearScene/AddObject from gen 1
@@ -477,5 +546,35 @@ permissions = ["ui", "background-control"]
             a,
             HostAction::BackgroundClearScene { .. } | HostAction::BackgroundAddObject { .. }
         )));
+    }
+
+    #[test]
+    fn third_party_cannot_overwrite_host_official_extension_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let off_dir = dir.path().join("off");
+        let tp_dir = dir.path().join("tp");
+        std::fs::create_dir(&off_dir).unwrap();
+        std::fs::create_dir(&tp_dir).unwrap();
+        for d in [&off_dir, &tp_dir] {
+            std::fs::write(d.join("index.js"), "beyrix.log('hi');").unwrap();
+            std::fs::write(
+                d.join("beyrix-ext.toml"),
+                "id = \"beyrix.official.kbd\"\nname = \"Kbd\"\nsdk_version = \"1.0.0\"\npermissions = [\"ui\", \"keyboard-layout\"]\n",
+            )
+            .unwrap();
+        }
+        let mut mgr = WidgetManager::new(WidgetsConfig::default());
+        mgr.register_extension(
+            ExtensionManifest::load_from_dir(&off_dir).unwrap(),
+            ExtensionTrust::HostOfficial,
+        )
+        .unwrap();
+        assert!(
+            mgr.register_extension(
+                ExtensionManifest::load_from_dir(&tp_dir).unwrap(),
+                ExtensionTrust::ThirdParty,
+            )
+            .is_err()
+        );
     }
 }

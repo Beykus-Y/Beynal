@@ -35,6 +35,52 @@ pub struct ExtensionDependency {
     pub version: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SettingFieldKind {
+    Boolean,
+    Number,
+    String,
+    Enum,
+    Color,
+    Slider,
+    Keybinding,
+    FileSelector,
+    Group,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SettingSchemaField {
+    pub key: String,
+    pub label: String,
+    pub kind: SettingFieldKind,
+    pub description: String,
+    pub default: Option<toml::Value>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub step: Option<f64>,
+    pub options: Vec<String>,
+    pub group: Option<String>,
+}
+
+impl Default for SettingSchemaField {
+    fn default() -> Self {
+        Self {
+            key: String::new(),
+            label: String::new(),
+            kind: SettingFieldKind::String,
+            description: String::new(),
+            default: None,
+            min: None,
+            max: None,
+            step: None,
+            options: Vec::new(),
+            group: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExtensionManifest {
@@ -51,6 +97,7 @@ pub struct ExtensionManifest {
     pub permissions: Vec<Capability>,
     pub dependencies: Vec<ExtensionDependency>,
     pub settings: BTreeMap<String, toml::Value>,
+    pub settings_schema: Vec<SettingSchemaField>,
     pub placement: WidgetPlacementConfig,
 }
 
@@ -70,6 +117,7 @@ impl Default for ExtensionManifest {
             permissions: vec![Capability::Ui, Capability::Theme],
             dependencies: Vec::new(),
             settings: BTreeMap::new(),
+            settings_schema: Vec::new(),
             placement: WidgetPlacementConfig::default(),
         }
     }
@@ -123,6 +171,17 @@ impl ExtensionManifest {
         let resolved = dir.join(entry);
         if !resolved.is_file() {
             return Err(format!("entry file not found: {}", resolved.display()));
+        }
+        // Prevent symlink escape outside the extension directory.
+        let canon_dir =
+            std::fs::canonicalize(dir).map_err(|e| format!("canonicalize extension dir: {e}"))?;
+        let canon_entry = std::fs::canonicalize(&resolved)
+            .map_err(|e| format!("canonicalize entry file: {e}"))?;
+        if !canon_entry.starts_with(&canon_dir) {
+            return Err(format!(
+                "entry file {:?} escapes extension root via symlink",
+                self.entry
+            ));
         }
         Ok(())
     }
@@ -181,5 +240,23 @@ permissions = ["ui", "theme"]
         let mut incompatible = loaded.manifest;
         incompatible.sdk_version = "2.0.0".to_string();
         assert!(incompatible.validate(dir.path()).is_err());
+
+        // Symlink escaping the extension directory must be rejected.
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "secret").unwrap();
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("evil.js");
+            std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+            let mut sym = ExtensionManifest {
+                id: "org.example.sym".into(),
+                name: "Sym".into(),
+                entry: "evil.js".into(),
+                ..Default::default()
+            };
+            assert!(sym.validate(dir.path()).is_err());
+            sym.entry = "index.js".into();
+            assert!(sym.validate(dir.path()).is_ok());
+        }
     }
 }

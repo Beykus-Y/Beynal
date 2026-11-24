@@ -94,11 +94,20 @@ pub enum HostAction {
     },
 }
 
+/// Hard safety caps for extension-emitted UI trees so a faulty or malicious
+/// extension cannot exhaust memory or stall the renderer.
+pub const MAX_UI_NODES: usize = 512;
+pub const MAX_UI_DEPTH: usize = 24;
+pub const MAX_UI_JSON_BYTES: usize = 256 * 1024;
+
 /// Snapshot of a widget's rendered UI tree and diagnostics.
 #[derive(Clone, Debug)]
 pub struct WidgetRenderState {
     pub id: String,
+    pub generation: u64,
     pub tree: Option<UiNode>,
+    pub node_count: usize,
+    pub last_eval_us: u64,
     pub last_error: Option<String>,
     pub visible: bool,
     pub updated_at: Instant,
@@ -113,8 +122,10 @@ pub struct HostActionEnvelope {
     pub action: HostAction,
 }
 
-/// Messages sent from UI / main thread to the JS worker thread.
-pub enum VmCommand {
+/// High-priority lifecycle control commands delivered over a dedicated
+/// non-blocking unbounded channel so they are NEVER dropped and NEVER stall
+/// the UI/PTY thread even if the bounded event queue is saturated.
+pub enum LifecycleCommand {
     LoadExtension {
         id: String,
         generation: u64,
@@ -129,6 +140,15 @@ pub enum VmCommand {
         id: String,
         generation: u64,
     },
+    UpdateSettings {
+        id: String,
+        settings_json: String,
+    },
+    Shutdown,
+}
+
+/// Best-effort bounded messages sent from UI / main thread to the JS worker thread.
+pub enum VmCommand {
     UiEvent {
         widget_id: String,
         node_id: String,
@@ -142,7 +162,6 @@ pub enum VmCommand {
         scale: f32,
         focused: bool,
     },
-    Shutdown,
 }
 
 /// Shared state readable by the main thread without blocking on JS execution.
@@ -159,6 +178,7 @@ pub struct SharedWidgetState {
 
 /// Handle to the background JS VM worker thread.
 pub struct WidgetRuntime {
+    lifecycle_tx: mpsc::Sender<LifecycleCommand>,
     tx: mpsc::SyncSender<VmCommand>,
     shared: Arc<Mutex<SharedWidgetState>>,
     shutdown_flag: Arc<AtomicBool>,
@@ -173,6 +193,7 @@ impl WidgetRuntime {
         theme: Theme,
         bus: EventBus,
     ) -> Result<Self, String> {
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel::<LifecycleCommand>();
         let (tx, rx) = mpsc::sync_channel::<VmCommand>(128);
         let shared = Arc::new(Mutex::new(SharedWidgetState::default()));
         let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -196,6 +217,7 @@ impl WidgetRuntime {
             .name("beyrix-widgets-vm".to_string())
             .spawn(move || {
                 run_vm_loop(
+                    lifecycle_rx,
                     rx,
                     shared_clone,
                     shutdown_clone,
@@ -209,6 +231,7 @@ impl WidgetRuntime {
             .map_err(|e| format!("spawn widget VM thread: {e}"))?;
 
         Ok(Self {
+            lifecycle_tx,
             tx,
             shared,
             shutdown_flag,
@@ -220,11 +243,18 @@ impl WidgetRuntime {
         let _ = self.tx.try_send(cmd);
     }
 
-    /// Reliable blocking send for lifecycle commands (`LoadExtension`,
-    /// `UnloadExtension`, `ReloadExtension`, `Shutdown`) so they are never
-    /// silently dropped when the channel is busy.
-    pub fn send_lifecycle(&self, cmd: VmCommand) {
-        let _ = self.tx.send(cmd);
+    /// Non-blocking, guaranteed delivery for lifecycle commands (`LoadExtension`,
+    /// `UnloadExtension`, `ReloadExtension`, `UpdateSettings`, `Shutdown`).
+    /// Never blocks the UI/PTY thread even if the bounded event channel is full,
+    /// and returns `Err` if the VM worker thread has exited.
+    pub fn send_lifecycle(&self, cmd: LifecycleCommand) -> Result<(), String> {
+        self.lifecycle_tx
+            .send(cmd)
+            .map_err(|_| "widget VM worker disconnected".to_string())
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.worker.as_ref().is_some_and(|h| !h.is_finished())
     }
 
     pub fn snapshot_renders(&self) -> HashMap<String, WidgetRenderState> {
@@ -246,7 +276,7 @@ impl WidgetRuntime {
 impl Drop for WidgetRuntime {
     fn drop(&mut self) {
         self.shutdown_flag.store(true, Ordering::Relaxed);
-        let _ = self.tx.try_send(VmCommand::Shutdown);
+        let _ = self.lifecycle_tx.send(LifecycleCommand::Shutdown);
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
         }
@@ -266,6 +296,7 @@ struct LoadedVmExtension {
 
 #[allow(clippy::too_many_arguments)]
 fn run_vm_loop(
+    lifecycle_rx: mpsc::Receiver<LifecycleCommand>,
     rx: mpsc::Receiver<VmCommand>,
     shared: Arc<Mutex<SharedWidgetState>>,
     shutdown: Arc<AtomicBool>,
@@ -293,18 +324,13 @@ fn run_vm_loop(
     let timeout = Duration::from_millis(execution_timeout_ms.max(10));
 
     while !shutdown.load(Ordering::Relaxed) {
-        // 1. Process incoming VM commands
-        while let Ok(cmd) = rx.try_recv() {
+        // 1. Always drain high-priority lifecycle commands FIRST so Load/Unload/
+        //    Reload/UpdateSettings/Shutdown are never delayed or dropped by a
+        //    flooded UI event queue.
+        while let Ok(cmd) = lifecycle_rx.try_recv() {
             match cmd {
-                VmCommand::Shutdown => return,
-                VmCommand::UpdateTheme(t) => theme = t,
-                VmCommand::UpdateWindow {
-                    width,
-                    height,
-                    scale,
-                    focused,
-                } => win_state = (width, height, scale, focused),
-                VmCommand::LoadExtension {
+                LifecycleCommand::Shutdown => return,
+                LifecycleCommand::LoadExtension {
                     id,
                     generation,
                     entry_path,
@@ -326,13 +352,14 @@ fn run_vm_loop(
                         win_state,
                     );
                 }
-                VmCommand::UnloadExtension { id } => {
+                LifecycleCommand::UnloadExtension { id } => {
                     extensions.remove(&id);
                     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
                     s.renders.remove(&id);
                     s.pending_actions.retain(|env| env.extension_id != id);
+                    s.render_dirty = true;
                 }
-                VmCommand::ReloadExtension { id, generation } => {
+                LifecycleCommand::ReloadExtension { id, generation } => {
                     if let Some(ext) = extensions.get(&id).map(|e| {
                         (
                             e.entry_path.clone(),
@@ -343,6 +370,7 @@ fn run_vm_loop(
                         extensions.remove(&id);
                         {
                             let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+                            s.renders.remove(&id);
                             s.pending_actions.retain(|env| env.extension_id != id);
                         }
                         load_into_vm(
@@ -361,6 +389,28 @@ fn run_vm_loop(
                         );
                     }
                 }
+                LifecycleCommand::UpdateSettings { id, settings_json } => {
+                    if let Some(ext) = extensions.get_mut(&id) {
+                        let script = format!(
+                            "if (globalThis.__beyrix_update_settings) {{ globalThis.__beyrix_update_settings({settings_json}); }}"
+                        );
+                        eval_with_timeout(ext, &deadline, timeout, &script, &shared);
+                        sync_render_from_vm(ext, &deadline, timeout, &shared);
+                    }
+                }
+            }
+        }
+
+        // 2. Process bounded best-effort VM commands (UI events, theme/window updates)
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                VmCommand::UpdateTheme(t) => theme = t,
+                VmCommand::UpdateWindow {
+                    width,
+                    height,
+                    scale,
+                    focused,
+                } => win_state = (width, height, scale, focused),
                 VmCommand::UiEvent {
                     widget_id,
                     node_id,
@@ -501,7 +551,10 @@ fn load_into_vm(
                 id.clone(),
                 WidgetRenderState {
                     id,
+                    generation,
                     tree: None,
+                    node_count: 0,
+                    last_eval_us: 0,
                     last_error: Some(format!("read entry: {e}")),
                     visible: false,
                     updated_at: Instant::now(),
@@ -697,6 +750,30 @@ fn handle_host_call(
     }
 }
 
+fn count_ui_nodes(node: &UiNode, depth: usize, count: &mut usize) -> Result<(), String> {
+    if depth > MAX_UI_DEPTH {
+        return Err(format!("UI tree exceeds max depth {MAX_UI_DEPTH}"));
+    }
+    *count += 1;
+    if *count > MAX_UI_NODES {
+        return Err(format!("UI tree exceeds max node count {MAX_UI_NODES}"));
+    }
+    match node {
+        UiNode::Container { child, .. } => count_ui_nodes(child, depth + 1, count),
+        UiNode::Row { children, .. }
+        | UiNode::Column { children, .. }
+        | UiNode::Grid { children, .. }
+        | UiNode::Stack { children }
+        | UiNode::ScrollView { children, .. } => {
+            for c in children {
+                count_ui_nodes(c, depth + 1, count)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn eval_with_timeout(
     ext: &mut LoadedVmExtension,
     deadline: &Arc<Mutex<Option<Instant>>>,
@@ -704,6 +781,7 @@ fn eval_with_timeout(
     code: &str,
     shared: &Arc<Mutex<SharedWidgetState>>,
 ) {
+    let t0 = Instant::now();
     {
         let mut guard = deadline.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(Instant::now() + timeout);
@@ -713,6 +791,7 @@ fn eval_with_timeout(
         let mut guard = deadline.lock().unwrap_or_else(|e| e.into_inner());
         *guard = None;
     }
+    let elapsed_us = t0.elapsed().as_micros() as u64;
     if let Err(err) = res {
         let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
         let entry = s
@@ -720,11 +799,16 @@ fn eval_with_timeout(
             .entry(ext.id.clone())
             .or_insert_with(|| WidgetRenderState {
                 id: ext.id.clone(),
+                generation: ext.generation,
                 tree: None,
+                node_count: 0,
+                last_eval_us: elapsed_us,
                 last_error: None,
                 visible: true,
                 updated_at: Instant::now(),
             });
+        entry.generation = ext.generation;
+        entry.last_eval_us = elapsed_us;
         entry.last_error = Some(format!("{err:?}"));
         entry.updated_at = Instant::now();
     }
@@ -739,6 +823,7 @@ fn sync_render_from_vm(
     if !ext.permissions.has(Capability::Ui) {
         return;
     }
+    let t0 = Instant::now();
     {
         let mut guard = deadline.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(Instant::now() + timeout);
@@ -754,16 +839,60 @@ fn sync_render_from_vm(
         let mut guard = deadline.lock().unwrap_or_else(|e| e.into_inner());
         *guard = None;
     }
+    let elapsed_us = t0.elapsed().as_micros() as u64;
     if let Some(json) = json_opt {
-        let parsed: Result<UiNode, _> = serde_json::from_str(&json);
         let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if json.len() > MAX_UI_JSON_BYTES {
+            let entry = s
+                .renders
+                .entry(ext.id.clone())
+                .or_insert_with(|| WidgetRenderState {
+                    id: ext.id.clone(),
+                    generation: ext.generation,
+                    tree: None,
+                    node_count: 0,
+                    last_eval_us: elapsed_us,
+                    last_error: None,
+                    visible: true,
+                    updated_at: Instant::now(),
+                });
+            entry.generation = ext.generation;
+            entry.last_error = Some(format!(
+                "UI payload ({} bytes) exceeds limit ({MAX_UI_JSON_BYTES} bytes)",
+                json.len()
+            ));
+            return;
+        }
+        let parsed: Result<UiNode, _> = serde_json::from_str(&json);
         match parsed {
             Ok(tree) => {
+                let mut node_count = 0usize;
+                if let Err(limit_err) = count_ui_nodes(&tree, 0, &mut node_count) {
+                    let entry =
+                        s.renders
+                            .entry(ext.id.clone())
+                            .or_insert_with(|| WidgetRenderState {
+                                id: ext.id.clone(),
+                                generation: ext.generation,
+                                tree: None,
+                                node_count: 0,
+                                last_eval_us: elapsed_us,
+                                last_error: None,
+                                visible: true,
+                                updated_at: Instant::now(),
+                            });
+                    entry.generation = ext.generation;
+                    entry.last_error = Some(limit_err);
+                    return;
+                }
                 s.renders.insert(
                     ext.id.clone(),
                     WidgetRenderState {
                         id: ext.id.clone(),
+                        generation: ext.generation,
                         tree: Some(tree),
+                        node_count,
+                        last_eval_us: elapsed_us,
                         last_error: None,
                         visible: true,
                         updated_at: Instant::now(),
@@ -777,11 +906,15 @@ fn sync_render_from_vm(
                     .entry(ext.id.clone())
                     .or_insert_with(|| WidgetRenderState {
                         id: ext.id.clone(),
+                        generation: ext.generation,
                         tree: None,
+                        node_count: 0,
+                        last_eval_us: elapsed_us,
                         last_error: None,
                         visible: true,
                         updated_at: Instant::now(),
                     });
+                entry.generation = ext.generation;
                 entry.last_error = Some(format!("invalid UI tree: {e}"));
             }
         }
@@ -998,6 +1131,24 @@ globalThis.beyrix = {{
         scale: {win_scale},
         focused: {win_focus},
     }},
+    settings: {{
+        _values: {{}},
+        get(key, fallback) {{
+            return Object.prototype.hasOwnProperty.call(this._values, key) ? this._values[key] : fallback;
+        }},
+        getAll() {{
+            return Object.assign({{}}, this._values);
+        }},
+        onChange(cb) {{
+            beyrix.events.on("settingsChanged", cb);
+        }},
+    }},
+}};
+globalThis.__beyrix_update_settings = function(values) {{
+    if (values && typeof values === "object") {{
+        beyrix.settings._values = Object.assign({{}}, beyrix.settings._values, values);
+        globalThis.__beyrix_emit("settingsChanged", beyrix.settings.getAll());
+    }}
 }};
 globalThis.console = {{ log: (...a) => beyrix.log(a.join(" ")), error: (...a) => beyrix.log("ERROR: " + a.join(" ")) }};
 "#,
@@ -1055,13 +1206,14 @@ mod tests {
 
         let loaded = ExtensionManifest::load_from_dir(dir.path()).unwrap();
         let vm = WidgetRuntime::start(8, 256, 40, Theme::default(), bus).unwrap();
-        vm.send(VmCommand::LoadExtension {
+        vm.send_lifecycle(LifecycleCommand::LoadExtension {
             id: "test.loop".into(),
             generation: 1,
             entry_path: loaded.entry_path,
             manifest: Box::new(loaded.manifest),
             permissions: PermissionSet::new([Capability::Ui]),
-        });
+        })
+        .unwrap();
         std::thread::sleep(Duration::from_millis(160));
         let renders = vm.snapshot_renders();
         let st = renders.get("test.loop").expect("error recorded");
@@ -1093,13 +1245,14 @@ beyrix.keyboard.onLayoutChange((ev) => {
 
         let loaded = ExtensionManifest::load_from_dir(dir.path()).unwrap();
         let vm = WidgetRuntime::start(16, 256, 50, Theme::default(), bus.clone()).unwrap();
-        vm.send(VmCommand::LoadExtension {
+        vm.send_lifecycle(LifecycleCommand::LoadExtension {
             id: "test.kbd".into(),
             generation: 1,
             entry_path: loaded.entry_path,
             manifest: Box::new(loaded.manifest),
             permissions: PermissionSet::new([Capability::Ui, Capability::KeyboardLayout]),
-        });
+        })
+        .unwrap();
         std::thread::sleep(Duration::from_millis(80));
         bus.publish(AppEvent::KeyboardLayout(KeyboardLayoutEvent {
             active_index: 1,
@@ -1112,5 +1265,99 @@ beyrix.keyboard.onLayoutChange((ev) => {
         let st = renders.get("test.kbd").expect("rendered");
         assert!(st.last_error.is_none(), "err: {:?}", st.last_error);
         assert!(st.tree.is_some());
+        assert_eq!(st.generation, 1);
+    }
+
+    #[test]
+    fn lifecycle_commands_never_block_or_drop_when_event_queue_is_flooded() {
+        let bus = EventBus::new();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            "beyrix.ui.render(beyrix.ui.text('ok'));",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("beyrix-ext.toml"),
+            "id = \"test.flood\"\nname = \"Flood\"\nsdk_version = \"1.0.0\"\n",
+        )
+        .unwrap();
+        let loaded = ExtensionManifest::load_from_dir(dir.path()).unwrap();
+        let vm = WidgetRuntime::start(16, 256, 50, Theme::default(), bus).unwrap();
+
+        // Completely saturate the bounded UI event channel.
+        for i in 0..512 {
+            vm.send(VmCommand::UiEvent {
+                widget_id: "nonexistent".into(),
+                node_id: format!("n{i}"),
+                kind: "click".into(),
+                value: 1.0,
+            });
+        }
+
+        // Lifecycle load must return immediately (non-blocking) and succeed!
+        let t0 = Instant::now();
+        vm.send_lifecycle(LifecycleCommand::LoadExtension {
+            id: "test.flood".into(),
+            generation: 7,
+            entry_path: loaded.entry_path,
+            manifest: Box::new(loaded.manifest),
+            permissions: PermissionSet::new([Capability::Ui]),
+        })
+        .unwrap();
+        assert!(t0.elapsed() < Duration::from_millis(20));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if let Some(st) = vm.snapshot_renders().get("test.flood")
+                && st.generation == 7
+                && st.tree.is_some()
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("lifecycle load was delayed or dropped under event flood");
+    }
+
+    #[test]
+    fn excessive_ui_node_tree_is_rejected_without_crashing_runtime() {
+        let bus = EventBus::new();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.js"),
+            "const items = []; for (let i = 0; i < 700; i++) items.push(beyrix.ui.text('x')); beyrix.ui.render(beyrix.ui.column(items));",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("beyrix-ext.toml"),
+            "id = \"test.huge\"\nname = \"Huge\"\nsdk_version = \"1.0.0\"\n",
+        )
+        .unwrap();
+        let loaded = ExtensionManifest::load_from_dir(dir.path()).unwrap();
+        let vm = WidgetRuntime::start(16, 256, 100, Theme::default(), bus).unwrap();
+        vm.send_lifecycle(LifecycleCommand::LoadExtension {
+            id: "test.huge".into(),
+            generation: 1,
+            entry_path: loaded.entry_path,
+            manifest: Box::new(loaded.manifest),
+            permissions: PermissionSet::new([Capability::Ui]),
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if let Some(st) = vm.snapshot_renders().get("test.huge")
+                && st
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("max node count"))
+            {
+                assert!(st.tree.is_none());
+                assert!(vm.is_alive());
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("excessive UI tree was not rejected");
     }
 }
