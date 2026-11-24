@@ -159,6 +159,7 @@ declare namespace Beyrix {
     background: {
       setPreset(preset: "torus" | "sphere" | "terrain" | "ocean" | "tunnel" | "starfield" | "audio-reactive"): void;
       clearScene(): void;
+      releaseScene(): void;
       addObject(spec: {
         id: string;
         primitive: "torus" | "sphere" | "cube" | "plane" | "obj";
@@ -180,6 +181,7 @@ declare namespace Beyrix {
       setCharset(charset: string): void;
       bind(binding: {
         id: string;
+        objectId?: string;
         source: "audio-bass" | "audio-mid" | "audio-treble" | "audio-rms" | "audio-peak" | "audio-beat" | "cpu-usage" | "ram-usage" | "xray-activity" | "mouse-x" | "mouse-y" | "time";
         target: "object-scale" | "rotation-speed" | "light-intensity" | "particle-impulse" | "brightness" | "wave-amplitude";
         inMin?: number;

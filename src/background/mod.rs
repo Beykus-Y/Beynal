@@ -20,7 +20,10 @@ use crate::config::{BackgroundConfig, BackgroundPreset, BackgroundTuiBehavior};
 use crate::render::{Renderer, Scene, SceneGlyph};
 use crate::theme::Theme;
 
-use bindings::{BindingInputs, BindingTarget, DataBinding, DataSource, evaluate_bindings};
+use bindings::{
+    BindingInputs, BindingTarget, DataBinding, DataSource, evaluate_bindings,
+    evaluate_bindings_for_object,
+};
 use glam::Vec3;
 use presets::build_preset_scene;
 use scene3d::{
@@ -96,15 +99,39 @@ impl BackgroundEngine {
         }
     }
 
-    pub fn set_preset(&mut self, preset: BackgroundPreset) {
+    pub fn set_preset(
+        &mut self,
+        owner: Option<&str>,
+        preset: BackgroundPreset,
+    ) -> Result<(), String> {
+        if let (Some(req_owner), Some(existing)) = (owner, &self.scene_owner)
+            && req_owner != existing
+        {
+            return Err("background scene is owned by another extension".to_string());
+        }
         self.config.preset = preset;
         self.custom_scene = None;
-        self.scene_owner = None;
+        self.scene_owner = owner.map(str::to_owned);
+        Ok(())
     }
 
-    pub fn clear_scene(&mut self, owner: &str) {
+    pub fn clear_scene(&mut self, owner: &str) -> Result<(), String> {
+        if let Some(existing) = &self.scene_owner
+            && existing != owner
+        {
+            return Err("background scene is owned by another extension".to_string());
+        }
         self.scene_owner = Some(owner.to_string());
         self.custom_scene = Some(Scene3D::default());
+        Ok(())
+    }
+
+    pub fn release_scene(&mut self, owner: &str) {
+        if self.scene_owner.as_deref() == Some(owner) {
+            self.scene_owner = None;
+            self.custom_scene = None;
+        }
+        self.bindings.retain(|b| b.owner != owner);
     }
 
     fn ensure_custom_scene_mut(&mut self, owner: &str) -> Option<&mut Scene3D> {
@@ -234,13 +261,28 @@ impl BackgroundEngine {
         }
     }
 
-    pub fn add_binding(&mut self, binding: DataBinding) {
+    pub fn add_binding(&mut self, owner: &str, mut binding: DataBinding) -> Result<(), String> {
+        if let Some(existing) = self.bindings.iter().find(|b| b.id == binding.id)
+            && !existing.owner.is_empty()
+            && existing.owner != owner
+        {
+            return Err("binding is owned by another extension".to_string());
+        }
+        binding.owner = owner.to_string();
         self.bindings.retain(|b| b.id != binding.id);
         self.bindings.push(binding);
+        Ok(())
     }
 
-    pub fn remove_binding(&mut self, id: &str) {
+    pub fn remove_binding(&mut self, owner: &str, id: &str) -> Result<(), String> {
+        if let Some(existing) = self.bindings.iter().find(|b| b.id == id)
+            && !existing.owner.is_empty()
+            && existing.owner != owner
+        {
+            return Err("cannot remove binding owned by another extension".to_string());
+        }
         self.bindings.retain(|b| b.id != id);
+        Ok(())
     }
 
     pub fn is_active(&self, focused: bool, in_tui: bool) -> bool {
@@ -300,8 +342,9 @@ impl BackgroundEngine {
         let mut s3d = if let Some(custom) = &self.custom_scene {
             let mut s = custom.clone();
             for obj in &mut s.objects {
-                obj.scale *= mods.scale;
-                obj.rotation.y += elapsed * 0.4 * mods.rotation_speed;
+                let obj_mods = evaluate_bindings_for_object(&mut self.bindings, inputs, &obj.id);
+                obj.scale *= obj_mods.scale;
+                obj.rotation.y += elapsed * 0.4 * obj_mods.rotation_speed;
             }
             s.light.intensity *= mods.light_intensity;
             s
@@ -451,7 +494,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         });
-        engine.clear_scene("ext.a");
+        engine.clear_scene("ext.a").unwrap();
         engine
             .add_object(
                 "ext.a",
@@ -466,7 +509,13 @@ mod tests {
                 },
             )
             .unwrap();
-        // Another extension cannot hijack ext.a's scene without clear_scene
+        // Another extension cannot hijack ext.a's scene, preset, or bindings
+        assert!(engine.clear_scene("ext.b").is_err());
+        assert!(
+            engine
+                .set_preset(Some("ext.b"), BackgroundPreset::Starfield)
+                .is_err()
+        );
         assert!(
             engine
                 .add_object(
@@ -483,6 +532,16 @@ mod tests {
                 )
                 .is_err()
         );
+        let mut b = DataBinding::new(
+            "cube-scale",
+            DataSource::AudioBass,
+            BindingTarget::ObjectScale,
+            1.0,
+            2.0,
+        );
+        b.object_id = Some("my-cube".into());
+        engine.add_binding("ext.a", b).unwrap();
+        assert!(engine.remove_binding("ext.b", "cube-scale").is_err());
         let mut scene = Scene::default();
         engine.render_to_scene(
             (800.0, 600.0),

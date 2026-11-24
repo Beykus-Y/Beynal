@@ -376,15 +376,36 @@ pub fn execute_process_action(
     expected_starttime: u64,
     action: ProcessAction,
 ) -> Result<(), String> {
+    // 1. Pin the kernel `struct pid` with pidfd_open BEFORE checking starttime.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_uint) };
+    if pidfd < 0 {
+        return Err(format!(
+            "pidfd_open({pid}) failed (refusing unsafe PID-only fallback): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(pidfd as i32) };
+
+    // 2. Verify starttime while holding the pidfd. If the PID was reused before
+    //    pidfd_open, starttime will not match and we abort without signaling.
+    let current = read_proc_stat(pid).ok_or_else(|| format!("process {pid} no longer exists"))?;
+    if current.starttime != expected_starttime {
+        return Err(format!(
+            "PID {pid} was reused (starttime mismatch); action aborted for safety"
+        ));
+    }
+
     if let ProcessAction::Renice(prio) = action {
-        let current =
-            read_proc_stat(pid).ok_or_else(|| format!("process {pid} no longer exists"))?;
-        if current.starttime != expected_starttime {
-            return Err(format!(
-                "PID {pid} was reused (starttime mismatch); action aborted for safety"
-            ));
-        }
+        // Note: Linux setpriority(2) has no pidfd variant. We hold pidfd_open above
+        // and verify starttime both before and immediately after setpriority.
         let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, prio) };
+        let after = read_proc_stat(pid);
+        if after
+            .as_ref()
+            .is_none_or(|s| s.starttime != expected_starttime)
+        {
+            return Err("process exited or PID reused during renice".to_string());
+        }
         return if rc == 0 {
             Ok(())
         } else {
@@ -399,25 +420,6 @@ pub fn execute_process_action(
         ProcessAction::Kill => libc::SIGKILL,
         ProcessAction::Renice(_) => unreachable!(),
     };
-
-    // 1. Pin the kernel `struct pid` with pidfd_open BEFORE checking starttime.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_uint) };
-    if pidfd < 0 {
-        return Err(format!(
-            "pidfd_open({pid}) failed (refusing unsafe kill fallback): {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(pidfd as i32) };
-
-    // 2. Verify starttime while holding the pidfd. If the PID was reused before
-    //    pidfd_open, starttime will not match and we abort without signaling.
-    let current = read_proc_stat(pid).ok_or_else(|| format!("process {pid} no longer exists"))?;
-    if current.starttime != expected_starttime {
-        return Err(format!(
-            "PID {pid} was reused (starttime mismatch); action aborted for safety"
-        ));
-    }
 
     // 3. Signal exclusively through pidfd_send_signal. If the process exited
     //    between step 2 and step 3, pidfd_send_signal returns ESRCH and will

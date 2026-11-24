@@ -354,7 +354,31 @@ impl Renderer {
 
     /// Build a scene in physical pixels. Partial redraws emit only damaged rows.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub fn build_terminal_scene(
+        &mut self,
+        screen: &Screen,
+        dimensions: (usize, usize),
+        selection: &crate::selection::Selection,
+        focused: bool,
+        blink_on: bool,
+        scale: f32,
+        rows: Option<(usize, usize)>,
+    ) -> Scene {
+        self.build_terminal_scene_with_insets(
+            screen,
+            dimensions,
+            selection,
+            focused,
+            blink_on,
+            scale,
+            rows,
+            (0.0, 0.0, 0.0, 0.0),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_terminal_scene_with_insets(
         &mut self,
         screen: &Screen,
         (width, height): (usize, usize),
@@ -363,6 +387,7 @@ impl Renderer {
         blink_on: bool,
         scale: f32,
         rows: Option<(usize, usize)>,
+        insets: (f32, f32, f32, f32),
     ) -> Scene {
         let base = self.geometry(scale).for_window(width, height);
         let (width, height) = (width as f32, height as f32);
@@ -371,10 +396,10 @@ impl Renderer {
         let padding = base.padding as f32;
         let baseline = base.baseline as f32;
         let px_size = self.font_px(scale);
-        let inner_left = padding;
-        let inner_right = (width - padding).max(inner_left);
-        let inner_top = padding;
-        let inner_bottom = (height - padding).max(inner_top);
+        let inner_left = padding + insets.0;
+        let inner_right = (width - padding - insets.2).max(inner_left);
+        let inner_top = padding + insets.1;
+        let inner_bottom = (height - padding - insets.3).max(inner_top);
 
         let background = rgba(self.theme.background);
         let cursor_color = rgba(self.theme.cursor);

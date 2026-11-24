@@ -51,6 +51,10 @@ pub enum CombineMode {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DataBinding {
     pub id: String,
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub object_id: Option<String>,
     pub source: DataSource,
     pub target: BindingTarget,
     pub in_min: f32,
@@ -73,6 +77,8 @@ impl DataBinding {
     ) -> Self {
         Self {
             id: id.into(),
+            owner: String::new(),
+            object_id: None,
             source,
             target,
             in_min: 0.0,
@@ -158,8 +164,33 @@ pub fn evaluate_bindings(
     bindings: &mut [DataBinding],
     inputs: &BindingInputs,
 ) -> EvaluatedModifiers {
+    evaluate_bindings_filtered(bindings, inputs, None)
+}
+
+pub fn evaluate_bindings_for_object(
+    bindings: &mut [DataBinding],
+    inputs: &BindingInputs,
+    object_id: &str,
+) -> EvaluatedModifiers {
+    evaluate_bindings_filtered(bindings, inputs, Some(object_id))
+}
+
+fn evaluate_bindings_filtered(
+    bindings: &mut [DataBinding],
+    inputs: &BindingInputs,
+    object_id: Option<&str>,
+) -> EvaluatedModifiers {
     let mut mods = EvaluatedModifiers::default();
     for b in bindings {
+        let applies = match (object_id, b.object_id.as_deref()) {
+            (Some(oid), Some(target_oid)) => oid == target_oid,
+            (Some(_), None) => true,
+            (None, None) => true,
+            (None, Some(_)) => false,
+        };
+        if !applies {
+            continue;
+        }
         let v = b.evaluate(inputs);
         let slot = match b.target {
             BindingTarget::ObjectScale => &mut mods.scale,

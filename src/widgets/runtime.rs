@@ -36,7 +36,13 @@ pub enum HostAction {
     MediaSetVolume(f64),
     MediaPlayFile(String),
     MediaEnqueue(String),
-    BackgroundSetPreset(String),
+    BackgroundSetPreset {
+        owner: String,
+        preset: String,
+    },
+    BackgroundReleaseScene {
+        owner: String,
+    },
     BackgroundClearScene {
         owner: String,
     },
@@ -70,8 +76,14 @@ pub enum HostAction {
         intensity: Option<f32>,
     },
     BackgroundSetCharset(String),
-    BackgroundBind(crate::background::bindings::DataBinding),
-    BackgroundUnbind(String),
+    BackgroundBind {
+        owner: String,
+        binding: crate::background::bindings::DataBinding,
+    },
+    BackgroundUnbind {
+        owner: String,
+        id: String,
+    },
     WidgetLog {
         extension_id: String,
         level: String,
@@ -128,6 +140,7 @@ pub struct SharedWidgetState {
     pub latest_media: Option<MediaEventPayload>,
     pub latest_audio: Option<AudioFramePayload>,
     pub latest_xray: Option<XRaySummaryPayload>,
+    pub render_dirty: bool,
 }
 
 /// Handle to the background JS VM worker thread.
@@ -201,6 +214,11 @@ impl WidgetRuntime {
     pub fn drain_actions(&self) -> Vec<HostAction> {
         let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         s.pending_actions.drain(..).collect()
+    }
+
+    pub fn take_render_dirty(&self) -> bool {
+        let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::replace(&mut s.render_dirty, false)
     }
 }
 
@@ -541,7 +559,16 @@ fn handle_host_call(
         }
         "background.setPreset" if perms.has(Capability::BackgroundControl) => {
             s.pending_actions
-                .push_back(HostAction::BackgroundSetPreset(arg.to_string()));
+                .push_back(HostAction::BackgroundSetPreset {
+                    owner: ext_id.to_string(),
+                    preset: arg.to_string(),
+                });
+        }
+        "background.releaseScene" if perms.has(Capability::BackgroundControl) => {
+            s.pending_actions
+                .push_back(HostAction::BackgroundReleaseScene {
+                    owner: ext_id.to_string(),
+                });
         }
         "background.clearScene" if perms.has(Capability::BackgroundControl) => {
             s.pending_actions
@@ -627,12 +654,17 @@ fn handle_host_call(
         }
         "background.bind" if perms.has(Capability::BackgroundControl) => {
             if let Ok(b) = serde_json::from_str::<crate::background::bindings::DataBinding>(arg) {
-                s.pending_actions.push_back(HostAction::BackgroundBind(b));
+                s.pending_actions.push_back(HostAction::BackgroundBind {
+                    owner: ext_id.to_string(),
+                    binding: b,
+                });
             }
         }
         "background.unbind" if perms.has(Capability::BackgroundControl) => {
-            s.pending_actions
-                .push_back(HostAction::BackgroundUnbind(arg.to_string()));
+            s.pending_actions.push_back(HostAction::BackgroundUnbind {
+                owner: ext_id.to_string(),
+                id: arg.to_string(),
+            });
         }
         _ => {}
     }
@@ -710,6 +742,7 @@ fn sync_render_from_vm(
                         updated_at: Instant::now(),
                     },
                 );
+                s.render_dirty = true;
             }
             Err(e) => {
                 let entry = s
@@ -870,6 +903,10 @@ globalThis.beyrix = {{
             requirePerm({perm_bg}, "background-control");
             __beyrix_host_call("background.clearScene", "");
         }},
+        releaseScene() {{
+            requirePerm({perm_bg}, "background-control");
+            __beyrix_host_call("background.releaseScene", "");
+        }},
         addObject(spec) {{
             requirePerm({perm_bg}, "background-control");
             __beyrix_host_call("background.addObject", JSON.stringify(spec));
@@ -898,6 +935,7 @@ globalThis.beyrix = {{
             requirePerm({perm_bg}, "background-control");
             const payload = {{
                 id: String(binding.id || "bind"),
+                object_id: binding.objectId ? String(binding.objectId) : null,
                 source: binding.source,
                 target: binding.target,
                 in_min: Number(binding.inMin ?? 0.0),

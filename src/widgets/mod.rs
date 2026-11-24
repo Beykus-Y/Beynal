@@ -22,7 +22,7 @@ use crate::theme::Theme;
 
 use layout::{
     DragOperation, ResolvedWidgetRect, VisualLayoutEditor, WidgetPlacementConfig,
-    compute_dock_insets, resolve_widget_rect,
+    compute_dock_insets, resolve_widget_rect_with_cursor,
 };
 use manifest::{ExtensionManifest, LoadedExtension};
 use permissions::PermissionSet;
@@ -157,6 +157,12 @@ impl WidgetManager {
             .map_or_else(Vec::new, WidgetRuntime::drain_actions)
     }
 
+    pub fn take_dirty(&self) -> bool {
+        self.runtime
+            .as_ref()
+            .is_some_and(WidgetRuntime::take_render_dirty)
+    }
+
     pub fn dock_insets(&self, in_tui: bool, scale: f32) -> layout::ViewportInsets {
         if !self.config.enabled {
             return layout::ViewportInsets::default();
@@ -175,6 +181,7 @@ impl WidgetManager {
         in_tui: bool,
         pointer_px: (f32, f32),
         inline_y_px: Option<f32>,
+        cursor_row_px: Option<(f32, f32)>,
         theme: &Theme,
         renderer: &mut Renderer,
         scene: &mut Scene,
@@ -195,7 +202,7 @@ impl WidgetManager {
             let Some(state) = renders.get(id) else {
                 continue;
             };
-            let pre_rect = resolve_widget_rect(
+            let pre_rect = resolve_widget_rect_with_cursor(
                 cfg,
                 win_size.0,
                 win_size.1,
@@ -205,12 +212,13 @@ impl WidgetManager {
                 in_tui,
                 true,
                 inline_y_px,
+                cursor_row_px,
             );
             let hovered = pointer_px.0 >= pre_rect.x
                 && pointer_px.0 <= pre_rect.x + pre_rect.w
                 && pointer_px.1 >= pre_rect.y
                 && pointer_px.1 <= pre_rect.y + pre_rect.h;
-            let resolved = resolve_widget_rect(
+            let resolved = resolve_widget_rect_with_cursor(
                 cfg,
                 win_size.0,
                 win_size.1,
@@ -220,6 +228,7 @@ impl WidgetManager {
                 in_tui,
                 hovered,
                 inline_y_px,
+                cursor_row_px,
             );
             self.resolved_rects.insert(id.clone(), resolved);
             if !resolved.visible && !self.editor.active {

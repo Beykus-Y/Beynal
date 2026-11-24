@@ -159,8 +159,9 @@ impl XRayEngine {
                 let mut cmd_name = String::new();
                 let mut peak_rss = 0u64;
                 let mut peak_procs = 0usize;
-                let mut start_io = (0u64, 0u64, 0u64, 0u64);
-                let mut last_io = (0u64, 0u64, 0u64, 0u64);
+                let mut cmd_pid_io: std::collections::HashMap<(i32, u64), (u64, u64, u64, u64)> =
+                    std::collections::HashMap::new();
+                let mut cmd_io_totals = (0u64, 0u64, 0u64, 0u64);
                 let mut wait_events: Vec<String> = Vec::new();
                 let mut cmd_seq = 1u64;
 
@@ -182,18 +183,13 @@ impl XRayEngine {
                     let total_cpu: f32 = nodes.iter().map(|n| n.cpu_percent).sum();
                     let total_rss: u64 = nodes.iter().map(|n| n.rss_bytes).sum();
 
-                    // Track foreground job lifecycle for post-command reports (scoped to fg PGID)
+                    // Track foreground job lifecycle for post-command reports (scoped to fg PGID,
+                    // accumulating I/O deltas per (pid, starttime) so exited children are not lost).
                     if let Some(fg) = fg_pgid {
                         let cmd_nodes: Vec<&ProcessNode> =
                             nodes.iter().filter(|n| n.pgid == fg).collect();
                         let cmd_rss: u64 = cmd_nodes.iter().map(|n| n.rss_bytes).sum();
                         let cmd_procs = cmd_nodes.len();
-                        let cmd_io = (
-                            cmd_nodes.iter().map(|n| n.read_bytes).sum::<u64>(),
-                            cmd_nodes.iter().map(|n| n.write_bytes).sum::<u64>(),
-                            cmd_nodes.iter().map(|n| n.logical_read_bytes).sum::<u64>(),
-                            cmd_nodes.iter().map(|n| n.logical_write_bytes).sum::<u64>(),
-                        );
 
                         if prev_fg != Some(fg) {
                             if let Some(old_fg) = prev_fg
@@ -209,12 +205,13 @@ impl XRayEngine {
                                     duration_ms: cmd_started.elapsed().as_millis() as u64,
                                     peak_rss_bytes: peak_rss,
                                     peak_process_count: peak_procs,
-                                    physical_read_bytes: last_io.0.saturating_sub(start_io.0),
-                                    physical_write_bytes: last_io.1.saturating_sub(start_io.1),
-                                    logical_read_bytes: last_io.2.saturating_sub(start_io.2),
-                                    logical_write_bytes: last_io.3.saturating_sub(start_io.3),
+                                    physical_read_bytes: cmd_io_totals.0,
+                                    physical_write_bytes: cmd_io_totals.1,
+                                    logical_read_bytes: cmd_io_totals.2,
+                                    logical_write_bytes: cmd_io_totals.3,
                                     wait_events: std::mem::take(&mut wait_events),
-                                    trace_active: lvl == XRayLevel::Trace,
+                                    // Syscall/eBPF tracing is not active; report honestly.
+                                    trace_active: false,
                                 });
                                 cmd_seq += 1;
                             }
@@ -223,8 +220,19 @@ impl XRayEngine {
                             cmd_wall = SystemTime::now();
                             peak_rss = cmd_rss;
                             peak_procs = cmd_procs;
-                            start_io = cmd_io;
-                            last_io = cmd_io;
+                            cmd_pid_io.clear();
+                            for n in &cmd_nodes {
+                                cmd_pid_io.insert(
+                                    (n.pid, n.starttime),
+                                    (
+                                        n.read_bytes,
+                                        n.write_bytes,
+                                        n.logical_read_bytes,
+                                        n.logical_write_bytes,
+                                    ),
+                                );
+                            }
+                            cmd_io_totals = (0, 0, 0, 0);
                             wait_events.clear();
                             cmd_name = cmd_nodes
                                 .first()
@@ -233,8 +241,24 @@ impl XRayEngine {
                         } else {
                             peak_rss = peak_rss.max(cmd_rss);
                             peak_procs = peak_procs.max(cmd_procs);
-                            last_io = cmd_io;
                             for n in &cmd_nodes {
+                                let cur = (
+                                    n.read_bytes,
+                                    n.write_bytes,
+                                    n.logical_read_bytes,
+                                    n.logical_write_bytes,
+                                );
+                                if let Some(prev) = cmd_pid_io.insert((n.pid, n.starttime), cur) {
+                                    cmd_io_totals.0 += cur.0.saturating_sub(prev.0);
+                                    cmd_io_totals.1 += cur.1.saturating_sub(prev.1);
+                                    cmd_io_totals.2 += cur.2.saturating_sub(prev.2);
+                                    cmd_io_totals.3 += cur.3.saturating_sub(prev.3);
+                                } else {
+                                    cmd_io_totals.0 += cur.0;
+                                    cmd_io_totals.1 += cur.1;
+                                    cmd_io_totals.2 += cur.2;
+                                    cmd_io_totals.3 += cur.3;
+                                }
                                 if !matches!(
                                     n.diagnosis.reason,
                                     diagnosis::WaitReason::ActiveCompute
@@ -249,7 +273,7 @@ impl XRayEngine {
                         }
                     }
 
-                    if let Some(focus_node) = nodes.last() {
+                    if let Some(focus_node) = select_focus_process(&nodes, fg_pgid) {
                         bus.publish(AppEvent::XRayUpdate(XRaySummaryPayload {
                             root_pid,
                             process_count: nodes.len(),
@@ -310,7 +334,8 @@ impl XRayEngine {
         let snap = self.snapshot();
 
         if self.config.compact_indicator {
-            let status_text = if let Some(last) = snap.nodes.last() {
+            let focus = select_focus_process(&snap.nodes, None);
+            let status_text = if let Some(last) = focus {
                 format!(
                     "X-Ray [{}] {} · {:.1}% CPU · {} MB · {}",
                     snap.level.name(),
@@ -460,6 +485,39 @@ impl Drop for XRayEngine {
     }
 }
 
+/// Select the most diagnostic-relevant process in the foreground job (prioritizing
+/// blocked/waiting processes, then highest CPU, never an unrelated background process).
+pub fn select_focus_process(nodes: &[ProcessNode], fg_pgid: Option<i32>) -> Option<&ProcessNode> {
+    let candidates: Vec<&ProcessNode> = match fg_pgid {
+        Some(fg) => {
+            let fg_nodes: Vec<&ProcessNode> = nodes.iter().filter(|n| n.pgid == fg).collect();
+            if fg_nodes.is_empty() {
+                nodes.iter().collect()
+            } else {
+                fg_nodes
+            }
+        }
+        None => nodes.iter().collect(),
+    };
+    candidates.into_iter().max_by(|a, b| {
+        let priority = |n: &ProcessNode| -> u8 {
+            match n.diagnosis.reason {
+                diagnosis::WaitReason::WaitingFileLock => 6,
+                diagnosis::WaitReason::PossibleDeadlock => 5,
+                diagnosis::WaitReason::WaitingStdin => 4,
+                diagnosis::WaitReason::WaitingDiskIo | diagnosis::WaitReason::WaitingNetwork => 3,
+                diagnosis::WaitReason::Stopped | diagnosis::WaitReason::Zombie => 2,
+                diagnosis::WaitReason::ActiveCompute => 1,
+                _ => 0,
+            }
+        };
+        priority(a)
+            .cmp(&priority(b))
+            .then_with(|| a.cpu_percent.total_cmp(&b.cpu_percent))
+            .then_with(|| a.pid.cmp(&b.pid))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,5 +600,42 @@ mod tests {
         let _ = waiter.wait();
         let _ = holder.kill();
         let _ = holder.wait();
+    }
+
+    #[test]
+    fn select_focus_process_prioritizes_blocked_fg_over_idle_last_node() {
+        let mk = |pid: i32, pgid: i32, reason: diagnosis::WaitReason, cpu: f32| ProcessNode {
+            pid,
+            ppid: 1,
+            pgid,
+            starttime: 100,
+            comm: format!("proc-{pid}"),
+            state: ProcessStateKind::Sleeping,
+            cpu_percent: cpu,
+            rss_bytes: 1024,
+            threads: 1,
+            read_bytes: 0,
+            write_bytes: 0,
+            logical_read_bytes: 0,
+            logical_write_bytes: 0,
+            open_fds: Vec::new(),
+            net_sockets: 0,
+            diagnosis: Diagnosis {
+                reason,
+                summary: String::new(),
+                evidence: Vec::new(),
+                source: String::new(),
+                confidence: diagnosis::Confidence::High,
+                limitations: String::new(),
+                updated_at: Instant::now(),
+            },
+        };
+        let nodes = vec![
+            mk(10, 20, diagnosis::WaitReason::WaitingFileLock, 0.0),
+            mk(11, 20, diagnosis::WaitReason::ActiveCompute, 12.0),
+            mk(12, 99, diagnosis::WaitReason::NoObservedActivity, 0.0),
+        ];
+        let focus = select_focus_process(&nodes, Some(20)).unwrap();
+        assert_eq!(focus.pid, 10);
     }
 }

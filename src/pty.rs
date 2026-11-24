@@ -27,6 +27,19 @@ impl Pty {
         Ok(())
     }
 
+    /// Query the foreground process group's command name directly from the PTY
+    /// (`tcgetpgrp` + `/proc/<pgid>/comm`), independent of X-Ray.
+    pub fn foreground_comm(&self) -> Option<String> {
+        let pgid = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
+        if pgid <= 0 {
+            return None;
+        }
+        std::fs::read_to_string(format!("/proc/{pgid}/comm"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
     pub fn spawn() -> io::Result<Self> {
         Self::spawn_with_prompt(None, None, None)
     }

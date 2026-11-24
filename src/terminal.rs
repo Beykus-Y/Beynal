@@ -161,7 +161,7 @@ impl Screen {
     }
     pub fn latest_inline_display_row(&self) -> Option<usize> {
         let &(abs_row, _) = self.command_anchors.back()?;
-        let top_abs = self.history.len().saturating_sub(self.viewport_offset);
+        let top_abs = self.history_base + self.history.len().saturating_sub(self.viewport_offset);
         let rel = abs_row.checked_sub(top_abs)?;
         (rel < self.rows).then_some(rel)
     }
@@ -1172,7 +1172,7 @@ impl Perform for Screen {
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         if let [b"133", kind, ..] = params {
             if matches!(kind.first(), Some(b'A' | b'C')) {
-                let abs_row = self.history.len() + self.cursor_y;
+                let abs_row = self.history_base + self.history.len() + self.cursor_y;
                 let id = self.next_command_id;
                 self.next_command_id += 1;
                 if self.command_anchors.len() >= 256 {

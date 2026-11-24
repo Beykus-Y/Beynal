@@ -303,6 +303,7 @@ struct State {
     background: Option<crate::background::BackgroundEngine>,
     xray: Option<crate::xray::XRayEngine>,
     xray_hits: Vec<crate::widgets::ui::UiHitTarget>,
+    platform_dirty: bool,
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
@@ -1778,7 +1779,8 @@ impl State {
                 .background
                 .as_ref()
                 .is_some_and(|b| b.is_active(self.keyboard_focus, self.in_tui_mode()));
-            let force_full = self.damage_full || self.editor.is_some() || bg_active;
+            let force_full =
+                self.damage_full || self.editor.is_some() || bg_active || self.platform_dirty;
             self.damage_full = false;
             let mut damage = if let Some(terminal) = &self.terminal {
                 terminal_damage(
@@ -1794,9 +1796,12 @@ impl State {
             } else {
                 RowDamage::full()
             };
-            if damage.is_empty() {
+            if damage.is_empty() && !self.platform_dirty {
                 self.dirty = false;
                 return Ok(());
+            }
+            if self.platform_dirty {
+                damage = RowDamage::full();
             }
             let mut full = damage.full;
             if !full {
@@ -1852,10 +1857,11 @@ impl State {
         if let Some(surface) = &self.surface {
             self.map_surface_buffer(surface, sizes);
         }
-        if let (Some(_), Some(terminal), Some(renderer)) =
-            (&self.surface, &self.terminal, &mut self.renderer)
-        {
+        if let (Some(_), Some(_), Some(_)) = (&self.surface, &self.terminal, &mut self.renderer) {
             let dimensions = sizes.buffer_dimensions();
+            let insets = self.dock_insets_tuple(sizes.scale.factor());
+            let renderer = self.renderer.as_mut().unwrap();
+            let terminal = self.terminal.as_ref().unwrap();
             let mut scene = match &mut self.editor {
                 Some(editor) => {
                     let (columns, rows) = sizes.grid_size(renderer);
@@ -1868,7 +1874,7 @@ impl State {
                         sizes.scale.factor(),
                     )
                 }
-                None => renderer.build_terminal_scene(
+                None => renderer.build_terminal_scene_with_insets(
                     terminal.screen(),
                     dimensions,
                     &self.selection,
@@ -1876,6 +1882,7 @@ impl State {
                     self.blink_on,
                     sizes.scale.factor(),
                     None,
+                    insets,
                 ),
             };
             let in_tui = self.in_tui_mode();
@@ -1908,6 +1915,7 @@ impl State {
             self.frame_pending = true;
             frame.busy = true;
             self.dirty = false;
+            self.platform_dirty = false;
         }
         Ok(())
     }
@@ -1960,8 +1968,10 @@ impl State {
                     )
                 }
                 None => {
+                    let insets = self.dock_insets_tuple(scale);
+                    let renderer = self.renderer.as_mut().ok_or("renderer unavailable")?;
                     let terminal = self.terminal.as_ref().ok_or("terminal unavailable")?;
-                    renderer.build_terminal_scene(
+                    renderer.build_terminal_scene_with_insets(
                         terminal.screen(),
                         dimensions,
                         &self.selection,
@@ -1969,6 +1979,7 @@ impl State {
                         self.blink_on,
                         scale,
                         None,
+                        insets,
                     )
                 }
             };
@@ -1990,13 +2001,12 @@ impl State {
             let gl = self.gl.as_mut().ok_or("OpenGL backend unavailable")?;
             gl.draw(renderer, &scene, &rects, true)?;
         } else {
-            let renderer = self.renderer.as_mut().ok_or("renderer unavailable")?;
-            let gl = self.gl.as_mut().ok_or("OpenGL backend unavailable")?;
             for (rect, range) in rects.iter().zip(damage.ranges.iter()) {
                 if rect.h == 0 {
                     continue;
                 }
-                let scene = match &mut self.editor {
+                let renderer = self.renderer.as_mut().ok_or("renderer unavailable")?;
+                let mut scene = match &mut self.editor {
                     Some(editor) => {
                         let (columns, rows) = grid;
                         let view = editor.view(columns, rows);
@@ -2009,8 +2019,10 @@ impl State {
                         )
                     }
                     None => {
+                        let insets = self.dock_insets_tuple(scale);
+                        let renderer = self.renderer.as_mut().ok_or("renderer unavailable")?;
                         let terminal = self.terminal.as_ref().ok_or("terminal unavailable")?;
-                        renderer.build_terminal_scene(
+                        renderer.build_terminal_scene_with_insets(
                             terminal.screen(),
                             dimensions,
                             &self.selection,
@@ -2018,35 +2030,66 @@ impl State {
                             self.blink_on,
                             scale,
                             Some(*range),
+                            insets,
                         )
                     }
                 };
+                let in_tui = self.in_tui_mode();
+                let ptr = sizes.physical_point(self.pointer_position);
+                let theme = self
+                    .terminal
+                    .as_ref()
+                    .map_or_else(crate::theme::Theme::default, |t| t.screen().theme().clone());
+                self.emit_platform_layers(
+                    &mut scene,
+                    (dimensions.0 as f32, dimensions.1 as f32),
+                    scale,
+                    in_tui,
+                    (ptr.0 as f32, ptr.1 as f32),
+                    &theme,
+                );
+                let renderer = self.renderer.as_mut().ok_or("renderer unavailable")?;
+                let gl = self.gl.as_mut().ok_or("OpenGL backend unavailable")?;
                 gl.draw(renderer, &scene, &[*rect], false)?;
             }
         }
         if let Some(surface) = &self.surface {
             surface.frame(qh, ());
         }
+        self.platform_dirty = false;
         let gl = self.gl.as_mut().ok_or("OpenGL backend unavailable")?;
         gl.present(&rects, full)
     }
 
     fn in_tui_mode(&self) -> bool {
+        const TUI_NAMES: &[&str] = &[
+            "vim", "nvim", "vi", "nano", "htop", "btop", "top", "tmux", "screen", "less", "man",
+            "mc", "lazygit", "tig", "ranger", "yazi",
+        ];
         let Some(terminal) = &self.terminal else {
             return false;
         };
         let screen = terminal.screen();
+        let known_tui_foreground = self
+            .pty
+            .as_ref()
+            .and_then(Pty::foreground_comm)
+            .is_some_and(|comm| TUI_NAMES.contains(&comm.to_ascii_lowercase().as_str()));
         let signals = crate::widgets::layout::TuiSignals {
             alternate_screen: screen.is_alternate_screen(),
             mouse_reporting: screen.mouse_mode() != crate::mouse::Mode::Off,
             bracketed_paste: screen.bracketed_paste,
             full_scroll_margins: !screen.has_custom_scroll_margins(),
-            known_tui_foreground: self
-                .xray
-                .as_ref()
-                .is_some_and(|x| x.has_known_tui_foreground()),
+            known_tui_foreground,
         };
         signals.is_fullscreen_tui()
+    }
+
+    fn dock_insets_tuple(&self, scale: f32) -> (f32, f32, f32, f32) {
+        self.widgets.as_ref().map_or((0.0, 0.0, 0.0, 0.0), |w| {
+            let i = w.dock_insets(self.in_tui_mode(), scale);
+            (i.left, i.top, i.right, i.bottom)
+        })
     }
 
     fn effective_grid_size(
@@ -2100,6 +2143,10 @@ impl State {
 
     fn pump_platform(&mut self) {
         if let Some(widgets) = &self.widgets {
+            if widgets.take_dirty() {
+                self.platform_dirty = true;
+                self.dirty = true;
+            }
             for action in widgets.drain_actions() {
                 match action {
                     crate::widgets::runtime::HostAction::MediaPlayPause => {
@@ -2133,18 +2180,28 @@ impl State {
                         }
                     }
                     crate::widgets::runtime::HostAction::MediaEnqueue(_) => {}
-                    crate::widgets::runtime::HostAction::BackgroundSetPreset(name) => {
+                    crate::widgets::runtime::HostAction::BackgroundSetPreset { owner, preset } => {
                         if let (Some(bg), Some(preset)) = (
                             &mut self.background,
-                            crate::config::BackgroundPreset::parse(&name),
-                        ) {
-                            bg.set_preset(preset);
+                            crate::config::BackgroundPreset::parse(&preset),
+                        ) && bg.set_preset(Some(&owner), preset).is_ok()
+                        {
+                            self.platform_dirty = true;
+                            self.dirty = true;
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundReleaseScene { owner } => {
+                        if let Some(bg) = &mut self.background {
+                            bg.release_scene(&owner);
+                            self.platform_dirty = true;
                             self.dirty = true;
                         }
                     }
                     crate::widgets::runtime::HostAction::BackgroundClearScene { owner } => {
-                        if let Some(bg) = &mut self.background {
-                            bg.clear_scene(&owner);
+                        if let Some(bg) = &mut self.background
+                            && bg.clear_scene(&owner).is_ok()
+                        {
+                            self.platform_dirty = true;
                             self.dirty = true;
                         }
                     }
@@ -2202,14 +2259,14 @@ impl State {
                             self.dirty = true;
                         }
                     }
-                    crate::widgets::runtime::HostAction::BackgroundBind(binding) => {
+                    crate::widgets::runtime::HostAction::BackgroundBind { owner, binding } => {
                         if let Some(bg) = &mut self.background {
-                            bg.add_binding(binding);
+                            let _ = bg.add_binding(&owner, binding);
                         }
                     }
-                    crate::widgets::runtime::HostAction::BackgroundUnbind(id) => {
+                    crate::widgets::runtime::HostAction::BackgroundUnbind { owner, id } => {
                         if let Some(bg) = &mut self.background {
-                            bg.remove_binding(&id);
+                            let _ = bg.remove_binding(&owner, &id);
                         }
                     }
                     crate::widgets::runtime::HostAction::WidgetLog {
@@ -2299,6 +2356,13 @@ impl State {
                 .as_ref()
                 .and_then(|t| t.screen().latest_inline_display_row())
                 .map(|row| g.padding as f32 + row as f32 * g.cell_height as f32);
+            let cursor_row_px = self.terminal.as_ref().map(|t| {
+                (
+                    g.padding as f32
+                        + t.screen().cursor_display_row() as f32 * g.cell_height as f32,
+                    g.cell_height as f32,
+                )
+            });
             widgets.emit_to_scene(
                 win_size,
                 scale,
@@ -2306,6 +2370,7 @@ impl State {
                 in_tui,
                 pointer_px,
                 inline_y_px,
+                cursor_row_px,
                 theme,
                 renderer,
                 scene,

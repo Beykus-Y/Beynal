@@ -241,6 +241,35 @@ pub fn resolve_widget_rect(
     hovered: bool,
     inline_y_px: Option<f32>,
 ) -> ResolvedWidgetRect {
+    resolve_widget_rect_with_cursor(
+        cfg,
+        win_w,
+        win_h,
+        scale,
+        cell_w,
+        cell_h,
+        in_tui,
+        hovered,
+        inline_y_px,
+        None,
+    )
+}
+
+/// Resolve a widget's physical-pixel rectangle inside `(win_w, win_h)`, with
+/// optional `(cursor_y_px, row_height)` avoidance for `Float` mode.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_widget_rect_with_cursor(
+    cfg: &WidgetPlacementConfig,
+    win_w: f32,
+    win_h: f32,
+    scale: f32,
+    cell_w: f32,
+    cell_h: f32,
+    in_tui: bool,
+    hovered: bool,
+    inline_y_px: Option<f32>,
+    cursor_row_px: Option<(f32, f32)>,
+) -> ResolvedWidgetRect {
     let effective_mode =
         resolve_effective_mode(cfg.mode, cfg.tui_behavior, in_tui, inline_y_px.is_some());
     if effective_mode == PlacementMode::Hidden {
@@ -282,6 +311,22 @@ pub fn resolve_widget_rect(
     if cfg.snap_to_grid && cell_w > 0.0 && cell_h > 0.0 {
         x = (x / cell_w).round() * cell_w;
         y = (y / cell_h).round() * cell_h;
+    }
+
+    if effective_mode == PlacementMode::Float
+        && let Some((cy, ch)) = cursor_row_px
+        && y < cy + ch
+        && y + h > cy
+    {
+        // Shift Float widget cleanly above or below the active cursor row
+        // without altering PTY/VT coordinates.
+        let above = cy - h - margin;
+        let below = cy + ch + margin;
+        if above >= 0.0 {
+            y = above;
+        } else if below + h <= win_h {
+            y = below;
+        }
     }
 
     x = x.clamp(0.0, (win_w - w).max(0.0));
@@ -516,5 +561,33 @@ mod tests {
         assert_eq!(cfg.x, 0.0);
         assert_eq!(cfg.y, 0.0);
         ed.end_drag();
+    }
+
+    #[test]
+    fn float_avoids_overlapping_active_cursor_row() {
+        let cfg = WidgetPlacementConfig {
+            mode: PlacementMode::Float,
+            anchor: Anchor::TopLeft,
+            x: 10.0,
+            y: 100.0,
+            width: 200.0,
+            height: 40.0,
+            margin: 8.0,
+            ..Default::default()
+        };
+        let resolved = resolve_widget_rect_with_cursor(
+            &cfg,
+            800.0,
+            600.0,
+            1.0,
+            10.0,
+            18.0,
+            false,
+            false,
+            None,
+            Some((110.0, 18.0)),
+        );
+        // Must shift so it does not overlap [110.0, 128.0)
+        assert!(resolved.y + resolved.h <= 110.0 || resolved.y >= 128.0);
     }
 }
