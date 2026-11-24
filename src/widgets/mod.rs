@@ -51,6 +51,7 @@ pub struct WidgetManager {
     pub editor: VisualLayoutEditor,
     pub hit_targets: Vec<UiHitTarget>,
     pub resolved_rects: BTreeMap<String, ResolvedWidgetRect>,
+    unloaded_extensions: Vec<String>,
     runtime: Option<WidgetRuntime>,
 }
 
@@ -64,6 +65,7 @@ impl WidgetManager {
             editor: VisualLayoutEditor::new(),
             hit_targets: Vec::new(),
             resolved_rects: BTreeMap::new(),
+            unloaded_extensions: Vec::new(),
             runtime: None,
         }
     }
@@ -140,21 +142,30 @@ impl WidgetManager {
 
     pub fn unload_extension(&mut self, id: &str) {
         self.extensions.remove(id);
+        self.granted_permissions.remove(id);
+        self.unloaded_extensions.push(id.to_string());
         if let Some(vm) = &self.runtime {
             vm.send(VmCommand::UnloadExtension { id: id.to_string() });
         }
     }
 
     pub fn reload_extension(&mut self, id: &str) {
+        self.unloaded_extensions.push(id.to_string());
         if let Some(vm) = &self.runtime {
             vm.send(VmCommand::ReloadExtension { id: id.to_string() });
         }
     }
 
-    pub fn drain_actions(&self) -> Vec<HostAction> {
-        self.runtime
-            .as_ref()
-            .map_or_else(Vec::new, WidgetRuntime::drain_actions)
+    pub fn drain_actions(&mut self) -> Vec<HostAction> {
+        let mut actions: Vec<HostAction> = self
+            .unloaded_extensions
+            .drain(..)
+            .map(|owner| HostAction::BackgroundReleaseScene { owner })
+            .collect();
+        if let Some(vm) = &self.runtime {
+            actions.extend(vm.drain_actions());
+        }
+        actions
     }
 
     pub fn take_dirty(&self) -> bool {

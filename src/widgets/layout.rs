@@ -19,6 +19,8 @@ pub enum PlacementMode {
     /// Drawn on top of terminal contents without resizing PTY.
     #[default]
     Overlay,
+    /// Overlay that shifts above/below the active cursor row to avoid obscuring input.
+    SmartOverlay,
     /// Drawn behind terminal contents (visible through transparent/unpainted background).
     Behind,
     /// Reserves a dedicated strip on an edge of the window, shrinking the terminal viewport.
@@ -313,12 +315,12 @@ pub fn resolve_widget_rect_with_cursor(
         y = (y / cell_h).round() * cell_h;
     }
 
-    if effective_mode == PlacementMode::Float
+    if effective_mode == PlacementMode::SmartOverlay
         && let Some((cy, ch)) = cursor_row_px
         && y < cy + ch
         && y + h > cy
     {
-        // Shift Float widget cleanly above or below the active cursor row
+        // SmartOverlay: shift vertically above or below the active cursor row
         // without altering PTY/VT coordinates.
         let above = cy - h - margin;
         let below = cy + ch + margin;
@@ -564,9 +566,9 @@ mod tests {
     }
 
     #[test]
-    fn float_avoids_overlapping_active_cursor_row() {
+    fn smart_overlay_avoids_overlapping_active_cursor_row() {
         let cfg = WidgetPlacementConfig {
-            mode: PlacementMode::Float,
+            mode: PlacementMode::SmartOverlay,
             anchor: Anchor::TopLeft,
             x: 10.0,
             y: 100.0,

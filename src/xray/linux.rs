@@ -395,22 +395,11 @@ pub fn execute_process_action(
         ));
     }
 
-    if let ProcessAction::Renice(prio) = action {
-        // Note: Linux setpriority(2) has no pidfd variant. We hold pidfd_open above
-        // and verify starttime both before and immediately after setpriority.
-        let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, prio) };
-        let after = read_proc_stat(pid);
-        if after
-            .as_ref()
-            .is_none_or(|s| s.starttime != expected_starttime)
-        {
-            return Err("process exited or PID reused during renice".to_string());
-        }
-        return if rc == 0 {
-            Ok(())
-        } else {
-            Err(format!("setpriority: {}", std::io::Error::last_os_error()))
-        };
+    if let ProcessAction::Renice(_) = action {
+        return Err(
+            "renice is disabled: Linux setpriority(2) lacks an atomic pidfd syscall and cannot guarantee PID-reuse safety"
+                .to_string(),
+        );
     }
 
     let sig = match action {

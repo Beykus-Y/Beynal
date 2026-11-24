@@ -75,7 +75,10 @@ pub enum HostAction {
         color: Option<[f32; 3]>,
         intensity: Option<f32>,
     },
-    BackgroundSetCharset(String),
+    BackgroundSetCharset {
+        owner: String,
+        charset: String,
+    },
     BackgroundBind {
         owner: String,
         binding: crate::background::bindings::DataBinding,
@@ -650,7 +653,10 @@ fn handle_host_call(
         }
         "background.setCharset" if perms.has(Capability::BackgroundControl) => {
             s.pending_actions
-                .push_back(HostAction::BackgroundSetCharset(arg.to_string()));
+                .push_back(HostAction::BackgroundSetCharset {
+                    owner: ext_id.to_string(),
+                    charset: arg.to_string(),
+                });
         }
         "background.bind" if perms.has(Capability::BackgroundControl) => {
             if let Ok(b) = serde_json::from_str::<crate::background::bindings::DataBinding>(arg) {

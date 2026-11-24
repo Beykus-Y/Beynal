@@ -20,10 +20,7 @@ use crate::config::{BackgroundConfig, BackgroundPreset, BackgroundTuiBehavior};
 use crate::render::{Renderer, Scene, SceneGlyph};
 use crate::theme::Theme;
 
-use bindings::{
-    BindingInputs, BindingTarget, DataBinding, DataSource, evaluate_bindings,
-    evaluate_bindings_for_object,
-};
+use bindings::{BindingInputs, BindingTarget, DataBinding, DataSource, FrameBindingCache};
 use glam::Vec3;
 use presets::build_preset_scene;
 use scene3d::{
@@ -261,6 +258,16 @@ impl BackgroundEngine {
         }
     }
 
+    pub fn set_charset(&mut self, owner: &str, charset: String) -> Result<(), String> {
+        if let Some(existing) = &self.scene_owner
+            && existing != owner
+        {
+            return Err("background scene is owned by another extension".to_string());
+        }
+        self.config.charset = charset;
+        Ok(())
+    }
+
     pub fn add_binding(&mut self, owner: &str, mut binding: DataBinding) -> Result<(), String> {
         if let Some(existing) = self.bindings.iter().find(|b| b.id == binding.id)
             && !existing.owner.is_empty()
@@ -333,7 +340,8 @@ impl BackgroundEngine {
         self.rasterizer.resize(cols, rows);
 
         let elapsed = self.start_time.elapsed().as_secs_f32() * self.config.speed;
-        let mods = evaluate_bindings(&mut self.bindings, inputs);
+        let cache = FrameBindingCache::evaluate_frame(&mut self.bindings, inputs);
+        let mods = cache.global;
         let accent = [
             theme.cursor[0] as f32 / 255.0,
             theme.cursor[1] as f32 / 255.0,
@@ -342,7 +350,7 @@ impl BackgroundEngine {
         let mut s3d = if let Some(custom) = &self.custom_scene {
             let mut s = custom.clone();
             for obj in &mut s.objects {
-                let obj_mods = evaluate_bindings_for_object(&mut self.bindings, inputs, &obj.id);
+                let obj_mods = cache.for_object(&obj.id);
                 obj.scale *= obj_mods.scale;
                 obj.rotation.y += elapsed * 0.4 * obj_mods.rotation_speed;
             }
@@ -542,6 +550,9 @@ mod tests {
         b.object_id = Some("my-cube".into());
         engine.add_binding("ext.a", b).unwrap();
         assert!(engine.remove_binding("ext.b", "cube-scale").is_err());
+        assert!(engine.set_charset("ext.b", ".:*#".into()).is_err());
+        assert!(engine.set_charset("ext.a", ".:*#".into()).is_ok());
+
         let mut scene = Scene::default();
         engine.render_to_scene(
             (800.0, 600.0),
@@ -549,11 +560,20 @@ mod tests {
             true,
             false,
             (0.5, 0.5),
-            &BindingInputs::default(),
+            &BindingInputs {
+                audio_bass: 1.0,
+                ..Default::default()
+            },
             &theme,
             &mut renderer,
             &mut scene,
         );
         assert!(!scene.behind_glyphs.is_empty());
+
+        // Releasing scene (e.g. on extension unload) frees custom_scene & bindings
+        engine.release_scene("ext.a");
+        assert!(engine.custom_scene.is_none());
+        assert!(engine.scene_owner.is_none());
+        assert!(engine.bindings.is_empty());
     }
 }

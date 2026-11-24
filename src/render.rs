@@ -99,6 +99,10 @@ pub struct Geometry {
     pub cell_height: usize,
     pub padding: usize,
     pub baseline: usize,
+    pub inset_left: usize,
+    pub inset_top: usize,
+    pub inset_right: usize,
+    pub inset_bottom: usize,
 }
 impl Geometry {
     /// The primary face defines the grid. Fallback faces use those same cells.
@@ -128,7 +132,27 @@ impl Geometry {
             cell_height: (ascent + descent + gap).max(1),
             baseline: ascent + gap / 2,
             padding: 0,
+            inset_left: 0,
+            inset_top: 0,
+            inset_right: 0,
+            inset_bottom: 0,
         }
+    }
+
+    pub fn with_insets(mut self, left: f32, top: f32, right: f32, bottom: f32) -> Self {
+        self.inset_left = left.max(0.0).round() as usize;
+        self.inset_top = top.max(0.0).round() as usize;
+        self.inset_right = right.max(0.0).round() as usize;
+        self.inset_bottom = bottom.max(0.0).round() as usize;
+        self
+    }
+
+    pub fn origin_x(self) -> usize {
+        self.padding + self.inset_left
+    }
+
+    pub fn origin_y(self) -> usize {
+        self.padding + self.inset_top
     }
 
     pub fn for_window(mut self, width: usize, height: usize) -> Self {
@@ -139,10 +163,11 @@ impl Geometry {
         self
     }
     pub fn cell_at(self, x: f64, y: f64) -> (usize, usize) {
-        let pad = self.padding as f64;
+        let ox = self.origin_x() as f64;
+        let oy = self.origin_y() as f64;
         (
-            ((x - pad) / self.cell_width as f64).floor() as usize,
-            ((y - pad) / self.cell_height as f64).floor() as usize,
+            ((x - ox) / self.cell_width as f64).floor() as usize,
+            ((y - oy) / self.cell_height as f64).floor() as usize,
         )
     }
 
@@ -150,12 +175,12 @@ impl Geometry {
         let padding = self.for_window(width, height).padding;
         (
             width
-                .saturating_sub(2 * padding)
+                .saturating_sub(2 * padding + self.inset_left + self.inset_right)
                 .checked_div(self.cell_width)
                 .unwrap_or(0)
                 .clamp(1, u16::MAX as usize),
             height
-                .saturating_sub(2 * padding)
+                .saturating_sub(2 * padding + self.inset_top + self.inset_bottom)
                 .checked_div(self.cell_height)
                 .unwrap_or(0)
                 .clamp(1, u16::MAX as usize),
@@ -389,17 +414,20 @@ impl Renderer {
         rows: Option<(usize, usize)>,
         insets: (f32, f32, f32, f32),
     ) -> Scene {
-        let base = self.geometry(scale).for_window(width, height);
+        let base = self
+            .geometry(scale)
+            .for_window(width, height)
+            .with_insets(insets.0, insets.1, insets.2, insets.3);
         let (width, height) = (width as f32, height as f32);
         let cell_w = base.cell_width as f32;
         let cell_h = base.cell_height as f32;
         let padding = base.padding as f32;
         let baseline = base.baseline as f32;
         let px_size = self.font_px(scale);
-        let inner_left = padding + insets.0;
-        let inner_right = (width - padding - insets.2).max(inner_left);
-        let inner_top = padding + insets.1;
-        let inner_bottom = (height - padding - insets.3).max(inner_top);
+        let inner_left = base.origin_x() as f32;
+        let inner_right = (width - padding - base.inset_right as f32).max(inner_left);
+        let inner_top = base.origin_y() as f32;
+        let inner_bottom = (height - padding - base.inset_bottom as f32).max(inner_top);
 
         let background = rgba(self.theme.background);
         let cursor_color = rgba(self.theme.cursor);
@@ -1439,5 +1467,39 @@ mod tests {
         }
         assert!(view.status.contains("demo.txt"));
         assert_eq!(view.rows[0].text, "!hello");
+    }
+
+    #[test]
+    fn dock_insets_shift_origin_grid_size_selection_and_scene_identically() {
+        let mut renderer = Renderer::new().unwrap();
+        let g = renderer.geometry(1.0).for_window(800, 600);
+        let g_dock = g.with_insets(40.0, 30.0, 0.0, 0.0);
+        assert_eq!(g_dock.origin_x(), g.padding + 40);
+        assert_eq!(g_dock.origin_y(), g.padding + 30);
+
+        let term = Terminal::new(40, 20);
+        let pos = crate::selection::position(
+            g_dock,
+            (g_dock.origin_x() + 2) as f64,
+            (g_dock.origin_y() + 2) as f64,
+            term.screen(),
+        );
+        assert_eq!((pos.col, pos.row), (0, 0));
+
+        let mut t2 = Terminal::new(40, 20);
+        t2.process(b"A");
+        let scene = renderer.build_terminal_scene_with_insets(
+            t2.screen(),
+            (800, 600),
+            &crate::selection::Selection::default(),
+            true,
+            true,
+            1.0,
+            None,
+            (40.0, 30.0, 0.0, 0.0),
+        );
+        assert!(!scene.glyphs.is_empty());
+        assert!(scene.glyphs[0].x >= g_dock.origin_x());
+        assert!(scene.glyphs[0].y >= g_dock.origin_y());
     }
 }

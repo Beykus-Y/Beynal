@@ -160,54 +160,57 @@ impl Default for EvaluatedModifiers {
     }
 }
 
+/// Pre-evaluated per-frame binding cache so every binding's EMA smoothing is
+/// stepped **exactly once per frame** regardless of how many objects are in the scene.
+#[derive(Clone, Debug)]
+pub struct FrameBindingCache {
+    pub global: EvaluatedModifiers,
+    pub per_object: std::collections::HashMap<String, EvaluatedModifiers>,
+}
+
+impl FrameBindingCache {
+    pub fn evaluate_frame(bindings: &mut [DataBinding], inputs: &BindingInputs) -> Self {
+        let mut global = EvaluatedModifiers::default();
+        let mut per_object: std::collections::HashMap<String, EvaluatedModifiers> =
+            std::collections::HashMap::new();
+        for b in bindings {
+            let v = b.evaluate(inputs);
+            let mods = if let Some(oid) = &b.object_id {
+                per_object.entry(oid.clone()).or_default()
+            } else {
+                &mut global
+            };
+            let slot = match b.target {
+                BindingTarget::ObjectScale => &mut mods.scale,
+                BindingTarget::RotationSpeed => &mut mods.rotation_speed,
+                BindingTarget::LightIntensity => &mut mods.light_intensity,
+                BindingTarget::ParticleImpulse => &mut mods.particle_impulse,
+                BindingTarget::Brightness => &mut mods.brightness,
+                BindingTarget::WaveAmplitude => &mut mods.wave_amplitude,
+            };
+            *slot = match b.combine {
+                CombineMode::Replace => v,
+                CombineMode::Add => *slot + v,
+                CombineMode::Multiply => *slot * v,
+                CombineMode::Max => slot.max(v),
+            };
+        }
+        Self { global, per_object }
+    }
+
+    pub fn for_object(&self, object_id: &str) -> EvaluatedModifiers {
+        self.per_object
+            .get(object_id)
+            .copied()
+            .unwrap_or(self.global)
+    }
+}
+
 pub fn evaluate_bindings(
     bindings: &mut [DataBinding],
     inputs: &BindingInputs,
 ) -> EvaluatedModifiers {
-    evaluate_bindings_filtered(bindings, inputs, None)
-}
-
-pub fn evaluate_bindings_for_object(
-    bindings: &mut [DataBinding],
-    inputs: &BindingInputs,
-    object_id: &str,
-) -> EvaluatedModifiers {
-    evaluate_bindings_filtered(bindings, inputs, Some(object_id))
-}
-
-fn evaluate_bindings_filtered(
-    bindings: &mut [DataBinding],
-    inputs: &BindingInputs,
-    object_id: Option<&str>,
-) -> EvaluatedModifiers {
-    let mut mods = EvaluatedModifiers::default();
-    for b in bindings {
-        let applies = match (object_id, b.object_id.as_deref()) {
-            (Some(oid), Some(target_oid)) => oid == target_oid,
-            (Some(_), None) => true,
-            (None, None) => true,
-            (None, Some(_)) => false,
-        };
-        if !applies {
-            continue;
-        }
-        let v = b.evaluate(inputs);
-        let slot = match b.target {
-            BindingTarget::ObjectScale => &mut mods.scale,
-            BindingTarget::RotationSpeed => &mut mods.rotation_speed,
-            BindingTarget::LightIntensity => &mut mods.light_intensity,
-            BindingTarget::ParticleImpulse => &mut mods.particle_impulse,
-            BindingTarget::Brightness => &mut mods.brightness,
-            BindingTarget::WaveAmplitude => &mut mods.wave_amplitude,
-        };
-        *slot = match b.combine {
-            CombineMode::Replace => v,
-            CombineMode::Add => *slot + v,
-            CombineMode::Multiply => *slot * v,
-            CombineMode::Max => slot.max(v),
-        };
-    }
-    mods
+    FrameBindingCache::evaluate_frame(bindings, inputs).global
 }
 
 #[cfg(test)]

@@ -1777,4 +1777,19 @@ mod tests {
 
         assert!(terminal.screen().line(0).starts_with("Привет"));
     }
+
+    #[test]
+    fn inline_osc133_anchor_survives_scrollback_eviction() {
+        let mut term = Terminal::new(40, 5);
+        term.process(b"\x1b]133;A\x07prompt> ");
+        assert_eq!(term.screen().latest_inline_display_row(), Some(0));
+        for i in 0..20 {
+            term.process(format!("\r\nline {i}").as_bytes());
+        }
+        // Anchor scrolled into history above the viewport
+        assert_eq!(term.screen().latest_inline_display_row(), None);
+        // Fresh OSC 133;A on the current bottom row
+        term.process(b"\x1b]133;A\x07prompt2> ");
+        assert_eq!(term.screen().latest_inline_display_row(), Some(4));
+    }
 }

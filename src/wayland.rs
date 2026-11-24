@@ -801,9 +801,9 @@ fn row_pixel_rect(
     physical: (i32, i32),
     range: (usize, usize),
 ) -> PixelRect {
-    let edge = |row| (geometry.padding + row * geometry.cell_height) as i32;
+    let edge = |row| (geometry.origin_y() + row * geometry.cell_height) as i32;
     let top = edge(range.0);
-    let bottom = edge(range.1).min(physical.1 - geometry.padding as i32);
+    let bottom = edge(range.1).min(physical.1 - (geometry.padding + geometry.inset_bottom) as i32);
     PixelRect {
         x: 0,
         y: top.max(0),
@@ -947,7 +947,13 @@ impl State {
 
     fn pointer_geometry(&self) -> Option<render::Geometry> {
         let renderer = self.renderer.as_ref()?;
-        Some(self.surface_sizes().geometry(renderer))
+        let sizes = self.surface_sizes();
+        let insets = self.dock_insets_tuple(sizes.scale.factor());
+        Some(
+            sizes
+                .geometry(renderer)
+                .with_insets(insets.0, insets.1, insets.2, insets.3),
+        )
     }
 
     fn map_surface_buffer(&self, surface: &wl_surface::WlSurface, sizes: SurfaceSizes) {
@@ -1930,9 +1936,12 @@ impl State {
         let dimensions = sizes.buffer_dimensions();
         let scale = sizes.scale.factor();
         let physical = sizes.physical;
+        let insets = self.dock_insets_tuple(scale);
         let renderer = self.renderer.as_ref().ok_or("renderer unavailable")?;
-        let geometry = sizes.geometry(renderer);
-        let grid = sizes.grid_size(renderer);
+        let geometry = sizes
+            .geometry(renderer)
+            .with_insets(insets.0, insets.1, insets.2, insets.3);
+        let grid = geometry.grid_size(dimensions.0, dimensions.1);
         let rects: Vec<PixelRect> = if full {
             vec![PixelRect {
                 x: 0,
@@ -2098,17 +2107,11 @@ impl State {
         renderer: &render::Renderer,
     ) -> (usize, usize) {
         let (w, h) = sizes.buffer_dimensions();
-        let insets = self
-            .widgets
-            .as_ref()
-            .map_or_else(crate::widgets::layout::ViewportInsets::default, |widgets| {
-                widgets.dock_insets(self.in_tui_mode(), sizes.scale.factor())
-            });
-        let eff_w = (w as f32 - insets.left - insets.right).max(1.0) as usize;
-        let eff_h = (h as f32 - insets.top - insets.bottom).max(1.0) as usize;
-        renderer
-            .geometry(sizes.scale.factor())
-            .grid_size(eff_w, eff_h)
+        let insets = self.dock_insets_tuple(sizes.scale.factor());
+        sizes
+            .geometry(renderer)
+            .with_insets(insets.0, insets.1, insets.2, insets.3)
+            .grid_size(w, h)
     }
 
     fn init_platform_subsystems(&mut self, child_pid: libc::pid_t, pty_master_fd: i32) {
@@ -2142,7 +2145,7 @@ impl State {
     }
 
     fn pump_platform(&mut self) {
-        if let Some(widgets) = &self.widgets {
+        if let Some(widgets) = &mut self.widgets {
             if widgets.take_dirty() {
                 self.platform_dirty = true;
                 self.dirty = true;
@@ -2253,9 +2256,14 @@ impl State {
                             self.dirty = true;
                         }
                     }
-                    crate::widgets::runtime::HostAction::BackgroundSetCharset(charset) => {
-                        if let Some(bg) = &mut self.background {
-                            bg.config.charset = charset;
+                    crate::widgets::runtime::HostAction::BackgroundSetCharset {
+                        owner,
+                        charset,
+                    } => {
+                        if let Some(bg) = &mut self.background
+                            && bg.set_charset(&owner, charset).is_ok()
+                        {
+                            self.platform_dirty = true;
                             self.dirty = true;
                         }
                     }
@@ -2298,6 +2306,12 @@ impl State {
                 self.dirty = true;
             }
         }
+        if let Some(xray) = &self.xray
+            && xray.take_dirty()
+        {
+            self.platform_dirty = true;
+            self.dirty = true;
+        }
         if let Some(bg) = &self.background
             && bg.is_active(self.keyboard_focus, in_tui)
             && bg.should_step()
@@ -2315,6 +2329,7 @@ impl State {
         pointer_px: (f32, f32),
         theme: &crate::theme::Theme,
     ) {
+        let insets = self.dock_insets_tuple(scale);
         let Some(renderer) = &mut self.renderer else {
             return;
         };
@@ -2350,15 +2365,17 @@ impl State {
             );
         }
         if let Some(widgets) = &mut self.widgets {
-            let g = renderer.geometry(scale);
+            let g = renderer
+                .geometry(scale)
+                .with_insets(insets.0, insets.1, insets.2, insets.3);
             let inline_y_px = self
                 .terminal
                 .as_ref()
                 .and_then(|t| t.screen().latest_inline_display_row())
-                .map(|row| g.padding as f32 + row as f32 * g.cell_height as f32);
+                .map(|row| g.origin_y() as f32 + row as f32 * g.cell_height as f32);
             let cursor_row_px = self.terminal.as_ref().map(|t| {
                 (
-                    g.padding as f32
+                    g.origin_y() as f32
                         + t.screen().cursor_display_row() as f32 * g.cell_height as f32,
                     g.cell_height as f32,
                 )

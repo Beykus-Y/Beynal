@@ -71,10 +71,52 @@ pub struct ProcessNode {
 pub struct XRaySnapshot {
     pub level: XRayLevel,
     pub capabilities: XRayCapabilities,
+    pub fg_pgid: Option<i32>,
     pub nodes: Vec<ProcessNode>,
     pub total_cpu_percent: f32,
     pub total_rss_bytes: u64,
     pub reports: Vec<CommandReport>,
+}
+
+/// Per-`(pid, starttime)` I/O delta accumulator.
+///
+/// Linux `/proc/[pid]/io` counters are strictly per-process (not inherited on
+/// `fork()` and not rolled up into the parent on `wait()`). Accumulating deltas
+/// per `(pid, starttime)` preserves I/O from exited child processes without
+/// double-counting.
+#[derive(Default)]
+pub struct IoAccumulator {
+    seen: std::collections::HashMap<(i32, u64), (u64, u64, u64, u64)>,
+    pub totals: (u64, u64, u64, u64),
+}
+
+impl IoAccumulator {
+    pub fn reset(&mut self) {
+        self.seen.clear();
+        self.totals = (0, 0, 0, 0);
+    }
+
+    pub fn update(&mut self, nodes: &[&ProcessNode]) {
+        for n in nodes {
+            let cur = (
+                n.read_bytes,
+                n.write_bytes,
+                n.logical_read_bytes,
+                n.logical_write_bytes,
+            );
+            if let Some(prev) = self.seen.insert((n.pid, n.starttime), cur) {
+                self.totals.0 += cur.0.saturating_sub(prev.0);
+                self.totals.1 += cur.1.saturating_sub(prev.1);
+                self.totals.2 += cur.2.saturating_sub(prev.2);
+                self.totals.3 += cur.3.saturating_sub(prev.3);
+            } else {
+                self.totals.0 += cur.0;
+                self.totals.1 += cur.1;
+                self.totals.2 += cur.2;
+                self.totals.3 += cur.3;
+            }
+        }
+    }
 }
 
 pub struct XRayEngine {
@@ -83,6 +125,7 @@ pub struct XRayEngine {
     snapshot: Arc<Mutex<XRaySnapshot>>,
     last_output_at: Arc<Mutex<Instant>>,
     level: Arc<Mutex<XRayLevel>>,
+    dirty: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -98,6 +141,7 @@ impl XRayEngine {
         let snapshot = Arc::new(Mutex::new(XRaySnapshot {
             level: config.level,
             capabilities: caps,
+            fg_pgid: None,
             nodes: Vec::new(),
             total_cpu_percent: 0.0,
             total_rss_bytes: 0,
@@ -109,9 +153,14 @@ impl XRayEngine {
             snapshot,
             last_output_at: Arc::new(Mutex::new(Instant::now())),
             level,
+            dirty: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(AtomicBool::new(false)),
             worker: None,
         }
+    }
+
+    pub fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, Ordering::Relaxed)
     }
 
     pub fn notify_terminal_output(&self) {
@@ -125,11 +174,13 @@ impl XRayEngine {
 
     pub fn toggle_panel(&mut self) {
         self.panel_open = !self.panel_open;
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     pub fn set_level(&mut self, level: XRayLevel) {
         self.config.level = level;
         *self.level.lock().unwrap_or_else(|e| e.into_inner()) = level;
+        self.dirty.store(true, Ordering::Relaxed);
     }
 
     pub fn ensure_started(&mut self, root_pid: i32, pty_master_fd: Option<i32>, bus: EventBus) {
@@ -139,6 +190,7 @@ impl XRayEngine {
         let snapshot = Arc::clone(&self.snapshot);
         let last_out = Arc::clone(&self.last_output_at);
         let level_shared = Arc::clone(&self.level);
+        let dirty_flag = Arc::clone(&self.dirty);
         let shutdown = Arc::clone(&self.shutdown);
         let interval = Duration::from_millis(self.config.poll_interval_ms.max(50));
         let history_limit = self.config.history_limit;
@@ -159,9 +211,7 @@ impl XRayEngine {
                 let mut cmd_name = String::new();
                 let mut peak_rss = 0u64;
                 let mut peak_procs = 0usize;
-                let mut cmd_pid_io: std::collections::HashMap<(i32, u64), (u64, u64, u64, u64)> =
-                    std::collections::HashMap::new();
-                let mut cmd_io_totals = (0u64, 0u64, 0u64, 0u64);
+                let mut io_acc = IoAccumulator::default();
                 let mut wait_events: Vec<String> = Vec::new();
                 let mut cmd_seq = 1u64;
 
@@ -183,8 +233,6 @@ impl XRayEngine {
                     let total_cpu: f32 = nodes.iter().map(|n| n.cpu_percent).sum();
                     let total_rss: u64 = nodes.iter().map(|n| n.rss_bytes).sum();
 
-                    // Track foreground job lifecycle for post-command reports (scoped to fg PGID,
-                    // accumulating I/O deltas per (pid, starttime) so exited children are not lost).
                     if let Some(fg) = fg_pgid {
                         let cmd_nodes: Vec<&ProcessNode> =
                             nodes.iter().filter(|n| n.pgid == fg).collect();
@@ -205,12 +253,11 @@ impl XRayEngine {
                                     duration_ms: cmd_started.elapsed().as_millis() as u64,
                                     peak_rss_bytes: peak_rss,
                                     peak_process_count: peak_procs,
-                                    physical_read_bytes: cmd_io_totals.0,
-                                    physical_write_bytes: cmd_io_totals.1,
-                                    logical_read_bytes: cmd_io_totals.2,
-                                    logical_write_bytes: cmd_io_totals.3,
+                                    physical_read_bytes: io_acc.totals.0,
+                                    physical_write_bytes: io_acc.totals.1,
+                                    logical_read_bytes: io_acc.totals.2,
+                                    logical_write_bytes: io_acc.totals.3,
                                     wait_events: std::mem::take(&mut wait_events),
-                                    // Syscall/eBPF tracing is not active; report honestly.
                                     trace_active: false,
                                 });
                                 cmd_seq += 1;
@@ -220,19 +267,8 @@ impl XRayEngine {
                             cmd_wall = SystemTime::now();
                             peak_rss = cmd_rss;
                             peak_procs = cmd_procs;
-                            cmd_pid_io.clear();
-                            for n in &cmd_nodes {
-                                cmd_pid_io.insert(
-                                    (n.pid, n.starttime),
-                                    (
-                                        n.read_bytes,
-                                        n.write_bytes,
-                                        n.logical_read_bytes,
-                                        n.logical_write_bytes,
-                                    ),
-                                );
-                            }
-                            cmd_io_totals = (0, 0, 0, 0);
+                            io_acc.reset();
+                            io_acc.update(&cmd_nodes);
                             wait_events.clear();
                             cmd_name = cmd_nodes
                                 .first()
@@ -241,24 +277,8 @@ impl XRayEngine {
                         } else {
                             peak_rss = peak_rss.max(cmd_rss);
                             peak_procs = peak_procs.max(cmd_procs);
+                            io_acc.update(&cmd_nodes);
                             for n in &cmd_nodes {
-                                let cur = (
-                                    n.read_bytes,
-                                    n.write_bytes,
-                                    n.logical_read_bytes,
-                                    n.logical_write_bytes,
-                                );
-                                if let Some(prev) = cmd_pid_io.insert((n.pid, n.starttime), cur) {
-                                    cmd_io_totals.0 += cur.0.saturating_sub(prev.0);
-                                    cmd_io_totals.1 += cur.1.saturating_sub(prev.1);
-                                    cmd_io_totals.2 += cur.2.saturating_sub(prev.2);
-                                    cmd_io_totals.3 += cur.3.saturating_sub(prev.3);
-                                } else {
-                                    cmd_io_totals.0 += cur.0;
-                                    cmd_io_totals.1 += cur.1;
-                                    cmd_io_totals.2 += cur.2;
-                                    cmd_io_totals.3 += cur.3;
-                                }
                                 if !matches!(
                                     n.diagnosis.reason,
                                     diagnosis::WaitReason::ActiveCompute
@@ -287,11 +307,13 @@ impl XRayEngine {
                     {
                         let mut snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
                         snap.level = lvl;
+                        snap.fg_pgid = fg_pgid;
                         snap.nodes = nodes;
                         snap.total_cpu_percent = total_cpu;
                         snap.total_rss_bytes = total_rss;
                         snap.reports = reports.list();
                     }
+                    dirty_flag.store(true, Ordering::Relaxed);
 
                     std::thread::sleep(interval);
                 }
@@ -334,7 +356,7 @@ impl XRayEngine {
         let snap = self.snapshot();
 
         if self.config.compact_indicator {
-            let focus = select_focus_process(&snap.nodes, None);
+            let focus = select_focus_process(&snap.nodes, snap.fg_pgid);
             let status_text = if let Some(last) = focus {
                 format!(
                     "X-Ray [{}] {} · {:.1}% CPU · {} MB · {}",
@@ -637,5 +659,70 @@ mod tests {
         ];
         let focus = select_focus_process(&nodes, Some(20)).unwrap();
         assert_eq!(focus.pid, 10);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io_accumulator_preserves_exited_child_io_and_renice_is_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_file = dir.path().join("io_test.bin");
+        // Parent bash spawns a child `dd` that writes 1 MiB and exits while parent stays alive.
+        let script = format!(
+            "dd if=/dev/zero of={} bs=65536 count=16 conv=fdatasync 2>/dev/null; sleep 2",
+            out_file.display()
+        );
+        let mut parent = Command::new("bash")
+            .args(["-c", &script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bash");
+        let root_pid = parent.id() as i32;
+
+        let mut sampler = linux::LinuxSampler::new();
+        let mut acc = IoAccumulator::default();
+        for _ in 0..12 {
+            let tree = sampler.collect_tree(root_pid, None, false, 1.0);
+            let refs: Vec<&ProcessNode> = tree.iter().collect();
+            acc.update(&refs);
+            std::thread::sleep(Duration::from_millis(35));
+        }
+        // Exited child's 1 MiB write must be preserved in logical_write_bytes (totals.3)
+        // and not double-counted across samples.
+        assert!(
+            acc.totals.3 >= 1_048_576,
+            "expected >= 1 MiB logical write, got {}",
+            acc.totals.3
+        );
+        assert!(
+            acc.totals.3 < 2 * 1_048_576,
+            "suspected double-count: got {}",
+            acc.totals.3
+        );
+
+        let tree = sampler.collect_tree(root_pid, None, false, 1.0);
+        if let Some(node) = tree.first() {
+            assert!(
+                linux::execute_process_action(node.pid, node.starttime, ProcessAction::Renice(5))
+                    .is_err()
+            );
+        }
+
+        let _ = parent.kill();
+        let _ = parent.wait();
+    }
+
+    #[test]
+    fn xray_take_dirty_is_independent_of_widgets() {
+        let mut engine = XRayEngine::new(XRayConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        assert!(!engine.take_dirty());
+        engine.toggle_panel();
+        assert!(engine.take_dirty());
+        assert!(!engine.take_dirty());
+        engine.set_level(XRayLevel::Inspect);
+        assert!(engine.take_dirty());
     }
 }
