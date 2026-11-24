@@ -830,6 +830,119 @@ pub fn emit_visual_editor_panel(
                     checked: cfg.avoid_overlap,
                     disabled: false,
                 });
+                content.push(UiNode::Row {
+                    gap: 6.0,
+                    align: Align::Center,
+                    children: vec![
+                        UiNode::Text {
+                            text: format!("Opacity {:.0}%", cfg.opacity * 100.0),
+                            size: Some(11.0),
+                            color: Some(UiColor::Token("muted".into())),
+                            align: Align::Start,
+                        },
+                        UiNode::Slider {
+                            id: "ed.prop.opacity".into(),
+                            value: cfg.opacity.clamp(0.1, 1.0),
+                            width: Some(130.0),
+                            height: Some(14.0),
+                            color: Some(UiColor::Token("accent".into())),
+                            track: None,
+                        },
+                    ],
+                });
+                content.push(UiNode::Row {
+                    gap: 6.0,
+                    align: Align::Center,
+                    children: vec![
+                        UiNode::Button {
+                            id: "ed.prop.w_dec".into(),
+                            label: "W -".into(),
+                            bg: Some(UiColor::Token("surface".into())),
+                            color: Some(UiColor::Token("fg".into())),
+                            width: Some(42.0),
+                            height: Some(22.0),
+                            radius: 5.0,
+                        },
+                        UiNode::Button {
+                            id: "ed.prop.w_inc".into(),
+                            label: "W +".into(),
+                            bg: Some(UiColor::Token("surface".into())),
+                            color: Some(UiColor::Token("fg".into())),
+                            width: Some(42.0),
+                            height: Some(22.0),
+                            radius: 5.0,
+                        },
+                        UiNode::Button {
+                            id: "ed.prop.h_dec".into(),
+                            label: "H -".into(),
+                            bg: Some(UiColor::Token("surface".into())),
+                            color: Some(UiColor::Token("fg".into())),
+                            width: Some(42.0),
+                            height: Some(22.0),
+                            radius: 5.0,
+                        },
+                        UiNode::Button {
+                            id: "ed.prop.h_inc".into(),
+                            label: "H +".into(),
+                            bg: Some(UiColor::Token("surface".into())),
+                            color: Some(UiColor::Token("fg".into())),
+                            width: Some(42.0),
+                            height: Some(22.0),
+                            radius: 5.0,
+                        },
+                    ],
+                });
+                // Auto-generated extension settings_schema controls
+                if let Some(ext) = mgr.extensions.get(sel)
+                    && !ext.manifest.settings_schema.is_empty()
+                {
+                    content.push(UiNode::Divider {
+                        vertical: false,
+                        color: None,
+                    });
+                    let cur_vals = mgr.extension_settings.get(sel);
+                    for field in &ext.manifest.settings_schema {
+                        let lbl = if field.label.is_empty() {
+                            field.key.clone()
+                        } else {
+                            field.label.clone()
+                        };
+                        match field.kind {
+                            super::manifest::SettingFieldKind::Boolean => {
+                                let checked = cur_vals
+                                    .and_then(|v| v.get(&field.key))
+                                    .and_then(|v| v.as_bool())
+                                    .or_else(|| field.default.as_ref().and_then(|v| v.as_bool()))
+                                    .unwrap_or(false);
+                                content.push(UiNode::Toggle {
+                                    id: format!("ed.schema.bool.{}", field.key),
+                                    label: lbl,
+                                    checked,
+                                    disabled: false,
+                                });
+                            }
+                            super::manifest::SettingFieldKind::Enum
+                                if !field.options.is_empty() =>
+                            {
+                                let cur = cur_vals
+                                    .and_then(|v| v.get(&field.key))
+                                    .and_then(|v| v.as_str())
+                                    .or_else(|| field.default.as_ref().and_then(|v| v.as_str()))
+                                    .unwrap_or(field.options[0].as_str());
+                                content.push(UiNode::Button {
+                                    id: format!("ed.schema.enum.{}", field.key),
+                                    label: format!("{lbl}: {cur}"),
+                                    bg: Some(UiColor::Token("surface".into())),
+                                    color: Some(UiColor::Token("accent".into())),
+                                    width: Some(240.0),
+                                    height: Some(24.0),
+                                    radius: 6.0,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             } else {
                 content.push(UiNode::Text {
                     text: "Click a widget to edit its properties".into(),
@@ -877,9 +990,42 @@ pub fn emit_visual_editor_panel(
             }
         }
         EditorTab::Profiles | EditorTab::Background | EditorTab::XRay => {
+            content.push(UiNode::Row {
+                gap: 6.0,
+                align: Align::Center,
+                children: vec![
+                    UiNode::Button {
+                        id: "ed.profile.new".into(),
+                        label: "+ New".into(),
+                        bg: Some(UiColor::Token("accent-soft".into())),
+                        color: Some(UiColor::Token("accent".into())),
+                        width: Some(64.0),
+                        height: Some(24.0),
+                        radius: 6.0,
+                    },
+                    UiNode::Button {
+                        id: "ed.profile.dup".into(),
+                        label: "Duplicate".into(),
+                        bg: Some(UiColor::Token("surface".into())),
+                        color: Some(UiColor::Token("fg".into())),
+                        width: Some(78.0),
+                        height: Some(24.0),
+                        radius: 6.0,
+                    },
+                    UiNode::Button {
+                        id: "ed.profile.save".into(),
+                        label: "Save".into(),
+                        bg: Some(UiColor::Token("surface".into())),
+                        color: Some(UiColor::Token("success".into())),
+                        width: Some(58.0),
+                        height: Some(24.0),
+                        radius: 6.0,
+                    },
+                ],
+            });
             for name in mgr.profiles.profiles.keys() {
                 let is_active = mgr.profiles.active == *name;
-                content.push(UiNode::Button {
+                let mut row_items = vec![UiNode::Button {
                     id: format!("ed.profile.{name}"),
                     label: if is_active {
                         format!("● {name} (active)")
@@ -892,9 +1038,25 @@ pub fn emit_visual_editor_panel(
                     color: Some(UiColor::Token(
                         if is_active { "accent" } else { "fg" }.into(),
                     )),
-                    width: Some(240.0),
-                    height: Some(26.0),
+                    width: Some(196.0),
+                    height: Some(24.0),
                     radius: 6.0,
+                }];
+                if name != "default" {
+                    row_items.push(UiNode::Button {
+                        id: format!("ed.profile.del.{name}"),
+                        label: "✕".into(),
+                        bg: Some(UiColor::Token("surface".into())),
+                        color: Some(UiColor::Token("error".into())),
+                        width: Some(26.0),
+                        height: Some(24.0),
+                        radius: 6.0,
+                    });
+                }
+                content.push(UiNode::Row {
+                    gap: 6.0,
+                    align: Align::Center,
+                    children: row_items,
                 });
             }
         }

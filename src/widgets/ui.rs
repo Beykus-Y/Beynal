@@ -288,6 +288,8 @@ pub enum UiNode {
     },
     ScrollView {
         #[serde(default)]
+        id: String,
+        #[serde(default)]
         scroll_y: f32,
         height: f32,
         children: Vec<UiNode>,
@@ -296,6 +298,20 @@ pub enum UiNode {
         id: String,
         label: String,
         checked: bool,
+        #[serde(default)]
+        disabled: bool,
+    },
+    Checkbox {
+        id: String,
+        label: String,
+        checked: bool,
+        #[serde(default)]
+        disabled: bool,
+    },
+    Dropdown {
+        id: String,
+        options: Vec<String>,
+        selected: usize,
         #[serde(default)]
         disabled: bool,
     },
@@ -343,6 +359,9 @@ pub enum HitKind {
     Button,
     Slider,
     Toggle,
+    Checkbox,
+    Dropdown,
+    ScrollView,
     Tab(usize),
 }
 
@@ -539,10 +558,19 @@ fn measure_node(node: &UiNode, max_w: f32, scale: f32) -> (f32, f32) {
         ),
         UiNode::Canvas { width, height, .. } => (width * scale, height * scale),
         UiNode::ScrollView { height, .. } => (max_w, height * scale),
-        UiNode::Toggle { label, .. } => (
+        UiNode::Toggle { label, .. } | UiNode::Checkbox { label, .. } => (
             ((label.chars().count() as f32 * 7.8 + 44.0) * scale).min(max_w),
             24.0 * scale,
         ),
+        UiNode::Dropdown {
+            options, selected, ..
+        } => {
+            let cur = options.get(*selected).map_or("Select", String::as_str);
+            (
+                ((cur.chars().count() as f32 * 8.0 + 34.0) * scale).min(max_w),
+                26.0 * scale,
+            )
+        }
         UiNode::Divider { vertical, .. } => {
             if *vertical {
                 (1.0 * scale, 18.0 * scale)
@@ -1072,7 +1100,10 @@ fn emit_node(
             }
         }
         UiNode::ScrollView {
-            scroll_y, children, ..
+            id,
+            scroll_y,
+            children,
+            ..
         } => {
             let view_clip = intersect_clip(clip, rect);
             let mut cy = y - scroll_y * ctx.scale;
@@ -1082,6 +1113,146 @@ fn emit_node(
                     emit_node(ctx, child, (x, cy, w, ch), view_clip, renderer, scene, hits);
                 }
                 cy += ch + 4.0 * ctx.scale;
+            }
+            if !id.is_empty() {
+                hits.push(UiHitTarget {
+                    widget_id: ctx.widget_id.to_string(),
+                    node_id: id.clone(),
+                    kind: HitKind::ScrollView,
+                    x,
+                    y,
+                    w,
+                    h,
+                });
+            }
+        }
+        UiNode::Checkbox {
+            id,
+            label,
+            checked,
+            disabled,
+        } => {
+            let box_sz = (16.0 * ctx.scale).min(h);
+            let box_y = y + (h - box_sz) * 0.5;
+            ctx.push_rect(
+                scene,
+                SceneRoundedRect {
+                    x,
+                    y: box_y,
+                    w: box_sz,
+                    h: box_sz,
+                    radius: 4.0 * ctx.scale,
+                    color: if *checked {
+                        accent_default
+                    } else {
+                        [fg_default[0], fg_default[1], fg_default[2], 0.12]
+                    },
+                    border_width: 1.0 * ctx.scale,
+                    border_color: if *checked {
+                        accent_default
+                    } else {
+                        [fg_default[0], fg_default[1], fg_default[2], 0.35]
+                    },
+                },
+            );
+            if *checked {
+                emit_text_line(
+                    ctx,
+                    "✓",
+                    11.0 * ctx.scale,
+                    (x, box_y, box_sz, box_sz),
+                    clip,
+                    Align::Center,
+                    to_f4(ctx.theme.background, 1.0),
+                    renderer,
+                    scene,
+                );
+            }
+            let text_x = x + box_sz + 8.0 * ctx.scale;
+            let text_col = if *disabled {
+                UiColor::Token("muted".into()).resolve(ctx.theme, fg_default)
+            } else {
+                fg_default
+            };
+            emit_text_line(
+                ctx,
+                label,
+                12.0 * ctx.scale,
+                (text_x, y, (x + w - text_x).max(0.0), h),
+                clip,
+                Align::Start,
+                text_col,
+                renderer,
+                scene,
+            );
+            if !*disabled {
+                hits.push(UiHitTarget {
+                    widget_id: ctx.widget_id.to_string(),
+                    node_id: id.clone(),
+                    kind: HitKind::Checkbox,
+                    x,
+                    y,
+                    w,
+                    h,
+                });
+            }
+        }
+        UiNode::Dropdown {
+            id,
+            options,
+            selected,
+            disabled,
+        } => {
+            let hovered = ctx.is_hovered(rect);
+            let label = format!("{} ▾", options.get(*selected).map_or("—", String::as_str));
+            ctx.push_rect(
+                scene,
+                SceneRoundedRect {
+                    x,
+                    y,
+                    w,
+                    h,
+                    radius: 6.0 * ctx.scale,
+                    color: card_default,
+                    border_width: 1.0 * ctx.scale,
+                    border_color: if hovered && !*disabled {
+                        [
+                            accent_default[0],
+                            accent_default[1],
+                            accent_default[2],
+                            0.75,
+                        ]
+                    } else {
+                        [fg_default[0], fg_default[1], fg_default[2], 0.25]
+                    },
+                },
+            );
+            let col = if *disabled {
+                UiColor::Token("muted".into()).resolve(ctx.theme, fg_default)
+            } else {
+                fg_default
+            };
+            emit_text_line(
+                ctx,
+                &label,
+                12.0 * ctx.scale,
+                (x + 8.0 * ctx.scale, y, (w - 16.0 * ctx.scale).max(0.0), h),
+                clip,
+                Align::Start,
+                col,
+                renderer,
+                scene,
+            );
+            if !*disabled {
+                hits.push(UiHitTarget {
+                    widget_id: ctx.widget_id.to_string(),
+                    node_id: id.clone(),
+                    kind: HitKind::Dropdown,
+                    x,
+                    y,
+                    w,
+                    h,
+                });
             }
         }
         UiNode::Toggle {

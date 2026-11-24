@@ -69,10 +69,13 @@ function renderWidget() {
         { x: 18, y: 14 - audio.treble * 14, w: 6, h: Math.max(2, audio.treble * 14), color: "magenta" },
     ].map((b) => ({ type: "fill-rect", ...b, radius: 2 }));
 
-    const header = [
-        beyrix.ui.icon("audio", { size: 14, color: "accent" }),
-        beyrix.ui.text(session.title || "Nothing playing", { size: 12.5, color: "fg" }),
-    ];
+    const header = [];
+    if (session.artId && typeof beyrix.ui.image === "function") {
+        header.push(beyrix.ui.image(session.artId, 28, 28, { radius: 6 }));
+    } else {
+        header.push(beyrix.ui.icon("audio", { size: 14, color: "accent" }));
+    }
+    header.push(beyrix.ui.text(session.title || "Nothing playing", { size: 12.5, color: "fg" }));
     if (showViz) {
         header.push(beyrix.ui.canvas(26, 14, bars));
     }

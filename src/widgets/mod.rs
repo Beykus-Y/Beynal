@@ -59,17 +59,27 @@ pub struct WidgetManager {
     generations: BTreeMap<String, u64>,
     unloaded_extensions: Vec<String>,
     runtime: Option<WidgetRuntime>,
+    active_slider: Option<(String, String, f32, f32)>,
+    file_mtimes: BTreeMap<String, std::time::SystemTime>,
+    last_reload_poll: Option<std::time::Instant>,
 }
 
 impl WidgetManager {
     pub fn new(config: WidgetsConfig) -> Self {
+        let mut profiles = layout::ProfileStore::default();
+        if let Some(path) = Self::profiles_path()
+            && let Ok(json) = std::fs::read_to_string(&path)
+            && let Ok(loaded) = serde_json::from_str::<layout::ProfileStore>(&json)
+        {
+            profiles = loaded;
+        }
         Self {
             config,
             extensions: BTreeMap::new(),
             trust_levels: BTreeMap::new(),
             granted_permissions: BTreeMap::new(),
             placements: BTreeMap::new(),
-            profiles: layout::ProfileStore::default(),
+            profiles,
             extension_settings: BTreeMap::new(),
             editor: VisualLayoutEditor::new(),
             editor_hits: Vec::new(),
@@ -78,7 +88,74 @@ impl WidgetManager {
             generations: BTreeMap::new(),
             unloaded_extensions: Vec::new(),
             runtime: None,
+            active_slider: None,
+            file_mtimes: BTreeMap::new(),
+            last_reload_poll: None,
         }
+    }
+
+    pub fn profiles_path() -> Option<std::path::PathBuf> {
+        crate::config::PlatformConfig::config_path()
+            .and_then(|p| p.parent().map(|d| d.join("profiles.json")))
+    }
+
+    pub fn persist_profiles(&mut self) -> Result<(), String> {
+        let active = self.profiles.active.clone();
+        if let Some(prof) = self.profiles.profiles.get_mut(&active) {
+            prof.widgets = self.placements.clone();
+        }
+        let Some(path) = Self::profiles_path() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
+        }
+        let json = serde_json::to_string_pretty(&self.profiles)
+            .map_err(|e| format!("serialize profiles: {e}"))?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json.as_bytes()).map_err(|e| format!("write tmp: {e}"))?;
+        std::fs::rename(&tmp, &path).map_err(|e| format!("rename profiles: {e}"))?;
+        Ok(())
+    }
+
+    /// Poll loaded extension entry files for mtime changes when `config.hot_reload` is enabled.
+    /// Does zero filesystem syscalls when `hot_reload` is false or runtime is stopped.
+    pub fn poll_hot_reload(&mut self) -> usize {
+        if !self.config.enabled || !self.config.hot_reload || self.runtime.is_none() {
+            return 0;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .last_reload_poll
+            .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_millis(350))
+        {
+            return 0;
+        }
+        self.last_reload_poll = Some(now);
+        let mut to_reload = Vec::new();
+        for (id, ext) in &self.extensions {
+            if let Ok(meta) = std::fs::metadata(&ext.entry_path)
+                && let Ok(mtime) = meta.modified()
+            {
+                match self.file_mtimes.get(id) {
+                    Some(&prev) if prev != mtime => {
+                        to_reload.push((id.clone(), mtime));
+                    }
+                    None => {
+                        self.file_mtimes.insert(id.clone(), mtime);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut reloaded = 0;
+        for (id, mtime) in to_reload {
+            self.file_mtimes.insert(id.clone(), mtime);
+            if self.reload_extension(&id).is_ok() {
+                reloaded += 1;
+            }
+        }
+        reloaded
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -427,7 +504,10 @@ impl WidgetManager {
                             _ => layout::EditorTab::Profiles,
                         };
                     }
-                    ("ed.close", _) => self.editor.toggle(),
+                    ("ed.close", _) => {
+                        let _ = self.persist_profiles();
+                        self.editor.toggle();
+                    }
                     ("ed.undo", _) => {
                         self.editor.undo(&mut self.placements);
                     }
@@ -506,6 +586,85 @@ impl WidgetManager {
                                 cfg.avoid_overlap = !cfg.avoid_overlap;
                             }
                         }
+                    }
+                    ("ed.prop.opacity", HitKind::Slider) => {
+                        if let Some(id) = self.editor.selected_widget.clone()
+                            && let Some(cfg) = self.placements.get_mut(&id)
+                        {
+                            let val = ((pointer_px.0 - hit.x) / hit.w.max(1.0)).clamp(0.1, 1.0);
+                            cfg.opacity = val;
+                        }
+                    }
+                    ("ed.prop.w_inc" | "ed.prop.w_dec" | "ed.prop.h_inc" | "ed.prop.h_dec", _) => {
+                        if let Some(id) = self.editor.selected_widget.clone() {
+                            self.editor.push_undo(self.placements.clone());
+                            if let Some(cfg) = self.placements.get_mut(&id) {
+                                match hit.node_id.as_str() {
+                                    "ed.prop.w_inc" => cfg.width = (cfg.width + 20.0).min(1200.0),
+                                    "ed.prop.w_dec" => cfg.width = (cfg.width - 20.0).max(80.0),
+                                    "ed.prop.h_inc" => cfg.height = (cfg.height + 16.0).min(800.0),
+                                    _ => cfg.height = (cfg.height - 16.0).max(28.0),
+                                }
+                            }
+                        }
+                    }
+                    (id_str, _) if id_str.starts_with("ed.schema.bool.") => {
+                        let key = id_str.trim_start_matches("ed.schema.bool.").to_string();
+                        if let Some(sel) = self.editor.selected_widget.clone() {
+                            let mut obj = self
+                                .extension_settings
+                                .get(&sel)
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!({}));
+                            let cur = obj.get(&key).and_then(|v| v.as_bool()).unwrap_or(false);
+                            obj[key] = serde_json::Value::Bool(!cur);
+                            let _ = self.update_extension_settings(&sel, obj);
+                        }
+                    }
+                    (id_str, _) if id_str.starts_with("ed.schema.enum.") => {
+                        let key = id_str.trim_start_matches("ed.schema.enum.").to_string();
+                        if let Some(sel) = self.editor.selected_widget.clone()
+                            && let Some(ext) = self.extensions.get(&sel)
+                            && let Some(field) =
+                                ext.manifest.settings_schema.iter().find(|f| f.key == key)
+                            && !field.options.is_empty()
+                        {
+                            let mut obj = self
+                                .extension_settings
+                                .get(&sel)
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!({}));
+                            let cur = obj
+                                .get(&key)
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(field.options[0].as_str());
+                            let idx = field.options.iter().position(|o| o == cur).unwrap_or(0);
+                            let next = field.options[(idx + 1) % field.options.len()].clone();
+                            obj[key] = serde_json::Value::String(next);
+                            let _ = self.update_extension_settings(&sel, obj);
+                        }
+                    }
+                    ("ed.profile.new", _) => {
+                        let idx = self.profiles.profiles.len() + 1;
+                        let name = format!("profile-{idx}");
+                        self.profiles.create(&name, self.placements.clone());
+                        let _ = self.profiles.switch(&name);
+                        let _ = self.persist_profiles();
+                    }
+                    ("ed.profile.dup", _) => {
+                        let cur = self.profiles.active.clone();
+                        let name = format!("{cur}-copy");
+                        self.profiles.create(&name, self.placements.clone());
+                        let _ = self.profiles.switch(&name);
+                        let _ = self.persist_profiles();
+                    }
+                    ("ed.profile.save", _) => {
+                        let _ = self.persist_profiles();
+                    }
+                    (id_str, _) if id_str.starts_with("ed.profile.del.") => {
+                        let name = id_str.trim_start_matches("ed.profile.del.");
+                        let _ = self.profiles.delete(name);
+                        let _ = self.persist_profiles();
                     }
                     (id_str, _) if id_str.starts_with("ed.select.") => {
                         let wid = id_str.trim_start_matches("ed.select.").to_string();
@@ -596,12 +755,22 @@ impl WidgetManager {
                 if let Some(vm) = &self.runtime {
                     let (kind, value) = match hit.kind {
                         HitKind::Button => ("click", 1.0),
-                        HitKind::Toggle => ("toggle", 1.0),
+                        HitKind::Toggle | HitKind::Checkbox => ("toggle", 1.0),
+                        HitKind::Dropdown => ("cycle", 1.0),
+                        HitKind::ScrollView => continue,
                         HitKind::Tab(idx) => ("tab", idx as f32),
-                        HitKind::Slider => (
-                            "change",
-                            ((pointer_px.0 - hit.x) / hit.w.max(1.0)).clamp(0.0, 1.0),
-                        ),
+                        HitKind::Slider => {
+                            self.active_slider = Some((
+                                hit.widget_id.clone(),
+                                hit.node_id.clone(),
+                                hit.x,
+                                hit.w.max(1.0),
+                            ));
+                            (
+                                "change",
+                                ((pointer_px.0 - hit.x) / hit.w.max(1.0)).clamp(0.0, 1.0),
+                            )
+                        }
                     };
                     vm.send(VmCommand::UiEvent {
                         widget_id: hit.widget_id.clone(),
@@ -623,6 +792,21 @@ impl WidgetManager {
         scale: f32,
         cell_size: (f32, f32),
     ) -> bool {
+        // Active widget Slider drag outside Layout Editor
+        if !self.editor.active
+            && let Some((widget_id, node_id, sx, sw)) = &self.active_slider
+        {
+            let value = ((pointer_px.0 - *sx) / (*sw).max(1.0)).clamp(0.0, 1.0);
+            if let Some(vm) = &self.runtime {
+                vm.send(VmCommand::UiEvent {
+                    widget_id: widget_id.clone(),
+                    node_id: node_id.clone(),
+                    kind: "change".into(),
+                    value,
+                });
+            }
+            return true;
+        }
         if !self.editor.active || self.editor.drag_mode.is_none() {
             return false;
         }
@@ -650,7 +834,40 @@ impl WidgetManager {
         false
     }
 
+    pub fn handle_pointer_scroll(&mut self, pointer_px: (f32, f32), delta_y: f32) -> bool {
+        if !self.config.enabled {
+            return false;
+        }
+        for hit in self.hit_targets.iter().rev() {
+            if hit.kind == HitKind::ScrollView
+                && pointer_px.0 >= hit.x
+                && pointer_px.0 <= hit.x + hit.w
+                && pointer_px.1 >= hit.y
+                && pointer_px.1 <= hit.y + hit.h
+            {
+                let interactive = self
+                    .resolved_rects
+                    .get(&hit.widget_id)
+                    .is_some_and(|r| r.interactive);
+                if !interactive {
+                    continue;
+                }
+                if let Some(vm) = &self.runtime {
+                    vm.send(VmCommand::UiEvent {
+                        widget_id: hit.widget_id.clone(),
+                        node_id: hit.node_id.clone(),
+                        kind: "scroll".into(),
+                        value: delta_y,
+                    });
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn handle_pointer_release(&mut self) {
+        self.active_slider = None;
         self.editor.end_drag();
     }
 }
