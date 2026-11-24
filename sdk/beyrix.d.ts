@@ -11,16 +11,27 @@ declare namespace Beyrix {
     | "background"
     | "fg"
     | "foreground"
+    | "fg-secondary"
     | "accent"
+    | "accent-soft"
     | "cursor"
     | "selection"
     | "selection_fg"
     | "muted"
     | "card"
+    | "surface"
+    | "surface-elevated"
+    | "surface-hover"
+    | "border"
+    | "border-subtle"
     | "red"
+    | "error"
     | "green"
+    | "success"
     | "yellow"
+    | "warning"
     | "blue"
+    | "info"
     | "magenta"
     | "cyan"
     | `#${string}`;
@@ -90,9 +101,17 @@ declare namespace Beyrix {
     title: string;
     artist: string;
     album: string;
+    artUrl: string | null;
     playing: boolean;
     position: number;
     duration: number;
+    volume: number | null;
+    canPlay: boolean;
+    canPause: boolean;
+    canGoNext: boolean;
+    canGoPrevious: boolean;
+    canSeek: boolean;
+    availableSessions: string[];
   }
 
   interface AudioFrameEvent {
@@ -205,6 +224,11 @@ declare namespace Beyrix {
       readonly height: number;
       readonly scale: number;
       readonly focused: boolean;
+    };
+    settings: {
+      get<T = unknown>(key: string, fallback?: T): T;
+      getAll(): Record<string, unknown>;
+      onChange(cb: (values: Record<string, unknown>) => void): void;
     };
   }
 }

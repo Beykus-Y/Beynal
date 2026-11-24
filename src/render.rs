@@ -1313,14 +1313,11 @@ mod tests {
         let mut terminal = Terminal::new(2, 1);
         terminal.process(b"A\x1b[?25l");
         let mut selection = crate::selection::Selection::default();
-        selection.press(
+        selection.select_range(
             terminal.screen(),
             crate::selection::Position { row: 0, col: 0 },
-            1,
-            0.0,
-            0.0,
+            crate::selection::Position { row: 0, col: 0 },
         );
-        selection.release();
         let g = renderer.geometry(1.0);
         let (width, height) = frame(g, 2, 1);
         let pixels = renderer.render_selection(terminal.screen(), width, height, &selection);
