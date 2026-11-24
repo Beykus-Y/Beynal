@@ -12,12 +12,19 @@ version = "0.1.0-alpha.2"
 edition = "2024"
 
 [dependencies]
+cpal = "0.15.3"
 fontdue = "0.9.5"
+glam = "0.25.0"
 glow = "0.16.0"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 khronos-egl = { version = "6.0.0", features = ["dynamic"] }
 libc = "0.2.191"
 libloading = "0.8.9"
+rquickjs = { version = "0.14.0", features = ["array-buffer", "loader", "macro"] }
+rustfft = "6.4.1"
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0"
+symphonia = { version = "0.5.4", features = ["all"] }
 tempfile = "3.27.0"
 toml = "1.2.2"
 toml_edit = "0.25.20"
@@ -28,3 +35,4 @@ vte = "0.15.0"
 # even on a machine without libwayland at link time.
 wayland-client = { version = "0.31.15", features = ["system", "dlopen"] }
 wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
+zbus = { version = "5.16.0", features = ["blocking-api"] }
