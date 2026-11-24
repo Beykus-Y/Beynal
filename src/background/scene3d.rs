@@ -83,14 +83,56 @@ impl Default for Camera3D {
 
 impl Camera3D {
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
+        self.view_proj_with_fit(aspect, crate::config::BackgroundFitMode::Fit)
+    }
+
+    /// Compute view-projection matrix honoring viewport aspect ratio, cell
+    /// aspect, and `BackgroundFitMode` without distorting geometry proportions.
+    pub fn view_proj_with_fit(
+        &self,
+        aspect: f32,
+        fit_mode: crate::config::BackgroundFitMode,
+    ) -> Mat4 {
+        let aspect = aspect.max(0.15);
         let view = Mat4::look_at_rh(self.position, self.target, self.up);
         let proj = match self.projection {
             ProjectionMode::Perspective => {
-                Mat4::perspective_rh_gl(self.fov_rad, aspect.max(0.1), self.near, self.far)
+                let effective_fov = match fit_mode {
+                    crate::config::BackgroundFitMode::Fill => self.fov_rad,
+                    crate::config::BackgroundFitMode::Fit => {
+                        if aspect < 1.0 {
+                            (2.0 * ((self.fov_rad * 0.5).tan() / aspect).atan())
+                                .clamp(self.fov_rad, 130.0_f32.to_radians())
+                        } else {
+                            self.fov_rad
+                        }
+                    }
+                    crate::config::BackgroundFitMode::Responsive => {
+                        if aspect < 1.0 {
+                            let fit_fov = (2.0 * ((self.fov_rad * 0.5).tan() / aspect).atan())
+                                .clamp(self.fov_rad, 125.0_f32.to_radians());
+                            self.fov_rad * 0.25 + fit_fov * 0.75
+                        } else {
+                            self.fov_rad
+                        }
+                    }
+                    crate::config::BackgroundFitMode::FixedScale => {
+                        let half_h = self.ortho_scale;
+                        let half_w = half_h * aspect;
+                        return Mat4::orthographic_rh_gl(
+                            -half_w, half_w, -half_h, half_h, self.near, self.far,
+                        ) * view;
+                    }
+                };
+                Mat4::perspective_rh_gl(effective_fov, aspect, self.near, self.far)
             }
             ProjectionMode::Orthographic => {
-                let half_h = self.ortho_scale;
-                let half_w = half_h * aspect.max(0.1);
+                let half_h = if fit_mode == crate::config::BackgroundFitMode::Fit && aspect < 1.0 {
+                    self.ortho_scale / aspect
+                } else {
+                    self.ortho_scale
+                };
+                let half_w = half_h * aspect;
                 Mat4::orthographic_rh_gl(-half_w, half_w, -half_h, half_h, self.near, self.far)
             }
         };
@@ -154,6 +196,7 @@ pub struct CharRasterizer {
     pub cols: usize,
     pub rows: usize,
     pub cells: Vec<BgCharCell>,
+    ramp_buf: Vec<char>,
 }
 
 impl CharRasterizer {
@@ -164,6 +207,7 @@ impl CharRasterizer {
             cols,
             rows,
             cells: vec![BgCharCell::default(); cols * rows],
+            ramp_buf: Vec::with_capacity(32),
         }
     }
 
@@ -178,14 +222,32 @@ impl CharRasterizer {
     }
 
     pub fn render(&mut self, scene: &Scene3D, charset: &str, brightness: f32, cell_aspect: f32) {
+        self.render_with_fit(
+            scene,
+            charset,
+            brightness,
+            cell_aspect,
+            crate::config::BackgroundFitMode::Fit,
+        );
+    }
+
+    pub fn render_with_fit(
+        &mut self,
+        scene: &Scene3D,
+        charset: &str,
+        brightness: f32,
+        cell_aspect: f32,
+        fit_mode: crate::config::BackgroundFitMode,
+    ) {
         self.cells.fill(BgCharCell::default());
-        let ramp: Vec<char> = if charset.is_empty() {
-            " .:-=+*#%@".chars().collect()
+        self.ramp_buf.clear();
+        if charset.is_empty() {
+            self.ramp_buf.extend(" .:-=+*#%@".chars());
         } else {
-            charset.chars().collect()
-        };
+            self.ramp_buf.extend(charset.chars());
+        }
         let aspect = (self.cols as f32 / self.rows.max(1) as f32) * cell_aspect.max(0.25);
-        let vp = scene.camera.view_proj(aspect);
+        let vp = scene.camera.view_proj_with_fit(aspect, fit_mode);
         let light_dir = scene.light.direction.normalize_or_zero();
 
         for obj in &scene.objects {
@@ -227,7 +289,7 @@ impl CharRasterizer {
                     + obj.material.diffuse * diff * scene.light.intensity)
                     * brightness)
                     .clamp(0.05, 1.0);
-                let ch = sample_ramp(&ramp, lum);
+                let ch = sample_ramp(&self.ramp_buf, lum);
                 let col = [
                     (obj.material.color[0] * scene.light.color[0] * lum).clamp(0.0, 1.0),
                     (obj.material.color[1] * scene.light.color[1] * lum).clamp(0.0, 1.0),

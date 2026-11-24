@@ -234,11 +234,27 @@ pub enum BackgroundTuiBehavior {
     Keep,
 }
 
+/// How 3D Background scenes adapt to narrow or wide terminal viewports.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackgroundFitMode {
+    /// Automatically widen vertical FOV in narrow viewports so the full 3D object fits.
+    #[default]
+    Fit,
+    /// Keep vertical FOV constant (fills height; may crop horizontally in narrow windows).
+    Fill,
+    /// Keep a constant world-space scale regardless of viewport dimensions.
+    FixedScale,
+    /// Smoothly adapt between Fit and Fill based on viewport aspect ratio.
+    Responsive,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct BackgroundConfig {
     pub enabled: bool,
     pub preset: BackgroundPreset,
+    pub fit_mode: BackgroundFitMode,
     pub fps: u32,
     pub resolution_scale: f32,
     pub char_density: f32,
@@ -261,6 +277,7 @@ impl Default for BackgroundConfig {
         Self {
             enabled: false,
             preset: BackgroundPreset::Torus,
+            fit_mode: BackgroundFitMode::Fit,
             fps: 30,
             resolution_scale: 1.0,
             char_density: 1.0,

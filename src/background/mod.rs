@@ -44,12 +44,21 @@ pub struct CustomObjectSpec {
     pub scale: Option<[f32; 3]>,
 }
 
+/// Safety caps preventing untrusted extensions from exhausting memory or
+/// stalling the terminal with excessive 3D geometry or bindings.
+pub const MAX_BG_OBJECTS: usize = 32;
+pub const MAX_BG_TRIANGLES_PER_OBJECT: usize = 4096;
+pub const MAX_BG_TOTAL_TRIANGLES: usize = 16384;
+pub const MAX_BG_BINDINGS: usize = 32;
+
 pub struct BackgroundEngine {
     pub config: BackgroundConfig,
     pub bindings: Vec<DataBinding>,
     pub custom_scene: Option<Scene3D>,
     pub scene_owner: Option<String>,
     rasterizer: CharRasterizer,
+    cached_glyphs: Vec<SceneGlyph>,
+    cached_viewport: (u32, u32, u32),
     start_time: Instant,
     last_frame: Instant,
     smoothed_frame_ms: f32,
@@ -89,8 +98,12 @@ impl BackgroundEngine {
             custom_scene: None,
             scene_owner: None,
             rasterizer: CharRasterizer::new(64, 24),
+            cached_glyphs: Vec::new(),
+            cached_viewport: (0, 0, 0),
             start_time: Instant::now(),
-            last_frame: Instant::now(),
+            last_frame: Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
             smoothed_frame_ms: 0.0,
             effective_fps: fps,
         }
@@ -156,9 +169,30 @@ impl BackgroundEngine {
             }
             other => return Err(format!("unknown primitive {other:?}")),
         };
+        if mesh.indices.len() > MAX_BG_TRIANGLES_PER_OBJECT {
+            return Err(format!(
+                "mesh has {} triangles (max {MAX_BG_TRIANGLES_PER_OBJECT})",
+                mesh.indices.len()
+            ));
+        }
         let Some(scene) = self.ensure_custom_scene_mut(owner) else {
             return Err("background scene is owned by another extension".to_string());
         };
+        let existing_objects = scene.objects.iter().filter(|o| o.id != spec.id).count();
+        if existing_objects >= MAX_BG_OBJECTS {
+            return Err(format!("scene object limit reached (max {MAX_BG_OBJECTS})"));
+        }
+        let existing_tris: usize = scene
+            .objects
+            .iter()
+            .filter(|o| o.id != spec.id)
+            .map(|o| o.mesh.indices.len())
+            .sum();
+        if existing_tris + mesh.indices.len() > MAX_BG_TOTAL_TRIANGLES {
+            return Err(format!(
+                "scene triangle budget exceeded (max {MAX_BG_TOTAL_TRIANGLES})"
+            ));
+        }
         scene.objects.retain(|o| o.id != spec.id);
         scene.objects.push(Object3D {
             id: spec.id,
@@ -280,6 +314,13 @@ impl BackgroundEngine {
         {
             return Err("binding is owned by another extension".to_string());
         }
+        if !self.bindings.iter().any(|b| b.id == binding.id)
+            && self.bindings.len() >= MAX_BG_BINDINGS
+        {
+            return Err(format!(
+                "background binding limit reached (max {MAX_BG_BINDINGS})"
+            ));
+        }
         binding.owner = owner.to_string();
         self.bindings.retain(|b| b.id != binding.id);
         self.bindings.push(binding);
@@ -342,6 +383,17 @@ impl BackgroundEngine {
         if !self.is_active(focused, in_tui) {
             return;
         }
+        let vp_key = (
+            win_size.0.round() as u32,
+            win_size.1.round() as u32,
+            (scale * 120.0).round() as u32,
+        );
+        // Reuse cached background glyphs when terminal repaints faster than the
+        // background engine's target FPS and viewport hasn't changed.
+        if !self.cached_glyphs.is_empty() && self.cached_viewport == vp_key && !self.should_step() {
+            scene.behind_glyphs.extend_from_slice(&self.cached_glyphs);
+            return;
+        }
         let t0 = Instant::now();
         let px_size =
             (self.config.char_size * scale * self.config.resolution_scale).clamp(8.0, 48.0);
@@ -382,14 +434,16 @@ impl BackgroundEngine {
             )
         };
         let _ = &mut s3d;
-        self.rasterizer.render(
+        self.rasterizer.render_with_fit(
             &s3d,
             &self.config.charset,
             mods.brightness * self.config.effect_intensity,
             cell_w / cell_h,
+            self.config.fit_mode,
         );
 
         let alpha = self.config.alpha.clamp(0.0, 1.0);
+        self.cached_glyphs.clear();
         for row in 0..rows {
             let py = row as f32 * cell_h + cell_h * 0.8;
             for col in 0..cols {
@@ -412,7 +466,7 @@ impl BackgroundEngine {
                 let w = metrics.width.min((win_size.0 as usize).saturating_sub(x));
                 let h = metrics.height.min((win_size.1 as usize).saturating_sub(y));
                 if w > 0 && h > 0 {
-                    scene.behind_glyphs.push(SceneGlyph {
+                    self.cached_glyphs.push(SceneGlyph {
                         ch: cell.ch,
                         px_size,
                         x,
@@ -425,6 +479,8 @@ impl BackgroundEngine {
                 }
             }
         }
+        self.cached_viewport = vp_key;
+        scene.behind_glyphs.extend_from_slice(&self.cached_glyphs);
 
         let frame_ms = t0.elapsed().as_secs_f32() * 1000.0;
         self.smoothed_frame_ms = self.smoothed_frame_ms * 0.85 + frame_ms * 0.15;
@@ -597,5 +653,74 @@ mod tests {
         assert!(engine.custom_scene.is_none());
         assert!(engine.scene_owner.is_none());
         assert!(engine.bindings.is_empty());
+    }
+
+    #[test]
+    fn narrow_viewport_fit_mode_prevents_horizontal_clipping_and_enforces_limits() {
+        let mut renderer = Renderer::new().unwrap();
+        let theme = Theme::default();
+        let mut engine = BackgroundEngine::new(BackgroundConfig {
+            enabled: true,
+            preset: BackgroundPreset::Torus,
+            fit_mode: crate::config::BackgroundFitMode::Fit,
+            ..Default::default()
+        });
+        let mut scene = Scene::default();
+        // Narrow Niri column (360 x 900)
+        engine.render_to_scene(
+            (360.0, 900.0),
+            1.0,
+            true,
+            false,
+            (0.5, 0.5),
+            &BindingInputs::default(),
+            &theme,
+            &mut renderer,
+            &mut scene,
+        );
+        assert!(!scene.behind_glyphs.is_empty());
+        // With Fit mode, the torus stays framed with margin inside the narrow column
+        // (leftmost glyph > 0 and rightmost glyph < 360).
+        let min_x = scene.behind_glyphs.iter().map(|g| g.x).min().unwrap();
+        let max_x = scene.behind_glyphs.iter().map(|g| g.x + g.w).max().unwrap();
+        assert!(
+            min_x > 0 && max_x < 360,
+            "torus clipped: [{min_x}, {max_x}]"
+        );
+
+        // Enforce MAX_BG_OBJECTS cap.
+        engine.clear_scene("ext.limit").unwrap();
+        for i in 0..MAX_BG_OBJECTS {
+            engine
+                .add_object(
+                    "ext.limit",
+                    CustomObjectSpec {
+                        id: format!("c{i}"),
+                        primitive: "cube".into(),
+                        obj_data: None,
+                        color: None,
+                        position: None,
+                        rotation: None,
+                        scale: None,
+                    },
+                )
+                .unwrap();
+        }
+        assert!(
+            engine
+                .add_object(
+                    "ext.limit",
+                    CustomObjectSpec {
+                        id: "overflow".into(),
+                        primitive: "cube".into(),
+                        obj_data: None,
+                        color: None,
+                        position: None,
+                        rotation: None,
+                        scale: None,
+                    },
+                )
+                .is_err()
+        );
     }
 }
