@@ -5,7 +5,7 @@
 //! Minimal OpenGL ES 2.0 backend on top of EGL/Wayland.
 //!
 //! The pipeline is deliberately small and terminal-specific:
-//! * one alpha glyph atlas, grown only for newly used glyphs;
+//! * one bounded alpha glyph atlas with ordered batches on overflow;
 //! * batched background/selection/cursor rectangles and batched glyph quads;
 //! * scissor-based partial redraw of damaged rows;
 //! * presentation through `eglSwapBuffers`/`EGL_KHR_swap_buffers_with_damage`.
@@ -19,9 +19,11 @@ use std::ffi::{c_int, c_void};
 use glow::HasContext as _;
 use khronos_egl as egl;
 
-use crate::render::{Renderer, Scene, SceneGlyph};
+use crate::render::{Renderer, Scene, SceneGlyph, SceneRect};
 
 const ATLAS_SIZE: u32 = 1024;
+const ATLAS_ENTRIES: usize = 8192;
+const GLYPHS_PER_BATCH: usize = 4096;
 const EGL_BUFFER_AGE_EXT: egl::Int = 0x313D;
 const EGL_SWAP_BEHAVIOR: egl::Int = 0x3093;
 const EGL_BUFFER_PRESERVED: egl::Int = 0x3094;
@@ -43,78 +45,42 @@ struct Slot {
     h: u32,
 }
 
+#[derive(Default)]
 struct GlyphAtlas {
-    data: Vec<u8>,
     map: HashMap<(char, u32), Slot>,
     shelf_x: u32,
     shelf_y: u32,
     shelf_h: u32,
-    reset: bool,
-    pending: Vec<Slot>,
 }
 
 impl GlyphAtlas {
-    fn new() -> Self {
-        Self {
-            data: vec![0; (ATLAS_SIZE * ATLAS_SIZE) as usize],
-            map: HashMap::new(),
-            shelf_x: 0,
-            shelf_y: 0,
-            shelf_h: 0,
-            reset: false,
-            pending: Vec::new(),
-        }
-    }
-
     fn clear(&mut self) {
-        self.data.fill(0);
         self.map.clear();
         self.shelf_x = 0;
         self.shelf_y = 0;
         self.shelf_h = 0;
-        self.pending.clear();
-        self.reset = true;
     }
 
-    fn slot(&mut self, ch: char, px_size: f32, renderer: &mut Renderer) -> Slot {
-        let key = (ch, (px_size * 100.0).round().max(1.0) as u32);
-        if let Some(slot) = self.map.get(&key) {
-            return *slot;
-        }
-        let (metrics, bitmap) = renderer.glyph_bitmap(ch, px_size);
-        let w = metrics.width as u32;
-        let h = metrics.height as u32;
-        if w == 0 || h == 0 || w > ATLAS_SIZE || h > ATLAS_SIZE {
-            let slot = Slot::default();
-            self.map.insert(key, slot);
-            return slot;
-        }
-        if self.shelf_x + w + 1 > ATLAS_SIZE {
-            self.shelf_x = 0;
-            self.shelf_y += self.shelf_h + 1;
-            self.shelf_h = 0;
-        }
-        if self.shelf_y + h + 1 > ATLAS_SIZE {
-            // The atlas is full: recycle it. Vertices are rebuilt every frame,
-            // so no stale UVs survive this reset.
-            self.clear();
-        }
-        let slot = Slot {
-            x: self.shelf_x,
-            y: self.shelf_y,
-            w,
-            h,
+    fn insert(&mut self, key: (char, u32), w: u32, h: u32) -> Option<Slot> {
+        let (x, y, shelf_h) = if self.shelf_x + w > ATLAS_SIZE {
+            (0, self.shelf_y + self.shelf_h, 0)
+        } else {
+            (self.shelf_x, self.shelf_y, self.shelf_h)
         };
-        self.shelf_x += w + 1;
-        self.shelf_h = self.shelf_h.max(h);
-        for row in 0..h {
-            let src = (row * w) as usize;
-            let dst = ((slot.y + row) * ATLAS_SIZE + slot.x) as usize;
-            self.data[dst..dst + w as usize].copy_from_slice(&bitmap[src..src + w as usize]);
+        if w == 0
+            || h == 0
+            || w > ATLAS_SIZE
+            || y + h > ATLAS_SIZE
+            || self.map.len() >= ATLAS_ENTRIES
+        {
+            return None;
         }
+        let slot = Slot { x, y, w, h };
+        self.shelf_x = x + w;
+        self.shelf_y = y;
+        self.shelf_h = shelf_h.max(h);
         self.map.insert(key, slot);
-        self.pending.push(slot);
-        slot
+        Some(slot)
     }
 }
 
@@ -278,7 +244,7 @@ impl GlBackend {
 
         let atlas_texture =
             unsafe { gl.create_texture() }.map_err(|error| format!("glGenTextures: {error}"))?;
-        let atlas = GlyphAtlas::new();
+        let atlas = GlyphAtlas::default();
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(atlas_texture));
             gl.tex_parameter_i32(
@@ -311,7 +277,7 @@ impl GlBackend {
                 0,
                 glow::ALPHA,
                 glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(&atlas.data)),
+                glow::PixelUnpackData::Slice(None),
             );
             gl.enable(glow::BLEND);
             gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
@@ -410,23 +376,31 @@ impl GlBackend {
             .map_err(|error| format!("eglMakeCurrent(None): {error}"))?;
         let _ = self.egl.destroy_surface(self.display, self.surface);
         unsafe { (self.window_api.destroy)(self.window) };
+        self.window = std::ptr::null_mut();
         let window = unsafe { (self.window_api.create)(self.wayland_surface, width, height) };
         if window.is_null() {
             return Err("wl_egl_window_create failed during resize".to_string());
         }
-        let surface = unsafe {
+        let surface = match unsafe {
             self.egl
                 .create_window_surface(self.display, self.config, window, Some(&[egl::NONE]))
+        } {
+            Ok(surface) => surface,
+            Err(error) => {
+                unsafe { (self.window_api.destroy)(window) };
+                return Err(format!("eglCreateWindowSurface during resize: {error}"));
+            }
+        };
+        if let Err(error) = self.egl.make_current(
+            self.display,
+            Some(surface),
+            Some(surface),
+            Some(self.context),
+        ) {
+            let _ = self.egl.destroy_surface(self.display, surface);
+            unsafe { (self.window_api.destroy)(window) };
+            return Err(format!("eglMakeCurrent during resize: {error}"));
         }
-        .map_err(|error| format!("eglCreateWindowSurface during resize: {error}"))?;
-        self.egl
-            .make_current(
-                self.display,
-                Some(surface),
-                Some(surface),
-                Some(self.context),
-            )
-            .map_err(|error| format!("eglMakeCurrent during resize: {error}"))?;
         self.window = window;
         self.surface = surface;
         self.width = width;
@@ -458,7 +432,13 @@ impl GlBackend {
     /// Present one damaged row range. `scene` must contain all cells for the
     /// damaged rows; `damage` is in physical pixels and only used as a hint to
     /// the compositor.
-    pub fn draw(&mut self, scene: &Scene, damage: &[PixelRect], full: bool) -> Result<(), String> {
+    pub fn draw(
+        &mut self,
+        renderer: &mut Renderer,
+        scene: &Scene,
+        damage: &[PixelRect],
+        full: bool,
+    ) -> Result<(), String> {
         self.egl
             .make_current(
                 self.display,
@@ -467,115 +447,35 @@ impl GlBackend {
                 Some(self.context),
             )
             .map_err(|error| format!("eglMakeCurrent: {error}"))?;
-        if self.atlas.reset {
-            self.upload_atlas_full();
-            self.atlas.reset = false;
-        }
-        self.upload_pending();
-        self.build_rects(scene);
-        self.build_glyphs(scene);
 
         unsafe {
             self.gl.viewport(0, 0, self.width, self.height);
         }
 
-        let first = damage.first().copied().unwrap_or(PixelRect {
-            x: 0,
-            y: 0,
-            w: self.width,
-            h: self.height,
-        });
-        if full {
-            unsafe {
+        unsafe {
+            if full {
                 self.gl.disable(glow::SCISSOR_TEST);
-                let [r, g, b, a] = scene.background;
-                self.gl.clear_color(r, g, b, a);
-                self.gl.clear(glow::COLOR_BUFFER_BIT);
-            }
-        } else {
-            let rect = first;
-            unsafe {
+            } else {
+                let rect = damage[0];
                 self.gl.enable(glow::SCISSOR_TEST);
                 self.gl
                     .scissor(rect.x, self.height - rect.y - rect.h, rect.w, rect.h);
-                // A damaged row must not retain stale selection/cursor/text
-                // pixels when cells become blank again.
-                let [r, g, b, a] = scene.background;
-                self.gl.clear_color(r, g, b, a);
-                self.gl.clear(glow::COLOR_BUFFER_BIT);
             }
+            let [r, g, b, a] = scene.background;
+            self.gl.clear_color(r, g, b, a);
+            self.gl.clear(glow::COLOR_BUFFER_BIT);
         }
 
-        unsafe {
-            if !self.rect_vertices.is_empty() {
-                self.gl.use_program(Some(self.rect_program));
-                if let Some(location) = &self.rect_size {
-                    self.gl
-                        .uniform_2_f32(Some(location), self.width as f32, self.height as f32);
-                }
-                self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.rect_vbo));
-                self.gl.buffer_data_u8_slice(
-                    glow::ARRAY_BUFFER,
-                    as_bytes(&self.rect_vertices),
-                    glow::STREAM_DRAW,
-                );
-                self.gl.enable_vertex_attrib_array(self.rect_pos);
-                self.gl
-                    .vertex_attrib_pointer_f32(self.rect_pos, 2, glow::FLOAT, false, 6 * 4, 0);
-                self.gl.enable_vertex_attrib_array(self.rect_color);
-                self.gl.vertex_attrib_pointer_f32(
-                    self.rect_color,
-                    4,
-                    glow::FLOAT,
-                    false,
-                    6 * 4,
-                    2 * 4,
-                );
-                self.gl
-                    .draw_arrays(glow::TRIANGLES, 0, (self.rect_vertices.len() / 6) as i32);
-            }
-
-            if !self.glyph_vertices.is_empty() {
-                self.gl.use_program(Some(self.glyph_program));
-                if let Some(location) = &self.glyph_size {
-                    self.gl
-                        .uniform_2_f32(Some(location), self.width as f32, self.height as f32);
-                }
-                self.gl.active_texture(glow::TEXTURE0);
-                self.gl
-                    .bind_texture(glow::TEXTURE_2D, Some(self.atlas_texture));
-                self.gl
-                    .bind_buffer(glow::ARRAY_BUFFER, Some(self.glyph_vbo));
-                self.gl.buffer_data_u8_slice(
-                    glow::ARRAY_BUFFER,
-                    as_bytes(&self.glyph_vertices),
-                    glow::STREAM_DRAW,
-                );
-                self.gl.enable_vertex_attrib_array(self.glyph_pos);
-                self.gl
-                    .vertex_attrib_pointer_f32(self.glyph_pos, 2, glow::FLOAT, false, 8 * 4, 0);
-                self.gl.enable_vertex_attrib_array(self.glyph_uv);
-                self.gl.vertex_attrib_pointer_f32(
-                    self.glyph_uv,
-                    2,
-                    glow::FLOAT,
-                    false,
-                    8 * 4,
-                    2 * 4,
-                );
-                self.gl.enable_vertex_attrib_array(self.glyph_color);
-                self.gl.vertex_attrib_pointer_f32(
-                    self.glyph_color,
-                    4,
-                    glow::FLOAT,
-                    false,
-                    8 * 4,
-                    4 * 4,
-                );
-                self.gl
-                    .draw_arrays(glow::TRIANGLES, 0, (self.glyph_vertices.len() / 8) as i32);
-            }
-            self.gl.disable(glow::SCISSOR_TEST);
+        self.draw_rects(&scene.rects);
+        let result = self.draw_glyphs(renderer, scene);
+        if result.is_ok() {
+            self.draw_rects(&scene.overlays);
+        }
+        unsafe { self.gl.disable(glow::SCISSOR_TEST) };
+        result?;
+        let error = unsafe { self.gl.get_error() };
+        if error != glow::NO_ERROR {
+            return Err(format!("OpenGL drawing error 0x{error:x}"));
         }
         Ok(())
     }
@@ -683,60 +583,13 @@ impl GlBackend {
         self.dump_done = true;
     }
 
-    fn upload_atlas_full(&self) {
-        unsafe {
-            self.gl
-                .bind_texture(glow::TEXTURE_2D, Some(self.atlas_texture));
-            self.gl.tex_sub_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                0,
-                0,
-                ATLAS_SIZE as i32,
-                ATLAS_SIZE as i32,
-                glow::ALPHA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(&self.atlas.data)),
-            );
-        }
-    }
-
-    fn upload_pending(&mut self) {
-        if self.atlas.pending.is_empty() {
+    fn draw_rects(&mut self, rects: &[SceneRect]) {
+        if rects.is_empty() {
             return;
         }
-        let pending = std::mem::take(&mut self.atlas.pending);
-        unsafe {
-            self.gl
-                .bind_texture(glow::TEXTURE_2D, Some(self.atlas_texture));
-            for slot in pending {
-                if slot.w == 0 || slot.h == 0 {
-                    continue;
-                }
-                let mut pixels = Vec::with_capacity((slot.w * slot.h) as usize);
-                for row in 0..slot.h {
-                    let start = ((slot.y + row) * ATLAS_SIZE + slot.x) as usize;
-                    pixels.extend_from_slice(&self.atlas.data[start..start + slot.w as usize]);
-                }
-                self.gl.tex_sub_image_2d(
-                    glow::TEXTURE_2D,
-                    0,
-                    slot.x as i32,
-                    slot.y as i32,
-                    slot.w as i32,
-                    slot.h as i32,
-                    glow::ALPHA,
-                    glow::UNSIGNED_BYTE,
-                    glow::PixelUnpackData::Slice(Some(&pixels)),
-                );
-            }
-        }
-    }
-
-    fn build_rects(&mut self, scene: &Scene) {
         self.rect_vertices.clear();
-        self.rect_vertices.reserve(scene.rects.len() * 6 * 6);
-        for rect in &scene.rects {
+        self.rect_vertices.reserve(rects.len() * 6 * 6);
+        for rect in rects {
             let x0 = rect.x;
             let y0 = rect.y;
             let x1 = rect.x + rect.w;
@@ -746,42 +599,121 @@ impl GlBackend {
                 self.rect_vertices.extend_from_slice(&[x, y, r, g, b, a]);
             }
         }
+        unsafe {
+            self.gl.use_program(Some(self.rect_program));
+            if let Some(location) = &self.rect_size {
+                self.gl
+                    .uniform_2_f32(Some(location), self.width as f32, self.height as f32);
+            }
+            self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.rect_vbo));
+            self.gl.buffer_data_u8_slice(
+                glow::ARRAY_BUFFER,
+                as_bytes(&self.rect_vertices),
+                glow::STREAM_DRAW,
+            );
+            self.gl.disable_vertex_attrib_array(self.glyph_color);
+            self.gl.enable_vertex_attrib_array(self.rect_pos);
+            self.gl
+                .vertex_attrib_pointer_f32(self.rect_pos, 2, glow::FLOAT, false, 6 * 4, 0);
+            self.gl.enable_vertex_attrib_array(self.rect_color);
+            self.gl
+                .vertex_attrib_pointer_f32(self.rect_color, 4, glow::FLOAT, false, 6 * 4, 2 * 4);
+            self.gl
+                .draw_arrays(glow::TRIANGLES, 0, (self.rect_vertices.len() / 6) as i32);
+        }
     }
 
-    fn build_glyphs(&mut self, scene: &Scene) {
+    fn draw_glyphs(&mut self, renderer: &mut Renderer, scene: &Scene) -> Result<(), String> {
+        if scene.glyphs.is_empty() {
+            return Ok(());
+        }
+        unsafe {
+            self.gl.use_program(Some(self.glyph_program));
+            if let Some(location) = &self.glyph_size {
+                self.gl
+                    .uniform_2_f32(Some(location), self.width as f32, self.height as f32);
+            }
+            self.gl.active_texture(glow::TEXTURE0);
+            self.gl
+                .bind_texture(glow::TEXTURE_2D, Some(self.atlas_texture));
+            self.gl
+                .bind_buffer(glow::ARRAY_BUFFER, Some(self.glyph_vbo));
+            self.gl.enable_vertex_attrib_array(self.glyph_pos);
+            self.gl
+                .vertex_attrib_pointer_f32(self.glyph_pos, 2, glow::FLOAT, false, 8 * 4, 0);
+            self.gl.enable_vertex_attrib_array(self.glyph_uv);
+            self.gl
+                .vertex_attrib_pointer_f32(self.glyph_uv, 2, glow::FLOAT, false, 8 * 4, 2 * 4);
+            self.gl.enable_vertex_attrib_array(self.glyph_color);
+            self.gl.vertex_attrib_pointer_f32(
+                self.glyph_color,
+                4,
+                glow::FLOAT,
+                false,
+                8 * 4,
+                4 * 4,
+            );
+        }
         self.glyph_vertices.clear();
-        self.glyph_vertices.reserve(scene.glyphs.len() * 6 * 8);
+        self.glyph_vertices
+            .reserve(scene.glyphs.len().min(GLYPHS_PER_BATCH) * 6 * 8);
         for glyph in &scene.glyphs {
-            let Some((u0, v0, u1, v1)) = atlas_uv(&mut self.atlas, glyph) else {
-                continue;
+            let key = (glyph.ch, glyph.px_size.to_bits());
+            let slot = match self.atlas.map.get(&key) {
+                Some(&slot) => slot,
+                None => {
+                    let (metrics, bitmap) = renderer.glyph_bitmap(glyph.ch, glyph.px_size);
+                    let (w, h) = (metrics.width as u32, metrics.height as u32);
+                    let slot = if let Some(slot) = self.atlas.insert(key, w, h) {
+                        slot
+                    } else {
+                        // GL executes draws and texture updates in command order.
+                        // Submit the vertices that refer to this page before reusing it.
+                        self.submit_glyphs();
+                        self.atlas.clear();
+                        self.atlas
+                            .insert(key, w, h)
+                            .ok_or("glyph exceeds atlas dimensions")?
+                    };
+                    unsafe {
+                        self.gl.tex_sub_image_2d(
+                            glow::TEXTURE_2D,
+                            0,
+                            slot.x as i32,
+                            slot.y as i32,
+                            slot.w as i32,
+                            slot.h as i32,
+                            glow::ALPHA,
+                            glow::UNSIGNED_BYTE,
+                            glow::PixelUnpackData::Slice(Some(bitmap)),
+                        );
+                    }
+                    slot
+                }
             };
-            let x0 = glyph.x;
-            let y0 = glyph.y;
-            let x1 = glyph.x + glyph.w;
-            let y1 = glyph.y + glyph.h;
-            let [r, g, b, a] = glyph.color;
-            let corners = [
-                (x0, y0, u0, v0),
-                (x1, y0, u1, v0),
-                (x1, y1, u1, v1),
-                (x0, y0, u0, v0),
-                (x1, y1, u1, v1),
-                (x0, y1, u0, v1),
-            ];
-            for (x, y, u, v) in corners {
-                self.glyph_vertices
-                    .extend_from_slice(&[x, y, u, v, r, g, b, a]);
+            append_glyph(&mut self.glyph_vertices, glyph, slot);
+            if self.glyph_vertices.len() == GLYPHS_PER_BATCH * 6 * 8 {
+                self.submit_glyphs();
             }
         }
+        self.submit_glyphs();
+        Ok(())
     }
 
-    /// Resolve atlas slots for a scene before building vertex data. Kept
-    /// separate from `build_glyphs` so the atlas can borrow the renderer.
-    pub fn prepare_scene(&mut self, renderer: &mut Renderer, scene: &Scene) {
-        for glyph in &scene.glyphs {
-            self.atlas.slot(glyph.ch, glyph.px_size, renderer);
+    fn submit_glyphs(&mut self) {
+        if self.glyph_vertices.is_empty() {
+            return;
         }
-        // `build_glyphs` runs after this and only reads the finished slots.
+        unsafe {
+            self.gl.buffer_data_u8_slice(
+                glow::ARRAY_BUFFER,
+                as_bytes(&self.glyph_vertices),
+                glow::STREAM_DRAW,
+            );
+            self.gl
+                .draw_arrays(glow::TRIANGLES, 0, (self.glyph_vertices.len() / 8) as i32);
+        }
+        self.glyph_vertices.clear();
     }
 }
 
@@ -789,33 +721,40 @@ impl Drop for GlBackend {
     fn drop(&mut self) {
         unsafe {
             let _ = self.egl.make_current(self.display, None, None, None);
-            self.gl.delete_program(self.rect_program);
-            self.gl.delete_program(self.glyph_program);
-            self.gl.delete_buffer(self.rect_vbo);
-            self.gl.delete_buffer(self.glyph_vbo);
-            self.gl.delete_texture(self.atlas_texture);
-            let _ = self.egl.destroy_surface(self.display, self.surface);
+            if !self.window.is_null() {
+                let _ = self.egl.destroy_surface(self.display, self.surface);
+                (self.window_api.destroy)(self.window);
+            }
+            // Destroying the context also frees its GL objects.
             let _ = self.egl.destroy_context(self.display, self.context);
-            (self.window_api.destroy)(self.window);
             let _ = self.egl.terminate(self.display);
         }
     }
 }
 
-fn atlas_uv(atlas: &mut GlyphAtlas, glyph: &SceneGlyph) -> Option<(f32, f32, f32, f32)> {
-    let key = (glyph.ch, (glyph.px_size * 100.0).round().max(1.0) as u32);
-    let slot = *atlas.map.get(&key)?;
-    if slot.w == 0 || slot.h == 0 {
-        return None;
-    }
-    let [u0, v0, u1, v1] = glyph.uv;
+fn append_glyph(vertices: &mut Vec<f32>, glyph: &SceneGlyph, slot: Slot) {
+    let (sx, sy) = glyph.source;
+    debug_assert!(sx + glyph.w <= slot.w as usize && sy + glyph.h <= slot.h as usize);
     let inv = 1.0 / ATLAS_SIZE as f32;
-    Some((
-        (slot.x as f32 + u0 * slot.w as f32) * inv,
-        (slot.y as f32 + v0 * slot.h as f32) * inv,
-        (slot.x as f32 + u1 * slot.w as f32) * inv,
-        (slot.y as f32 + v1 * slot.h as f32) * inv,
-    ))
+    let u0 = (slot.x as usize + sx) as f32 * inv;
+    let v0 = (slot.y as usize + sy) as f32 * inv;
+    let u1 = u0 + glyph.w as f32 * inv;
+    let v1 = v0 + glyph.h as f32 * inv;
+    let x0 = glyph.x as f32;
+    let y0 = glyph.y as f32;
+    let x1 = (glyph.x + glyph.w) as f32;
+    let y1 = (glyph.y + glyph.h) as f32;
+    let [r, g, b, a] = glyph.color;
+    for (x, y, u, v) in [
+        (x0, y0, u0, v0),
+        (x1, y0, u1, v0),
+        (x1, y1, u1, v1),
+        (x0, y0, u0, v0),
+        (x1, y1, u1, v1),
+        (x0, y1, u0, v1),
+    ] {
+        vertices.extend_from_slice(&[x, y, u, v, r, g, b, a]);
+    }
 }
 
 fn as_bytes(values: &[f32]) -> &[u8] {
@@ -903,7 +842,11 @@ attribute vec2 a_pos;
 attribute vec2 a_uv;
 attribute vec4 a_color;
 uniform vec2 u_size;
-varying vec2 v_uv;
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+varying highp vec2 v_uv;
+#else
+varying mediump vec2 v_uv;
+#endif
 varying vec4 v_color;
 void main() {
     vec2 p = a_pos / u_size * 2.0 - 1.0;
@@ -915,7 +858,11 @@ void main() {
     const FRAGMENT: &str = r#"
 precision mediump float;
 uniform sampler2D u_atlas;
-varying vec2 v_uv;
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+varying highp vec2 v_uv;
+#else
+varying mediump vec2 v_uv;
+#endif
 varying vec4 v_color;
 void main() {
     float alpha = texture2D(u_atlas, v_uv).a;

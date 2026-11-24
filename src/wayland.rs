@@ -7,7 +7,7 @@ use std::error::Error;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::FileExt;
+use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -61,11 +61,12 @@ struct KeyPress {
     text: String,
 }
 
-fn metrics(geometry: render::Geometry) -> Metrics {
+fn metrics(geometry: render::Geometry, sizes: SurfaceSizes) -> Metrics {
     Metrics {
         cell_width: geometry.cell_width,
         cell_height: geometry.cell_height,
         padding: geometry.padding,
+        logical_per_pixel: sizes.logical_per_pixel(),
     }
 }
 
@@ -195,12 +196,39 @@ fn wheel_rows(remainder: f64, steps: f64, speed: usize) -> (isize, f64) {
     (total as isize, total.fract())
 }
 
+// Two compositor buffers, mapped directly for painting. Bound both the
+// allocation size and the total number of buffers across resize generations.
+const MAX_SHM_BUFFERS: usize = 2;
+const MAX_SHM_BUFFER_BYTES: i32 = 256 * 1024 * 1024;
+
+fn shm_layout((width, height): (i32, i32)) -> Option<(i32, i32)> {
+    let stride = width.checked_mul(4)?;
+    let size = stride.checked_mul(height)?;
+    (width > 0 && height > 0 && size <= MAX_SHM_BUFFER_BYTES).then_some((stride, size))
+}
+
 struct FrameBuffer {
     buffer: wl_buffer::WlBuffer,
-    file: File,
+    mapping: NonNull<u8>,
+    len: usize,
     busy: bool,
     id: u64,
     generation: u64,
+}
+
+impl FrameBuffer {
+    fn pixels(&mut self) -> &mut [u8] {
+        // Only a released or newly allocated buffer may be written.
+        assert!(!self.busy);
+        unsafe { std::slice::from_raw_parts_mut(self.mapping.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for FrameBuffer {
+    fn drop(&mut self) {
+        self.buffer.destroy();
+        unsafe { libc::munmap(self.mapping.as_ptr().cast(), self.len) };
+    }
 }
 
 #[derive(Default)]
@@ -250,14 +278,14 @@ struct State {
     configured: bool,
     dirty: bool,
     frame_pending: bool,
-    pixels: Vec<u8>,
     terminal: Option<Terminal>,
     editor: Option<BEdit>,
     standalone_editor: bool,
     renderer: Option<render::Renderer>,
     backend: ActiveBackend,
     gl: Option<GlBackend>,
-    scale: f32,
+    scale: Scale,
+    pending_scale: Option<Scale>,
     damage_full: bool,
     damage_hashes: Vec<u64>,
     damage_signature: Option<TerminalSignature>,
@@ -296,7 +324,6 @@ fn run_with(editor: Option<BEdit>) -> Result<(), Box<dyn Error>> {
         blink_on: true,
         width: WIDTH,
         height: HEIGHT,
-        scale: 1.0,
         dump_deadline: crate::compat::env("BEYRIX_GL_DUMP")
             .map(|_| std::time::Instant::now() + Duration::from_millis(3000)),
         debug_input: crate::compat::env("BEYRIX_DEBUG_INPUT").as_deref()
@@ -382,12 +409,15 @@ fn run_with(editor: Option<BEdit>) -> Result<(), Box<dyn Error>> {
             state.dirty = true;
         }
         state.pump_clipboard();
-        state.update_drag(true);
-        if let Some((width, height)) = state.pending_size.take() {
+        let size = state.pending_size.take();
+        let scale = state.pending_scale.take();
+        if size.is_some() || scale.is_some() {
+            let logical = size.unwrap_or((state.width, state.height));
             state
-                .resize(width, height, &qh)
+                .resize(logical, scale.unwrap_or(state.scale))
                 .map_err(|e| format!("resize window: {e}"))?;
         }
+        state.update_drag(true);
         state
             .redraw(&qh)
             .map_err(|e| format!("update shared buffer: {e}"))?;
@@ -667,34 +697,82 @@ fn terminal_damage(
     damage
 }
 
-fn physical_size(logical: (i32, i32), scale: f32) -> (i32, i32) {
-    (
-        (logical.0 as f32 * scale).round().max(1.0) as i32,
-        (logical.1 as f32 * scale).round().max(1.0) as i32,
-    )
+/// Wayland fractional scale is expressed in units of 1/120.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Scale(u32);
+
+impl Default for Scale {
+    fn default() -> Self {
+        Self(120)
+    }
 }
 
-/// Sizes for one surface commit. `logical` is the size the compositor assigned
-/// to the xdg surface; `physical` is the backing buffer size in pixels. The
-/// viewport destination must always be logical, even when the buffer is scaled
-/// for fractional output scaling.
+impl Scale {
+    fn factor(self) -> f32 {
+        self.0 as f32 / 120.0
+    }
+
+    fn physical(self, logical: i32) -> i32 {
+        // Round positive dimensions to the nearest pixel, with exact ties up.
+        ((i64::from(logical) * i64::from(self.0) + 60) / 120).clamp(1, i64::from(i32::MAX)) as i32
+    }
+}
+
+/// Sizes for one surface commit. The viewport destination is surface-local;
+/// both backends draw into a buffer sized in physical pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SurfaceSizes {
     logical: (i32, i32),
     physical: (i32, i32),
+    scale: Scale,
 }
 
 impl SurfaceSizes {
-    fn new(logical: (i32, i32), scale: f32) -> Self {
+    fn new(logical: (i32, i32), scale: Scale) -> Self {
         let logical = (logical.0.max(1), logical.1.max(1));
         Self {
             logical,
-            physical: physical_size(logical, scale),
+            physical: (scale.physical(logical.0), scale.physical(logical.1)),
+            scale,
         }
     }
 
-    fn viewport_destination(self) -> (i32, i32) {
-        self.logical
+    fn buffer_scale(self, viewport: bool) -> i32 {
+        if viewport {
+            1
+        } else {
+            (self.scale.0 / 120) as i32
+        }
+    }
+
+    fn buffer_dimensions(self) -> (usize, usize) {
+        (self.physical.0 as usize, self.physical.1 as usize)
+    }
+
+    fn logical_per_pixel(self) -> (f64, f64) {
+        (
+            f64::from(self.logical.0) / f64::from(self.physical.0),
+            f64::from(self.logical.1) / f64::from(self.physical.1),
+        )
+    }
+
+    fn physical_point(self, (x, y): (f64, f64)) -> (f64, f64) {
+        let (lx, ly) = self.logical_per_pixel();
+        (x / lx, y / ly)
+    }
+
+    fn geometry(self, renderer: &render::Renderer) -> render::Geometry {
+        let (width, height) = self.buffer_dimensions();
+        renderer
+            .geometry(self.scale.factor())
+            .for_window(width, height)
+    }
+
+    fn grid_size(self, renderer: &render::Renderer) -> (usize, usize) {
+        let (width, height) = self.buffer_dimensions();
+        renderer
+            .geometry(self.scale.factor())
+            .grid_size(width, height)
     }
 }
 
@@ -711,16 +789,12 @@ fn resolve_toplevel_configure(previous: (i32, i32), width: i32, height: i32) -> 
 
 fn row_pixel_rect(
     geometry: render::Geometry,
-    logical: (usize, usize),
-    scale: f32,
     physical: (i32, i32),
     range: (usize, usize),
 ) -> PixelRect {
-    let base = geometry.for_window(logical.0.max(1), logical.1.max(1));
-    let cell_h = base.cell_height as f32 * scale;
-    let padding = base.padding as f32 * scale;
-    let top = (padding + range.0 as f32 * cell_h).floor() as i32;
-    let bottom = ((padding + range.1 as f32 * cell_h).ceil() as i32).min(physical.1);
+    let edge = |row| (geometry.padding + row * geometry.cell_height) as i32;
+    let top = edge(range.0);
+    let bottom = edge(range.1).min(physical.1 - geometry.padding as i32);
     PixelRect {
         x: 0,
         y: top.max(0),
@@ -763,16 +837,11 @@ impl State {
         }
         if let Some(viewporter) = &self.viewporter {
             let viewport = viewporter.get_viewport(&surface, qh, ());
-            let destination = SurfaceSizes::new((WIDTH, HEIGHT), self.scale).viewport_destination();
-            viewport.set_destination(destination.0, destination.1);
             self.viewport = Some(viewport);
-            if surface.version() >= 3 {
-                surface.set_buffer_scale(1);
-            }
         }
         let renderer =
             render::Renderer::with_theme(theme.clone()).map_err(|e| format!("load fonts: {e}"))?;
-        let (columns, rows) = renderer.geometry.grid_size(WIDTH as usize, HEIGHT as usize);
+        let (columns, rows) = self.surface_sizes().grid_size(&renderer);
         let requested = theme.renderer;
         let mut gl = None;
         let reason;
@@ -826,9 +895,6 @@ impl State {
             control.set_prompt(&theme)?;
         }
         let terminal = Terminal::with_theme(columns, rows, theme);
-        if self.backend == ActiveBackend::Software {
-            self.create_buffers(WIDTH, HEIGHT, qh)?;
-        }
         self.damage_full = true;
 
         // Начальный commit без буфера:
@@ -863,83 +929,25 @@ impl State {
         Ok(())
     }
 
-    fn set_fractional_scale(&mut self, scale: u32, qh: &QueueHandle<Self>) {
-        let scale = (scale as f32 / 120.0).clamp(0.5, 4.0);
-        self.apply_scale(scale, qh);
+    fn surface_sizes(&self) -> SurfaceSizes {
+        SurfaceSizes::new((self.width, self.height), self.scale)
     }
 
-    fn set_preferred_scale(&mut self, factor: i32, qh: &QueueHandle<Self>) {
-        if self.fractional_scale.is_some() {
-            return;
-        }
-        let factor = factor.clamp(1, 4) as f32;
-        self.apply_scale(factor, qh);
+    fn pointer_geometry(&self) -> Option<render::Geometry> {
+        let renderer = self.renderer.as_ref()?;
+        Some(self.surface_sizes().geometry(renderer))
     }
 
-    fn set_viewport_destination(&self, logical: (i32, i32)) {
+    fn map_surface_buffer(&self, surface: &wl_surface::WlSurface, sizes: SurfaceSizes) {
         if let Some(viewport) = &self.viewport {
-            // The destination is surface-local (logical) size. The backing
-            // buffer may be larger for fractional scaling; it must never
-            // become the viewport destination or the compositor will scale the
-            // window back to the size used at startup.
-            let destination = SurfaceSizes::new(logical, self.scale).viewport_destination();
-            viewport.set_destination(destination.0, destination.1);
+            viewport.set_destination(sizes.logical.0, sizes.logical.1);
+        }
+        if surface.version() >= 3 {
+            surface.set_buffer_scale(sizes.buffer_scale(self.viewport.is_some()));
         }
     }
 
-    fn apply_scale(&mut self, scale: f32, qh: &QueueHandle<Self>) {
-        if !scale.is_finite() || (scale - self.scale).abs() < 0.001 {
-            return;
-        }
-        self.scale = scale;
-        if let Some(surface) = &self.surface
-            && surface.version() >= 3
-        {
-            if self.viewport.is_some() {
-                // With wp_viewport the buffer is scaled into the logical
-                // destination, so the surface itself keeps buffer scale 1.
-                surface.set_buffer_scale(1);
-            } else if self.gl.is_some() {
-                surface.set_buffer_scale(scale.round().clamp(1.0, 4.0) as i32);
-            }
-        }
-        self.set_viewport_destination((self.width, self.height));
-        if self.gl.is_some() {
-            let sizes = SurfaceSizes::new((self.width, self.height), scale);
-            let result = self
-                .gl
-                .as_mut()
-                .map(|gl| gl.resize(sizes.physical.0, sizes.physical.1));
-            if let Some(Err(error)) = result {
-                eprintln!("beyrix: OpenGL resize failed ({error}); using software");
-                self.gl = None;
-                self.backend = ActiveBackend::Software;
-                if let Err(error) = self.ensure_software_buffers(qh) {
-                    eprintln!("beyrix: cannot create software buffers: {error}");
-                    self.running = false;
-                }
-            }
-        }
-        self.damage_full = true;
-        self.dirty = true;
-    }
-
-    fn ensure_software_buffers(&mut self, qh: &QueueHandle<Self>) -> Result<(), Box<dyn Error>> {
-        if self
-            .buffers
-            .iter()
-            .any(|buffer| buffer.generation == self.generation)
-        {
-            return Ok(());
-        }
-        self.create_buffers(self.width, self.height, qh)
-    }
-
-    fn fallback_to_software(
-        &mut self,
-        reason: String,
-        qh: &QueueHandle<Self>,
-    ) -> Result<(), Box<dyn Error>> {
+    fn fallback_to_software(&mut self, reason: String) {
         eprintln!("beyrix: OpenGL backend disabled ({reason}); using software");
         self.gl = None;
         self.backend = ActiveBackend::Software;
@@ -948,9 +956,7 @@ impl State {
         self.damage_signature = None;
         self.damage_history.clear();
         self.frame_pending = false;
-        self.ensure_software_buffers(qh)?;
         self.dirty = true;
-        Ok(())
     }
 
     fn open_editor(&mut self, request: OpenRequest) {
@@ -991,15 +997,14 @@ impl State {
 
     fn apply_theme(&mut self, name: &str) -> Result<(), Box<dyn Error>> {
         let theme = crate::theme::Theme::load_for(name)?;
+        let sizes = self.surface_sizes();
         let renderer = self.renderer.as_mut().ok_or("renderer unavailable")?;
         renderer.retheme(theme.clone())?;
+        let (cols, rows) = sizes.grid_size(renderer);
         if let Some(gl) = &mut self.gl {
             gl.invalidate_atlas();
         }
         self.damage_full = true;
-        let (cols, rows) = renderer
-            .geometry
-            .grid_size(self.width as usize, self.height as usize);
         if let Some(pty) = &self.pty {
             pty.resize(cols as u16, rows as u16)?;
         }
@@ -1010,99 +1015,102 @@ impl State {
             terminal.apply_theme(theme);
             terminal.resize(cols, rows);
         }
+        if let Some(editor) = &mut self.editor {
+            editor.follow_cursor();
+        }
         self.dirty = true;
         Ok(())
     }
 
-    fn create_buffers(
+    fn software_buffer(
         &mut self,
-        width: i32,
-        height: i32,
+        physical: (i32, i32),
         qh: &QueueHandle<Self>,
-    ) -> Result<(), Box<dyn Error>> {
-        let stride = width.checked_mul(4).ok_or("window width too large")?;
-        let size = stride
-            .checked_mul(height)
-            .filter(|s| *s > 0)
-            .ok_or("window dimensions too large")?;
-        let shm = self.shm.as_ref().ok_or("wl_shm unavailable")?;
-        let mut created = Vec::new();
-        for _ in 0..2 {
-            let file = tempfile::tempfile()?;
-            file.set_len(size as u64)?;
-            let pool = shm.create_pool(file.as_fd(), size, qh, ());
-            let id = self.next_buffer_id;
-            self.next_buffer_id += 1;
-            let buffer =
-                pool.create_buffer(0, width, height, stride, wl_shm::Format::Argb8888, qh, id);
-            pool.destroy();
-            created.push(FrameBuffer {
-                buffer,
-                file,
-                busy: false,
-                id,
-                generation: self.generation,
-            });
+    ) -> Result<Option<usize>, Box<dyn Error>> {
+        if let Some(index) = self.buffers.iter().position(|buffer| !buffer.busy) {
+            return Ok(Some(index));
         }
-        self.buffers.extend(created);
-        Ok(())
+        if self.buffers.len() >= MAX_SHM_BUFFERS {
+            return Ok(None);
+        }
+        let (stride, size) = shm_layout(physical).ok_or("software framebuffer too large")?;
+        let shm = self.shm.as_ref().ok_or("wl_shm unavailable")?;
+        let file = tempfile::tempfile()?;
+        file.set_len(size as u64)?;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let Some(mapping) = NonNull::new(ptr.cast()) else {
+            unsafe { libc::munmap(ptr, size as usize) };
+            return Err("null framebuffer mapping".into());
+        };
+        let pool = shm.create_pool(file.as_fd(), size, qh, ());
+        let id = self.next_buffer_id;
+        self.next_buffer_id += 1;
+        let buffer = pool.create_buffer(
+            0,
+            physical.0,
+            physical.1,
+            stride,
+            wl_shm::Format::Argb8888,
+            qh,
+            id,
+        );
+        pool.destroy();
+        let index = self.buffers.len();
+        self.buffers.push(FrameBuffer {
+            buffer,
+            mapping,
+            len: size as usize,
+            busy: false,
+            id,
+            generation: self.generation,
+        });
+        Ok(Some(index))
     }
 
-    fn resize(
-        &mut self,
-        width: i32,
-        height: i32,
-        qh: &QueueHandle<Self>,
-    ) -> Result<(), Box<dyn Error>> {
-        let sizes = SurfaceSizes::new((width, height), self.scale);
-        let (width, height) = sizes.logical;
-        if (width, height) == (self.width, self.height) {
-            // Scale changes and the first configure can keep the same logical
-            // size while the viewport is still on its startup destination.
-            self.set_viewport_destination(sizes.logical);
+    fn resize(&mut self, logical: (i32, i32), scale: Scale) -> Result<(), Box<dyn Error>> {
+        let sizes = SurfaceSizes::new(logical, scale);
+        if sizes == self.surface_sizes() {
             return Ok(());
         }
-        let (columns, rows) = self
-            .renderer
-            .as_ref()
-            .ok_or("renderer unavailable")?
-            .geometry
-            .grid_size(width as usize, height as usize);
-        let mut gl_error = None;
-        if let Some(gl) = &mut self.gl
-            && let Err(error) = gl.resize(sizes.physical.0, sizes.physical.1)
-        {
-            gl_error = Some(error);
-        }
-        if let Some(error) = gl_error {
-            self.fallback_to_software(error, qh)?;
-        }
-        if self.gl.is_none() {
+        let old_physical = self.surface_sizes().physical;
+        let (columns, rows) =
+            sizes.grid_size(self.renderer.as_ref().ok_or("renderer unavailable")?);
+        if sizes.physical != old_physical {
+            if let Some(gl) = &mut self.gl
+                && let Err(error) = gl.resize(sizes.physical.0, sizes.physical.1)
+            {
+                self.fallback_to_software(error);
+            }
             self.generation += 1;
-            self.create_buffers(width, height, qh)?;
+            self.buffers.retain(|frame| frame.busy);
         }
-        self.damage_full = true;
-        if let Some(pty) = &self.pty {
-            pty.resize(columns as u16, rows as u16)
-                .map_err(|e| format!("TIOCSWINSZ: {e}"))?;
-        }
-        if let Some(terminal) = &mut self.terminal {
+        if let Some(terminal) = &mut self.terminal
+            && (terminal.screen().columns, terminal.screen().rows) != (columns, rows)
+        {
+            if let Some(pty) = &self.pty {
+                pty.resize(columns as u16, rows as u16)
+                    .map_err(|e| format!("TIOCSWINSZ: {e}"))?;
+            }
             terminal.resize(columns, rows);
         }
         if let Some(editor) = &mut self.editor {
             editor.follow_cursor();
         }
-        self.width = width;
-        self.height = height;
-        self.set_viewport_destination(sizes.logical);
-        self.buffers.retain(|frame| {
-            if frame.generation != self.generation && !frame.busy {
-                frame.buffer.destroy();
-                false
-            } else {
-                true
-            }
-        });
+        (self.width, self.height) = sizes.logical;
+        self.scale = scale;
+        self.damage_full = true;
         self.dirty = true;
         Ok(())
     }
@@ -1136,18 +1144,10 @@ impl State {
 
     fn mouse_cell(&self) -> Option<(usize, usize)> {
         let terminal = self.terminal.as_ref()?;
-        let renderer = self.renderer.as_ref()?;
+        let geometry = self.pointer_geometry()?;
         let screen = terminal.screen();
-        let geometry = renderer
-            .geometry
-            .for_window(self.width as usize, self.height as usize);
-        let (x, y) = self.pointer_position;
-        let column = ((x - geometry.padding as f64) / geometry.cell_width as f64)
-            .floor()
-            .max(0.0) as usize;
-        let display_row = ((y - geometry.padding as f64) / geometry.cell_height as f64)
-            .floor()
-            .max(0.0) as usize;
+        let (x, y) = self.surface_sizes().physical_point(self.pointer_position);
+        let (column, display_row) = geometry.cell_at(x, y);
         let row = display_row
             .saturating_sub(screen.layout_offset())
             .min(screen.rows.saturating_sub(1));
@@ -1203,12 +1203,10 @@ impl State {
     }
 
     fn pointer_button(&mut self, button: crate::mouse::Button, pressed: bool, time: u32) {
+        let sizes = self.surface_sizes();
+        let (x, y) = sizes.physical_point(self.pointer_position);
         if self.editor.is_some() {
-            let geometry = self.renderer.as_ref().map(|renderer| {
-                renderer
-                    .geometry
-                    .for_window(self.width as usize, self.height as usize)
-            });
+            let geometry = self.pointer_geometry();
             let Some(editor) = &mut self.editor else {
                 return;
             };
@@ -1216,8 +1214,7 @@ impl State {
                 if button == crate::mouse::Button::Left
                     && let Some(geometry) = geometry
                 {
-                    let (x, y) = self.pointer_position;
-                    let metrics = metrics(geometry);
+                    let metrics = metrics(geometry, sizes);
                     if let Some(effect) = editor.mouse_confirmation(x, y, metrics) {
                         match effect {
                             crate::editor::Effect::Close => self.close_editor(),
@@ -1241,19 +1238,13 @@ impl State {
                 return;
             }
             if button == crate::mouse::Button::Left
-                && let (Some(geometry), Some(terminal)) = (
-                    self.renderer.as_ref().map(|renderer| {
-                        renderer
-                            .geometry
-                            .for_window(self.width as usize, self.height as usize)
-                    }),
-                    self.terminal.as_ref(),
-                )
+                && let (Some(geometry), Some(terminal)) =
+                    (self.pointer_geometry(), self.terminal.as_ref())
             {
-                let (x, y) = self.pointer_position;
                 let position = crate::selection::position(geometry, x, y, terminal.screen());
+                let (logical_x, logical_y) = self.pointer_position;
                 self.selection
-                    .press(terminal.screen(), position, time, x, y);
+                    .press(terminal.screen(), position, time, logical_x, logical_y);
                 self.dirty = true;
             }
         } else if let Some(held) = self.mouse_button.take() {
@@ -1290,15 +1281,14 @@ impl State {
         let steps = self.wheel_steps.take().unwrap_or(self.wheel_axis / 10.0);
         self.wheel_axis = 0.0;
         let steps = if steps.is_finite() { steps } else { 0.0 };
+        let sizes = self.surface_sizes();
         if let Some(editor) = &mut self.editor {
             let (rows, remainder) = wheel_rows(self.wheel_remainder, steps, 3);
             self.wheel_remainder = remainder;
             if let Some(renderer) = &self.renderer {
-                let geometry = renderer
-                    .geometry
-                    .for_window(self.width as usize, self.height as usize);
-                let (x, y) = self.pointer_position;
-                self.dirty |= editor.scroll(-rows, x, y, metrics(geometry));
+                let geometry = sizes.geometry(renderer);
+                let (x, y) = sizes.physical_point(self.pointer_position);
+                self.dirty |= editor.scroll(-rows, x, y, metrics(geometry, sizes));
             }
         } else if self.mouse_reporting() {
             // Report whole wheel notches and keep the fractional remainder so
@@ -1324,6 +1314,8 @@ impl State {
     }
 
     fn update_drag(&mut self, tick: bool) {
+        let sizes = self.surface_sizes();
+        let (x, y) = sizes.physical_point(self.pointer_position);
         if self.editor.is_some() {
             let (Some(renderer), Some(editor)) = (&self.renderer, &mut self.editor) else {
                 return;
@@ -1331,11 +1323,8 @@ impl State {
             if !self.pointer_focus {
                 return;
             }
-            let geometry = renderer
-                .geometry
-                .for_window(self.width as usize, self.height as usize);
-            let (x, y) = self.pointer_position;
-            self.dirty |= editor.mouse_drag(x, y, metrics(geometry), tick);
+            let geometry = sizes.geometry(renderer);
+            self.dirty |= editor.mouse_drag(x, y, metrics(geometry, sizes), tick);
             return;
         }
         if !self.selection.is_dragging() || !self.pointer_focus {
@@ -1351,10 +1340,7 @@ impl State {
             self.dirty = true;
             return;
         }
-        let (x, y) = self.pointer_position;
-        let geometry = renderer
-            .geometry
-            .for_window(self.width as usize, self.height as usize);
+        let geometry = sizes.geometry(renderer);
         let top = geometry.padding as f64;
         let bottom = top + (terminal.screen().rows * geometry.cell_height) as f64;
         let (direction, distance) = if y < top {
@@ -1787,7 +1773,7 @@ impl State {
                     }
                 }
                 Err(reason) => {
-                    self.fallback_to_software(reason, qh)?;
+                    self.fallback_to_software(reason);
                     self.redraw_software(qh)?;
                 }
             }
@@ -1797,55 +1783,52 @@ impl State {
     }
 
     fn redraw_software(&mut self, qh: &QueueHandle<Self>) -> Result<(), Box<dyn Error>> {
-        self.ensure_software_buffers(qh)?;
-        let Some(index) = self
-            .buffers
-            .iter()
-            .position(|buffer| !buffer.busy && buffer.generation == self.generation)
-        else {
+        let sizes = self.surface_sizes();
+        let Some(index) = self.software_buffer(sizes.physical, qh)? else {
             return Ok(());
         };
+        if let Some(surface) = &self.surface {
+            self.map_surface_buffer(surface, sizes);
+        }
         if let (Some(surface), Some(terminal), Some(renderer)) =
             (&self.surface, &self.terminal, &mut self.renderer)
         {
             let frame = &mut self.buffers[index];
-            match &mut self.editor {
+            let dimensions = sizes.buffer_dimensions();
+            let scene = match &mut self.editor {
                 Some(editor) => {
-                    let (columns, rows) = renderer
-                        .geometry
-                        .grid_size(self.width as usize, self.height as usize);
+                    let (columns, rows) = sizes.grid_size(renderer);
                     let view = editor.view(columns, rows);
-                    renderer.render_editor_into(
+                    renderer.build_editor_scene(
                         &view,
-                        (self.width as usize, self.height as usize),
+                        dimensions,
                         self.keyboard_focus,
                         self.blink_on,
-                        &mut self.pixels,
-                    );
+                        sizes.scale.factor(),
+                    )
                 }
-                None => renderer.render_into(
+                None => renderer.build_terminal_scene(
                     terminal.screen(),
-                    (self.width as usize, self.height as usize),
+                    dimensions,
                     &self.selection,
                     self.keyboard_focus,
                     self.blink_on,
-                    &mut self.pixels,
+                    sizes.scale.factor(),
+                    None,
                 ),
-            }
-            frame.file.write_all_at(&self.pixels, 0)?;
+            };
+            renderer.paint_scene(&scene, dimensions.0, frame.pixels());
             surface.attach(Some(&frame.buffer), 0, 0);
-            surface.damage_buffer(0, 0, self.width, self.height);
+            if surface.version() >= 4 {
+                surface.damage_buffer(0, 0, sizes.physical.0, sizes.physical.1);
+            } else {
+                surface.damage(0, 0, sizes.logical.0, sizes.logical.1);
+            }
             surface.frame(qh, ());
             surface.commit();
             self.frame_pending = true;
             frame.busy = true;
             self.dirty = false;
-            if self.debug_input {
-                eprintln!(
-                    "[output] framebuffer {index} wrote {} bytes and committed",
-                    self.pixels.len()
-                );
-            }
         }
         Ok(())
     }
@@ -1856,15 +1839,13 @@ impl State {
         damage: &RowDamage,
         qh: &QueueHandle<Self>,
     ) -> Result<(), String> {
-        let sizes = SurfaceSizes::new((self.width, self.height), self.scale);
-        let logical = (sizes.logical.0 as usize, sizes.logical.1 as usize);
-        let scale = self.scale;
+        let sizes = self.surface_sizes();
+        let dimensions = sizes.buffer_dimensions();
+        let scale = sizes.scale.factor();
         let physical = sizes.physical;
-        let geometry = self
-            .renderer
-            .as_ref()
-            .ok_or("renderer unavailable")?
-            .geometry;
+        let renderer = self.renderer.as_ref().ok_or("renderer unavailable")?;
+        let geometry = sizes.geometry(renderer);
+        let grid = sizes.grid_size(renderer);
         let rects: Vec<PixelRect> = if full {
             vec![PixelRect {
                 x: 0,
@@ -1876,26 +1857,25 @@ impl State {
             damage
                 .ranges
                 .iter()
-                .map(|range| row_pixel_rect(geometry, logical, scale, physical, *range))
-                .filter(|rect| rect.h > 0 && rect.w > 0)
+                .map(|range| row_pixel_rect(geometry, physical, *range))
                 .collect()
         };
         if rects.is_empty() {
             return Ok(());
         }
         if let Some(surface) = &self.surface {
-            surface.frame(qh, ());
+            self.map_surface_buffer(surface, sizes);
         }
         let renderer = self.renderer.as_mut().ok_or("renderer unavailable")?;
         let gl = self.gl.as_mut().ok_or("OpenGL backend unavailable")?;
         if full {
             let scene = match &mut self.editor {
                 Some(editor) => {
-                    let (columns, rows) = geometry.grid_size(logical.0, logical.1);
+                    let (columns, rows) = grid;
                     let view = editor.view(columns, rows);
                     renderer.build_editor_scene(
                         &view,
-                        logical,
+                        dimensions,
                         self.keyboard_focus,
                         self.blink_on,
                         scale,
@@ -1905,7 +1885,7 @@ impl State {
                     let terminal = self.terminal.as_ref().ok_or("terminal unavailable")?;
                     renderer.build_terminal_scene(
                         terminal.screen(),
-                        logical,
+                        dimensions,
                         &self.selection,
                         self.keyboard_focus,
                         self.blink_on,
@@ -1914,17 +1894,19 @@ impl State {
                     )
                 }
             };
-            gl.prepare_scene(renderer, &scene);
-            gl.draw(&scene, &rects, true)?;
+            gl.draw(renderer, &scene, &rects, true)?;
         } else {
             for (rect, range) in rects.iter().zip(damage.ranges.iter()) {
+                if rect.h == 0 {
+                    continue;
+                }
                 let scene = match &mut self.editor {
                     Some(editor) => {
-                        let (columns, rows) = geometry.grid_size(logical.0, logical.1);
+                        let (columns, rows) = grid;
                         let view = editor.view(columns, rows);
                         renderer.build_editor_scene(
                             &view,
-                            logical,
+                            dimensions,
                             self.keyboard_focus,
                             self.blink_on,
                             scale,
@@ -1934,7 +1916,7 @@ impl State {
                         let terminal = self.terminal.as_ref().ok_or("terminal unavailable")?;
                         renderer.build_terminal_scene(
                             terminal.screen(),
-                            logical,
+                            dimensions,
                             &self.selection,
                             self.keyboard_focus,
                             self.blink_on,
@@ -1943,9 +1925,11 @@ impl State {
                         )
                     }
                 };
-                gl.prepare_scene(renderer, &scene);
-                gl.draw(&scene, &[*rect], false)?;
+                gl.draw(renderer, &scene, &[*rect], false)?;
             }
+        }
+        if let Some(surface) = &self.surface {
+            surface.frame(qh, ());
         }
         gl.present(&rects, full)
     }
@@ -2151,10 +2135,12 @@ impl Dispatch<wl_surface::WlSurface, ()> for State {
         event: wl_surface::Event,
         _: &(),
         _: &Connection,
-        qh: &QueueHandle<Self>,
+        _: &QueueHandle<Self>,
     ) {
-        if let wl_surface::Event::PreferredBufferScale { factor } = event {
-            state.set_preferred_scale(factor, qh);
+        if let wl_surface::Event::PreferredBufferScale { factor } = event
+            && state.fractional_scale.is_none()
+        {
+            state.pending_scale = Some(Scale(factor.clamp(1, 4) as u32 * 120));
         }
     }
 }
@@ -2165,10 +2151,10 @@ impl Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for State {
         event: wp_fractional_scale_v1::Event,
         _: &(),
         _: &Connection,
-        qh: &QueueHandle<Self>,
+        _: &QueueHandle<Self>,
     ) {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
-            state.set_fractional_scale(scale, qh);
+            state.pending_scale = Some(Scale(scale.clamp(60, 480)));
         }
     }
 }
@@ -2189,8 +2175,7 @@ impl Dispatch<wl_buffer::WlBuffer, u64> for State {
         if let wl_buffer::Event::Release = event {
             if let Some(index) = state.buffers.iter().position(|frame| frame.id == *id) {
                 if state.buffers[index].generation != state.generation {
-                    let frame = state.buffers.remove(index);
-                    frame.buffer.destroy();
+                    state.buffers.remove(index);
                 } else {
                     state.buffers[index].busy = false;
                 }
@@ -2559,18 +2544,16 @@ mod input_tests {
 
     #[test]
     fn surface_sizes_keep_logical_dimensions_out_of_the_buffer() {
-        let sizes = SurfaceSizes::new((1528, 812), 1.25);
-        assert_eq!(sizes.viewport_destination(), (1528, 812));
+        let sizes = SurfaceSizes::new((1528, 812), Scale(150));
+        assert_eq!(sizes.logical, (1528, 812));
         assert_eq!(sizes.physical, (1910, 1015));
         assert_ne!(
-            sizes.viewport_destination(),
-            sizes.physical,
+            sizes.logical, sizes.physical,
             "the viewport destination must stay in surface-local coordinates"
         );
 
-        let minimum = SurfaceSizes::new((0, 0), 2.0);
+        let minimum = SurfaceSizes::new((0, 0), Scale(240));
         assert_eq!(minimum.logical, (1, 1));
-        assert_eq!(minimum.viewport_destination(), (1, 1));
         assert_eq!(minimum.physical, (2, 2));
     }
 
@@ -2583,8 +2566,8 @@ mod input_tests {
             ((1528, 812), (1910, 1015)),
             ((800, 500), (1000, 625)),
         ] {
-            let sizes = SurfaceSizes::new(logical, 1.25);
-            assert_eq!(sizes.viewport_destination(), logical);
+            let sizes = SurfaceSizes::new(logical, Scale(150));
+            assert_eq!(sizes.logical, logical);
             assert_eq!(sizes.physical, physical);
         }
     }
@@ -2751,12 +2734,7 @@ mod input_tests {
             height: 240,
             ..Default::default()
         };
-        let geometry = state
-            .renderer
-            .as_ref()
-            .unwrap()
-            .geometry
-            .for_window(state.width as usize, state.height as usize);
+        let geometry = state.pointer_geometry().unwrap();
         state.pointer_position = (
             geometry.padding as f64 + geometry.cell_width as f64 * 2.0 + 1.0,
             geometry.padding as f64 + geometry.cell_height as f64 * 3.0 + 1.0,
@@ -2814,11 +2792,15 @@ mod input_tests {
             terminal: Some(terminal),
             renderer: Some(render::Renderer::new().unwrap()),
             pointer_focus: true,
-            pointer_position: (22.0, -10.0),
             width: 104,
             height: 60,
             ..Default::default()
         };
+        let geometry = state.pointer_geometry().unwrap();
+        state.pointer_position = (
+            (geometry.padding + geometry.cell_width) as f64,
+            geometry.padding as f64 - geometry.cell_height as f64 - 1.0,
+        );
         let terminal = state.terminal.as_mut().unwrap();
         let row = terminal.screen().visible_start() + 1;
         state.selection.press(

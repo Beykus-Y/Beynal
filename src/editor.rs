@@ -119,11 +119,12 @@ impl Stamp {
 }
 
 /// Pixel metrics needed to map pointer coordinates onto text positions.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Metrics {
     pub cell_width: usize,
     pub cell_height: usize,
     pub padding: usize,
+    pub logical_per_pixel: (f64, f64),
 }
 
 pub struct Document {
@@ -855,6 +856,8 @@ impl Document {
         let Some(position) = self.position_at(x, y, metrics) else {
             return false;
         };
+        let (logical_x, logical_y) = metrics.logical_per_pixel;
+        let (x, y) = (x * logical_x, y * logical_y);
         let double_click = self.last_click.is_some_and(|(previous, row, px, py)| {
             time.abs_diff(previous) <= 400
                 && row == position.row
@@ -1740,6 +1743,7 @@ mod tests {
             cell_width: 10,
             cell_height: 20,
             padding: 10,
+            logical_per_pixel: (1.0, 1.0),
         };
         editor.view(40, 10);
         let gutter = editor.gutter_cells();
@@ -1759,6 +1763,7 @@ mod tests {
             cell_width: 10,
             cell_height: 20,
             padding: 10,
+            logical_per_pixel: (1.0, 1.0),
         };
         editor.view(60, 10);
         let gutter = editor.gutter_cells();

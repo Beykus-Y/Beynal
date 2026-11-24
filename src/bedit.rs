@@ -1889,6 +1889,7 @@ mod tests {
             cell_width: 10,
             cell_height: 18,
             padding: 12,
+            logical_per_pixel: (1.0, 1.0),
         };
         let click = |editor: &mut BEdit, hit: Hit| {
             let region = editor.hits.iter().find(|region| region.hit == hit).unwrap();

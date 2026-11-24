@@ -11,12 +11,7 @@ pub struct Position {
 }
 
 pub fn position(geometry: Geometry, x: f64, y: f64, screen: &Screen) -> Position {
-    let col = ((x - geometry.padding as f64) / geometry.cell_width as f64)
-        .floor()
-        .max(0.0) as usize;
-    let row = ((y - geometry.padding as f64) / geometry.cell_height as f64)
-        .floor()
-        .max(0.0) as usize;
+    let (col, row) = geometry.cell_at(x, y);
     Position {
         row: screen.display_row_or_visible(row.min(screen.rows.saturating_sub(1))),
         col: col.min(screen.columns.saturating_sub(1)),
@@ -249,9 +244,16 @@ mod tests {
         let mut t = Terminal::with_theme(6, 3, theme.clone());
         t.process(b"abc");
         assert_eq!(t.screen().display_row(2), Some(0));
-        let g = Geometry::from_theme(&theme);
+        let g = crate::render::Renderer::with_theme(theme)
+            .unwrap()
+            .geometry(1.0);
         assert_eq!(
-            position(g, 22.0, 53.0, t.screen()),
+            position(
+                g,
+                (g.padding + g.cell_width) as f64,
+                (g.padding + 2 * g.cell_height) as f64,
+                t.screen()
+            ),
             Position { row: 0, col: 1 }
         );
         let mut s = Selection::default();
@@ -338,9 +340,14 @@ mod tests {
     #[test]
     fn coordinates_and_reverse_multiline() {
         let t = Terminal::new(5, 3);
-        let g = Geometry::from_theme(&crate::theme::Theme::default());
+        let g = crate::render::Renderer::new().unwrap().geometry(1.0);
         assert_eq!(
-            position(g, 22.0, 30.0, t.screen()),
+            position(
+                g,
+                (g.padding + g.cell_width) as f64,
+                (g.padding + g.cell_height) as f64,
+                t.screen()
+            ),
             Position { row: 1, col: 1 }
         );
         assert_eq!(
