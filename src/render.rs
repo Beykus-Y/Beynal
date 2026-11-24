@@ -246,13 +246,23 @@ impl Renderer {
             .find(|font| font.lookup_glyph_index(ch) != 0)
     }
 
+    fn raster_source(&self, ch: char) -> (&Font, char) {
+        if let Some(font) = self.font_for(ch) {
+            (font, ch)
+        } else {
+            // Some faces give the missing-glyph slot an empty outline.
+            // Use an explicit replacement while keeping the original cell span.
+            let replacement = '\u{fffd}';
+            self.font_for(replacement)
+                .map_or((&self.fonts[0], '?'), |font| (font, replacement))
+        }
+    }
+
     pub fn glyph_bitmap(&mut self, ch: char, px_size: f32) -> &(Metrics, Vec<u8>) {
         let key = (ch, px_size.to_bits());
         if !self.cache.contains_key(&key) {
-            let glyph = self
-                .font_for(ch)
-                .unwrap_or(&self.fonts[0])
-                .rasterize(ch, px_size);
+            let (font, raster_char) = self.raster_source(ch);
+            let glyph = font.rasterize(raster_char, px_size);
             if self.cache.len() >= GLYPH_CACHE_ENTRIES
                 || self.cache_bytes + glyph.1.len() > GLYPH_CACHE_BYTES
             {
@@ -541,11 +551,11 @@ impl Renderer {
         let metrics = if let Some(glyph) = self.cache.get(&(ch, px_size.to_bits())) {
             glyph.0
         } else {
-            let font = self.font_for(ch);
-            if combining && font.is_none() {
+            if combining && self.font_for(ch).is_none() {
                 return;
             }
-            font.unwrap_or(&self.fonts[0]).metrics(ch, px_size)
+            let (font, raster_char) = self.raster_source(ch);
+            font.metrics(raster_char, px_size)
         };
         if metrics.width == 0 || metrics.height == 0 {
             return;
@@ -1214,7 +1224,10 @@ mod tests {
         let before = renderer.geometry(1.25);
         let px = renderer.font_px(1.25);
         let missing = '\u{10ffff}';
-        let expected = renderer.fonts[0].rasterize(missing, px);
+        let (font, replacement) = renderer.raster_source(missing);
+        assert_ne!(replacement, missing);
+        let expected = font.rasterize(replacement, px);
+        assert!(expected.1.iter().any(|&alpha| alpha != 0));
         assert_eq!(renderer.glyph_bitmap(missing, px), &expected);
         let primary = &renderer.fonts[0];
         let fallback = renderer.fonts[1..].iter().find_map(|font| {
