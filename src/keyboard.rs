@@ -54,6 +54,58 @@ unsafe extern "C" {
         buffer: *mut c_char,
         size: usize,
     ) -> c_int;
+    fn xkb_keymap_num_layouts(keymap: *mut c_void) -> u32;
+    fn xkb_keymap_layout_get_name(keymap: *mut c_void, idx: u32) -> *const c_char;
+    fn xkb_state_layout_index_is_active(state: *mut c_void, idx: u32, kind: c_int) -> c_int;
+}
+
+/// Derive a compact 2-3 character layout code from an XKB layout name.
+pub fn short_layout_name(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    for (needle, code) in [
+        ("english", "EN"),
+        ("russian", "RU"),
+        ("ukrainian", "UA"),
+        ("belarusian", "BY"),
+        ("german", "DE"),
+        ("french", "FR"),
+        ("spanish", "ES"),
+        ("italian", "IT"),
+        ("portuguese", "PT"),
+        ("polish", "PL"),
+        ("turkish", "TR"),
+        ("japanese", "JA"),
+        ("korean", "KO"),
+        ("chinese", "ZH"),
+        ("arabic", "AR"),
+        ("hebrew", "HE"),
+        ("greek", "EL"),
+        ("czech", "CS"),
+        ("swedish", "SV"),
+        ("norwegian", "NO"),
+        ("finnish", "FI"),
+        ("dutch", "NL"),
+        ("kazakh", "KK"),
+        ("(us)", "EN"),
+    ] {
+        if lower.contains(needle) {
+            return code.to_string();
+        }
+    }
+    if lower == "us" {
+        return "EN".to_string();
+    }
+    let code: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic())
+        .take(2)
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    if code.is_empty() {
+        "??".to_string()
+    } else {
+        code
+    }
 }
 
 pub struct Keyboard {
@@ -112,6 +164,62 @@ impl Keyboard {
                 xkb_state_update_mask(self.state, depressed, latched, locked, 0, 0, group);
             }
         }
+    }
+
+    /// Return all XKB layout names configured in the active keymap.
+    pub fn layouts(&self) -> Vec<String> {
+        if self.keymap.is_null() {
+            return Vec::new();
+        }
+        let count = unsafe { xkb_keymap_num_layouts(self.keymap) };
+        let mut out = Vec::with_capacity(count as usize);
+        for idx in 0..count {
+            let ptr = unsafe { xkb_keymap_layout_get_name(self.keymap, idx) };
+            let name = if ptr.is_null() {
+                format!("Layout {}", idx + 1)
+            } else {
+                unsafe { CStr::from_ptr(ptr) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            out.push(name);
+        }
+        out
+    }
+
+    /// Return the currently active effective XKB layout group index.
+    pub fn active_layout_index(&self) -> u32 {
+        if self.keymap.is_null() || self.state.is_null() {
+            return 0;
+        }
+        let count = unsafe { xkb_keymap_num_layouts(self.keymap) };
+        for idx in 0..count {
+            // XKB_STATE_LAYOUT_EFFECTIVE = 1 << 7 = 128
+            if unsafe { xkb_state_layout_index_is_active(self.state, idx, 128) > 0 } {
+                return idx;
+            }
+        }
+        0
+    }
+
+    /// Build a [`crate::events::KeyboardLayoutEvent`] snapshot for the active window.
+    pub fn layout_event(&self) -> Option<crate::events::KeyboardLayoutEvent> {
+        let layouts = self.layouts();
+        if layouts.is_empty() {
+            return None;
+        }
+        let active_index = self.active_layout_index();
+        let active_name = layouts
+            .get(active_index as usize)
+            .cloned()
+            .unwrap_or_else(|| "Unknown".to_string());
+        let short_name = short_layout_name(&active_name);
+        Some(crate::events::KeyboardLayoutEvent {
+            active_index,
+            active_name,
+            short_name,
+            layouts,
+        })
     }
     fn modifier(&self, name: &CStr) -> bool {
         !self.state.is_null()
@@ -287,5 +395,33 @@ mod tests {
         for text in [&b"\x03"[..], b"\x04", b"\x0c", "я".as_bytes()] {
             assert_eq!(translate(0, text), text);
         }
+    }
+
+    #[test]
+    fn enumerates_layouts_and_tracks_active_group() {
+        use std::io::Write;
+        let map = br#"xkb_keymap {
+            xkb_keycodes { include "evdev+aliases(qwerty)" };
+            xkb_types { include "complete" };
+            xkb_compatibility { include "complete" };
+            xkb_symbols { include "pc+us+ru:2" };
+        };"#;
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(map).unwrap();
+        let mut keyboard = super::Keyboard::new().unwrap();
+        keyboard.keymap(file.into(), map.len() as u32).unwrap();
+
+        let layouts = keyboard.layouts();
+        assert!(layouts.len() >= 2);
+        keyboard.modifiers(0, 0, 0, 1);
+        assert_eq!(keyboard.active_layout_index(), 1);
+        let ev = keyboard.layout_event().unwrap();
+        assert_eq!(ev.active_index, 1);
+        assert_eq!(ev.short_name, "RU");
+
+        keyboard.modifiers(0, 0, 0, 0);
+        let ev0 = keyboard.layout_event().unwrap();
+        assert_eq!(ev0.active_index, 0);
+        assert_eq!(ev0.short_name, "EN");
     }
 }

@@ -1,0 +1,25 @@
+id = "org.beyrix.keyboard-layout"
+name = "Keyboard Layout Indicator"
+version = "1.0.0"
+kind = "widget"
+sdk_version = "1.0.0"
+entry = "index.js"
+author = "Beyrix"
+description = "Displays the active keyboard layout for the current terminal window (Wayland/XKB & Windows)."
+license = "MPL-2.0"
+official = true
+permissions = ["ui", "keyboard-layout", "theme", "window"]
+
+[placement]
+mode = "overlay"
+tui_behavior = "overlay"
+anchor = "top-right"
+x = -14.0
+y = 12.0
+width = 86.0
+height = 34.0
+margin = 8.0
+z_index = 20
+opacity = 0.90
+border_radius = 8.0
+click_through = true
