@@ -269,6 +269,11 @@ impl BackgroundEngine {
     }
 
     pub fn add_binding(&mut self, owner: &str, mut binding: DataBinding) -> Result<(), String> {
+        if let Some(existing_owner) = &self.scene_owner
+            && existing_owner != owner
+        {
+            return Err("cannot add binding to a scene owned by another extension".to_string());
+        }
         if let Some(existing) = self.bindings.iter().find(|b| b.id == binding.id)
             && !existing.owner.is_empty()
             && existing.owner != owner
@@ -282,6 +287,13 @@ impl BackgroundEngine {
     }
 
     pub fn remove_binding(&mut self, owner: &str, id: &str) -> Result<(), String> {
+        if let Some(existing_owner) = &self.scene_owner
+            && existing_owner != owner
+        {
+            return Err(
+                "cannot remove binding from a scene owned by another extension".to_string(),
+            );
+        }
         if let Some(existing) = self.bindings.iter().find(|b| b.id == id)
             && !existing.owner.is_empty()
             && existing.owner != owner
@@ -549,6 +561,16 @@ mod tests {
         );
         b.object_id = Some("my-cube".into());
         engine.add_binding("ext.a", b).unwrap();
+        // Another extension cannot add a binding with a new ID to ext.a's scene!
+        let mut hijack_b = DataBinding::new(
+            "new-hijack-bind",
+            DataSource::AudioBass,
+            BindingTarget::ObjectScale,
+            0.1,
+            0.2,
+        );
+        hijack_b.object_id = Some("my-cube".into());
+        assert!(engine.add_binding("ext.b", hijack_b).is_err());
         assert!(engine.remove_binding("ext.b", "cube-scale").is_err());
         assert!(engine.set_charset("ext.b", ".:*#".into()).is_err());
         assert!(engine.set_charset("ext.a", ".:*#".into()).is_ok());

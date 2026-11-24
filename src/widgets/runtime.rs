@@ -104,10 +104,20 @@ pub struct WidgetRenderState {
     pub updated_at: Instant,
 }
 
+/// Action envelope tagged with extension ID and instance generation to drop stale
+/// actions from unloaded or reloaded extension instances.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HostActionEnvelope {
+    pub extension_id: String,
+    pub generation: u64,
+    pub action: HostAction,
+}
+
 /// Messages sent from UI / main thread to the JS worker thread.
 pub enum VmCommand {
     LoadExtension {
         id: String,
+        generation: u64,
         entry_path: PathBuf,
         manifest: Box<ExtensionManifest>,
         permissions: PermissionSet,
@@ -138,7 +148,7 @@ pub enum VmCommand {
 #[derive(Default)]
 pub struct SharedWidgetState {
     pub renders: HashMap<String, WidgetRenderState>,
-    pub pending_actions: VecDeque<HostAction>,
+    pub pending_actions: VecDeque<HostActionEnvelope>,
     pub latest_keyboard: Option<KeyboardLayoutEvent>,
     pub latest_media: Option<MediaEventPayload>,
     pub latest_audio: Option<AudioFramePayload>,
@@ -214,7 +224,7 @@ impl WidgetRuntime {
         s.renders.clone()
     }
 
-    pub fn drain_actions(&self) -> Vec<HostAction> {
+    pub fn drain_actions(&self) -> Vec<HostActionEnvelope> {
         let mut s = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         s.pending_actions.drain(..).collect()
     }
@@ -237,6 +247,7 @@ impl Drop for WidgetRuntime {
 
 struct LoadedVmExtension {
     id: String,
+    generation: u64,
     entry_path: PathBuf,
     last_mtime: Option<SystemTime>,
     manifest: ExtensionManifest,
@@ -287,6 +298,7 @@ fn run_vm_loop(
                 } => win_state = (width, height, scale, focused),
                 VmCommand::LoadExtension {
                     id,
+                    generation,
                     entry_path,
                     manifest,
                     permissions,
@@ -298,6 +310,7 @@ fn run_vm_loop(
                         &deadline,
                         timeout,
                         id,
+                        generation,
                         entry_path,
                         manifest,
                         permissions,
@@ -309,16 +322,22 @@ fn run_vm_loop(
                     extensions.remove(&id);
                     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
                     s.renders.remove(&id);
+                    s.pending_actions.retain(|env| env.extension_id != id);
                 }
                 VmCommand::ReloadExtension { id } => {
                     if let Some(ext) = extensions.get(&id).map(|e| {
                         (
+                            e.generation + 1,
                             e.entry_path.clone(),
                             Box::new(e.manifest.clone()),
                             e.permissions.clone(),
                         )
                     }) {
                         extensions.remove(&id);
+                        {
+                            let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+                            s.pending_actions.retain(|env| env.extension_id != id);
+                        }
                         load_into_vm(
                             &rt,
                             &mut extensions,
@@ -329,6 +348,7 @@ fn run_vm_loop(
                             ext.0,
                             ext.1,
                             ext.2,
+                            ext.3,
                             &theme,
                             win_state,
                         );
@@ -453,6 +473,7 @@ fn load_into_vm(
     deadline: &Arc<Mutex<Option<Instant>>>,
     timeout: Duration,
     id: String,
+    generation: u64,
     entry_path: PathBuf,
     manifest: Box<ExtensionManifest>,
     permissions: PermissionSet,
@@ -485,6 +506,7 @@ fn load_into_vm(
 
     let mut ext = LoadedVmExtension {
         id: id.clone(),
+        generation,
         entry_path,
         last_mtime: mtime,
         manifest: *manifest,
@@ -507,7 +529,7 @@ fn load_into_vm(
         let eid = ext_id.clone();
         let perms = perms_bridge.clone();
         let dispatch_fn = Function::new(ctx.clone(), move |action: String, arg: String| {
-            handle_host_call(&eid, &perms, &sh, &action, &arg);
+            handle_host_call(&eid, generation, &perms, &sh, &action, &arg);
         });
         if let Ok(f) = dispatch_fn {
             let _ = globals.set("__beyrix_host_call", f);
@@ -522,71 +544,55 @@ fn load_into_vm(
 
 fn handle_host_call(
     ext_id: &str,
+    generation: u64,
     perms: &PermissionSet,
     shared: &Arc<Mutex<SharedWidgetState>>,
     action: &str,
     arg: &str,
 ) {
-    let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
-    if s.pending_actions.len() >= 128 {
-        s.pending_actions.pop_front();
-    }
-    match action {
-        "log" => s.pending_actions.push_back(HostAction::WidgetLog {
+    let parsed: Option<HostAction> = match action {
+        "log" => Some(HostAction::WidgetLog {
             extension_id: ext_id.to_string(),
             level: "info".to_string(),
             message: arg.to_string(),
         }),
         "media.playPause" if perms.has(Capability::MediaControl) => {
-            s.pending_actions.push_back(HostAction::MediaPlayPause);
+            Some(HostAction::MediaPlayPause)
         }
-        "media.next" if perms.has(Capability::MediaControl) => {
-            s.pending_actions.push_back(HostAction::MediaNext);
-        }
-        "media.prev" if perms.has(Capability::MediaControl) => {
-            s.pending_actions.push_back(HostAction::MediaPrev);
-        }
+        "media.next" if perms.has(Capability::MediaControl) => Some(HostAction::MediaNext),
+        "media.prev" if perms.has(Capability::MediaControl) => Some(HostAction::MediaPrev),
         "media.seek" if perms.has(Capability::MediaControl) => {
-            if let Ok(secs) = arg.parse::<f64>() {
-                s.pending_actions.push_back(HostAction::MediaSeek(secs));
-            }
+            arg.parse::<f64>().ok().map(HostAction::MediaSeek)
         }
         "media.setVolume" if perms.has(Capability::MediaControl) => {
-            if let Ok(v) = arg.parse::<f64>() {
-                s.pending_actions.push_back(HostAction::MediaSetVolume(v));
-            }
+            arg.parse::<f64>().ok().map(HostAction::MediaSetVolume)
         }
         "media.playFile" if perms.has(Capability::MediaControl) => {
-            s.pending_actions
-                .push_back(HostAction::MediaPlayFile(arg.to_string()));
+            Some(HostAction::MediaPlayFile(arg.to_string()))
         }
         "background.setPreset" if perms.has(Capability::BackgroundControl) => {
-            s.pending_actions
-                .push_back(HostAction::BackgroundSetPreset {
-                    owner: ext_id.to_string(),
-                    preset: arg.to_string(),
-                });
+            Some(HostAction::BackgroundSetPreset {
+                owner: ext_id.to_string(),
+                preset: arg.to_string(),
+            })
         }
         "background.releaseScene" if perms.has(Capability::BackgroundControl) => {
-            s.pending_actions
-                .push_back(HostAction::BackgroundReleaseScene {
-                    owner: ext_id.to_string(),
-                });
+            Some(HostAction::BackgroundReleaseScene {
+                owner: ext_id.to_string(),
+            })
         }
         "background.clearScene" if perms.has(Capability::BackgroundControl) => {
-            s.pending_actions
-                .push_back(HostAction::BackgroundClearScene {
-                    owner: ext_id.to_string(),
-                });
+            Some(HostAction::BackgroundClearScene {
+                owner: ext_id.to_string(),
+            })
         }
         "background.addObject" if perms.has(Capability::BackgroundControl) => {
-            if let Ok(spec) = serde_json::from_str::<crate::background::CustomObjectSpec>(arg) {
-                s.pending_actions
-                    .push_back(HostAction::BackgroundAddObject {
-                        owner: ext_id.to_string(),
-                        spec,
-                    });
-            }
+            serde_json::from_str::<crate::background::CustomObjectSpec>(arg)
+                .ok()
+                .map(|spec| HostAction::BackgroundAddObject {
+                    owner: ext_id.to_string(),
+                    spec,
+                })
         }
         "background.updateObject" if perms.has(Capability::BackgroundControl) => {
             #[derive(serde::Deserialize)]
@@ -597,24 +603,22 @@ fn handle_host_call(
                 scale: Option<[f32; 3]>,
                 color: Option<[f32; 3]>,
             }
-            if let Ok(u) = serde_json::from_str::<Upd>(arg) {
-                s.pending_actions
-                    .push_back(HostAction::BackgroundUpdateObject {
-                        owner: ext_id.to_string(),
-                        id: u.id,
-                        position: u.position,
-                        rotation: u.rotation,
-                        scale: u.scale,
-                        color: u.color,
-                    });
-            }
+            serde_json::from_str::<Upd>(arg)
+                .ok()
+                .map(|u| HostAction::BackgroundUpdateObject {
+                    owner: ext_id.to_string(),
+                    id: u.id,
+                    position: u.position,
+                    rotation: u.rotation,
+                    scale: u.scale,
+                    color: u.color,
+                })
         }
         "background.removeObject" if perms.has(Capability::BackgroundControl) => {
-            s.pending_actions
-                .push_back(HostAction::BackgroundRemoveObject {
-                    owner: ext_id.to_string(),
-                    id: arg.to_string(),
-                });
+            Some(HostAction::BackgroundRemoveObject {
+                owner: ext_id.to_string(),
+                id: arg.to_string(),
+            })
         }
         "background.setCamera" if perms.has(Capability::BackgroundControl) => {
             #[derive(serde::Deserialize)]
@@ -624,16 +628,15 @@ fn handle_host_call(
                 fov: Option<f32>,
                 ortho: Option<bool>,
             }
-            if let Ok(c) = serde_json::from_str::<Cam>(arg) {
-                s.pending_actions
-                    .push_back(HostAction::BackgroundSetCamera {
-                        owner: ext_id.to_string(),
-                        position: c.position,
-                        target: c.target,
-                        fov_deg: c.fov,
-                        ortho: c.ortho,
-                    });
-            }
+            serde_json::from_str::<Cam>(arg)
+                .ok()
+                .map(|c| HostAction::BackgroundSetCamera {
+                    owner: ext_id.to_string(),
+                    position: c.position,
+                    target: c.target,
+                    fov_deg: c.fov,
+                    ortho: c.ortho,
+                })
         }
         "background.setLight" if perms.has(Capability::BackgroundControl) => {
             #[derive(serde::Deserialize)]
@@ -642,37 +645,48 @@ fn handle_host_call(
                 color: Option<[f32; 3]>,
                 intensity: Option<f32>,
             }
-            if let Ok(l) = serde_json::from_str::<Light>(arg) {
-                s.pending_actions.push_back(HostAction::BackgroundSetLight {
+            serde_json::from_str::<Light>(arg)
+                .ok()
+                .map(|l| HostAction::BackgroundSetLight {
                     owner: ext_id.to_string(),
                     direction: l.direction,
                     color: l.color,
                     intensity: l.intensity,
-                });
-            }
+                })
         }
         "background.setCharset" if perms.has(Capability::BackgroundControl) => {
-            s.pending_actions
-                .push_back(HostAction::BackgroundSetCharset {
-                    owner: ext_id.to_string(),
-                    charset: arg.to_string(),
-                });
+            Some(HostAction::BackgroundSetCharset {
+                owner: ext_id.to_string(),
+                charset: arg.to_string(),
+            })
         }
         "background.bind" if perms.has(Capability::BackgroundControl) => {
-            if let Ok(b) = serde_json::from_str::<crate::background::bindings::DataBinding>(arg) {
-                s.pending_actions.push_back(HostAction::BackgroundBind {
+            serde_json::from_str::<crate::background::bindings::DataBinding>(arg)
+                .ok()
+                .map(|binding| HostAction::BackgroundBind {
                     owner: ext_id.to_string(),
-                    binding: b,
-                });
-            }
+                    binding,
+                })
         }
         "background.unbind" if perms.has(Capability::BackgroundControl) => {
-            s.pending_actions.push_back(HostAction::BackgroundUnbind {
+            Some(HostAction::BackgroundUnbind {
                 owner: ext_id.to_string(),
                 id: arg.to_string(),
-            });
+            })
         }
-        _ => {}
+        _ => None,
+    };
+
+    if let Some(act) = parsed {
+        let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if s.pending_actions.len() >= 128 {
+            s.pending_actions.pop_front();
+        }
+        s.pending_actions.push_back(HostActionEnvelope {
+            extension_id: ext_id.to_string(),
+            generation,
+            action: act,
+        });
     }
 }
 
@@ -1036,6 +1050,7 @@ mod tests {
         let vm = WidgetRuntime::start(8, 256, 40, Theme::default(), bus).unwrap();
         vm.send(VmCommand::LoadExtension {
             id: "test.loop".into(),
+            generation: 1,
             entry_path: loaded.entry_path,
             manifest: Box::new(loaded.manifest),
             permissions: PermissionSet::new([Capability::Ui]),
@@ -1073,6 +1088,7 @@ beyrix.keyboard.onLayoutChange((ev) => {
         let vm = WidgetRuntime::start(16, 256, 50, Theme::default(), bus.clone()).unwrap();
         vm.send(VmCommand::LoadExtension {
             id: "test.kbd".into(),
+            generation: 1,
             entry_path: loaded.entry_path,
             manifest: Box::new(loaded.manifest),
             permissions: PermissionSet::new([Capability::Ui, Capability::KeyboardLayout]),

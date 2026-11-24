@@ -51,6 +51,7 @@ pub struct WidgetManager {
     pub editor: VisualLayoutEditor,
     pub hit_targets: Vec<UiHitTarget>,
     pub resolved_rects: BTreeMap<String, ResolvedWidgetRect>,
+    generations: BTreeMap<String, u64>,
     unloaded_extensions: Vec<String>,
     runtime: Option<WidgetRuntime>,
 }
@@ -65,6 +66,7 @@ impl WidgetManager {
             editor: VisualLayoutEditor::new(),
             hit_targets: Vec::new(),
             resolved_rects: BTreeMap::new(),
+            generations: BTreeMap::new(),
             unloaded_extensions: Vec::new(),
             runtime: None,
         }
@@ -125,6 +127,9 @@ impl WidgetManager {
                 PermissionSet::safe_default(&loaded.manifest.permissions, &[])
             }
         };
+        let gen_entry = self.generations.entry(id.clone()).or_insert(0);
+        *gen_entry += 1;
+        let generation = *gen_entry;
         self.granted_permissions.insert(id.clone(), perms.clone());
         self.placements
             .entry(id.clone())
@@ -132,6 +137,7 @@ impl WidgetManager {
         if let Some(vm) = &self.runtime {
             vm.send(VmCommand::LoadExtension {
                 id: id.clone(),
+                generation,
                 entry_path: loaded.entry_path.clone(),
                 manifest: Box::new(loaded.manifest.clone()),
                 permissions: perms,
@@ -143,6 +149,9 @@ impl WidgetManager {
     pub fn unload_extension(&mut self, id: &str) {
         self.extensions.remove(id);
         self.granted_permissions.remove(id);
+        if let Some(g) = self.generations.get_mut(id) {
+            *g += 1;
+        }
         self.unloaded_extensions.push(id.to_string());
         if let Some(vm) = &self.runtime {
             vm.send(VmCommand::UnloadExtension { id: id.to_string() });
@@ -150,6 +159,9 @@ impl WidgetManager {
     }
 
     pub fn reload_extension(&mut self, id: &str) {
+        if let Some(g) = self.generations.get_mut(id) {
+            *g += 1;
+        }
         self.unloaded_extensions.push(id.to_string());
         if let Some(vm) = &self.runtime {
             vm.send(VmCommand::ReloadExtension { id: id.to_string() });
@@ -163,7 +175,11 @@ impl WidgetManager {
             .map(|owner| HostAction::BackgroundReleaseScene { owner })
             .collect();
         if let Some(vm) = &self.runtime {
-            actions.extend(vm.drain_actions());
+            for env in vm.drain_actions() {
+                if self.generations.get(&env.extension_id).copied() == Some(env.generation) {
+                    actions.push(env.action);
+                }
+            }
         }
         actions
     }
@@ -412,5 +428,49 @@ permissions = ["ui", "terminal-read", "network", "process-spawn", "xray-control"
         assert!(!perms.has(Capability::Network));
         assert!(!perms.has(Capability::ProcessSpawn));
         assert!(!perms.has(Capability::XRayControl));
+    }
+
+    #[test]
+    fn stale_actions_from_unloaded_generation_are_dropped() {
+        let bus = EventBus::new();
+        let dir = tempfile::tempdir().unwrap();
+        let ext_dir = dir.path().join("bg-ext");
+        std::fs::create_dir(&ext_dir).unwrap();
+        std::fs::write(
+            ext_dir.join("index.js"),
+            "beyrix.background.clearScene(); beyrix.background.addObject({ id: 'o1', primitive: 'cube' });",
+        )
+        .unwrap();
+        std::fs::write(
+            ext_dir.join("beyrix-ext.toml"),
+            r#"
+id = "org.example.bg"
+name = "BG"
+sdk_version = "1.0.0"
+permissions = ["ui", "background-control"]
+"#,
+        )
+        .unwrap();
+
+        let mut mgr = WidgetManager::new(WidgetsConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        mgr.ensure_started(Theme::default(), bus).unwrap();
+        let loaded = ExtensionManifest::load_from_dir(&ext_dir).unwrap();
+        mgr.register_extension(loaded, ExtensionTrust::ThirdParty);
+        std::thread::sleep(std::time::Duration::from_millis(80));
+
+        // Unload before draining actions: stale BackgroundClearScene/AddObject from gen 1
+        // must be dropped and only BackgroundReleaseScene emitted!
+        mgr.unload_extension("org.example.bg");
+        let actions = mgr.drain_actions();
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, HostAction::BackgroundReleaseScene { owner } if owner == "org.example.bg")));
+        assert!(!actions.iter().any(|a| matches!(
+            a,
+            HostAction::BackgroundClearScene { .. } | HostAction::BackgroundAddObject { .. }
+        )));
     }
 }

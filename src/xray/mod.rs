@@ -78,25 +78,56 @@ pub struct XRaySnapshot {
     pub reports: Vec<CommandReport>,
 }
 
-/// Per-`(pid, starttime)` I/O delta accumulator.
+/// Per-`(pid, starttime)` I/O delta accumulator accounting for `proc_pid_io(5)` semantics.
 ///
-/// Linux `/proc/[pid]/io` counters are strictly per-process (not inherited on
-/// `fork()` and not rolled up into the parent on `wait()`). Accumulating deltas
-/// per `(pid, starttime)` preserves I/O from exited child processes without
-/// double-counting.
+/// In Linux, `/proc/[pid]/io` includes the process's own I/O **plus** all
+/// waited-for (`waitpid`) children. Alive (unwaited) children are not yet in the
+/// parent's `/proc/[ppid]/io`. Summing live tracked processes plus any exited
+/// processes whose parent is no longer in the tracked tree avoids double-counting
+/// waited-for children while preserving reparented/exited subtrees.
+pub type IoCounters = (u64, u64, u64, u64);
+type PidKey = (i32, u64);
+
 #[derive(Default)]
 pub struct IoAccumulator {
-    seen: std::collections::HashMap<(i32, u64), (u64, u64, u64, u64)>,
-    pub totals: (u64, u64, u64, u64),
+    live: std::collections::HashMap<PidKey, (i32, IoCounters)>,
+    unabsorbed_exited: IoCounters,
+    pub totals: IoCounters,
 }
 
 impl IoAccumulator {
     pub fn reset(&mut self) {
-        self.seen.clear();
+        self.live.clear();
+        self.unabsorbed_exited = (0, 0, 0, 0);
         self.totals = (0, 0, 0, 0);
     }
 
     pub fn update(&mut self, nodes: &[&ProcessNode]) {
+        let live_pids: std::collections::HashSet<i32> = nodes.iter().map(|n| n.pid).collect();
+        let current_keys: std::collections::HashSet<(i32, u64)> =
+            nodes.iter().map(|n| (n.pid, n.starttime)).collect();
+
+        // Any previously-live process that disappeared: if its parent is still
+        // alive in `nodes`, the parent absorbed its I/O via waitpid() (do NOT add
+        // to `unabsorbed_exited`). Otherwise, preserve its last observed I/O.
+        let disappeared: Vec<(i32, u64)> = self
+            .live
+            .keys()
+            .filter(|k| !current_keys.contains(k))
+            .copied()
+            .collect();
+        for key in disappeared {
+            if let Some((ppid, last_io)) = self.live.remove(&key)
+                && !live_pids.contains(&ppid)
+            {
+                self.unabsorbed_exited.0 += last_io.0;
+                self.unabsorbed_exited.1 += last_io.1;
+                self.unabsorbed_exited.2 += last_io.2;
+                self.unabsorbed_exited.3 += last_io.3;
+            }
+        }
+
+        let mut live_sum = (0u64, 0u64, 0u64, 0u64);
         for n in nodes {
             let cur = (
                 n.read_bytes,
@@ -104,18 +135,23 @@ impl IoAccumulator {
                 n.logical_read_bytes,
                 n.logical_write_bytes,
             );
-            if let Some(prev) = self.seen.insert((n.pid, n.starttime), cur) {
-                self.totals.0 += cur.0.saturating_sub(prev.0);
-                self.totals.1 += cur.1.saturating_sub(prev.1);
-                self.totals.2 += cur.2.saturating_sub(prev.2);
-                self.totals.3 += cur.3.saturating_sub(prev.3);
-            } else {
-                self.totals.0 += cur.0;
-                self.totals.1 += cur.1;
-                self.totals.2 += cur.2;
-                self.totals.3 += cur.3;
-            }
+            self.live.insert((n.pid, n.starttime), (n.ppid, cur));
+            live_sum.0 += cur.0;
+            live_sum.1 += cur.1;
+            live_sum.2 += cur.2;
+            live_sum.3 += cur.3;
         }
+
+        let candidate = (
+            self.unabsorbed_exited.0 + live_sum.0,
+            self.unabsorbed_exited.1 + live_sum.1,
+            self.unabsorbed_exited.2 + live_sum.2,
+            self.unabsorbed_exited.3 + live_sum.3,
+        );
+        self.totals.0 = self.totals.0.max(candidate.0);
+        self.totals.1 = self.totals.1.max(candidate.1);
+        self.totals.2 = self.totals.2.max(candidate.2);
+        self.totals.3 = self.totals.3.max(candidate.3);
     }
 }
 
@@ -710,6 +746,107 @@ mod tests {
 
         let _ = parent.kill();
         let _ = parent.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn io_accumulator_does_not_double_count_waited_for_child() {
+        use std::io::{BufRead, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let out_file = dir.path().join("det_io.bin");
+        let pipe_go = dir.path().join("go.fifo");
+        let pipe_done = dir.path().join("done.fifo");
+        let pipe_exit = dir.path().join("exit.fifo");
+
+        // Create named pipes for deterministic synchronization:
+        // 1. Child writes 1 MiB, signals READY on stdout, waits on `go.fifo`.
+        // 2. Test samples BOTH parent and child while child is alive.
+        // 3. Test writes to `go.fifo` -> child exits -> parent waitpids -> parent prints WAITED.
+        // 4. Test samples parent AFTER waitpid, then writes to `exit.fifo` so parent exits.
+        for p in [&pipe_go, &pipe_done, &pipe_exit] {
+            let c_p = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c_p.as_ptr(), 0o600) }, 0);
+        }
+
+        let py = format!(
+            r#"
+import os, sys
+pid = os.fork()
+if pid == 0:
+    with open({out:?}, 'wb') as f:
+        f.write(b'A' * 1048576)
+        f.flush()
+        os.fsync(f.fileno())
+    with open({done:?}, 'w') as d:
+        d.write('READY\n')
+        d.flush()
+    with open({go:?}, 'r') as g:
+        g.read()
+    os._exit(0)
+else:
+    with open({done:?}, 'r') as d:
+        d.readline()
+    print('CHILD_ALIVE', flush=True)
+    os.waitpid(pid, 0)
+    print('CHILD_WAITED', flush=True)
+    with open({exit_p:?}, 'r') as e:
+        e.read()
+"#,
+            out = out_file.to_str().unwrap(),
+            done = pipe_done.to_str().unwrap(),
+            go = pipe_go.to_str().unwrap(),
+            exit_p = pipe_exit.to_str().unwrap(),
+        );
+
+        let mut parent = Command::new("python3")
+            .args(["-c", &py])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn python3");
+        let root_pid = parent.id() as i32;
+        let mut stdout = BufReader::new(parent.stdout.take().unwrap());
+
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "CHILD_ALIVE");
+
+        let mut sampler = linux::LinuxSampler::new();
+        let mut acc = IoAccumulator::default();
+
+        // Sample 1: BOTH parent and child are alive!
+        let tree1 = sampler.collect_tree(root_pid, None, false, 1.0);
+        assert_eq!(tree1.len(), 2, "expected parent + alive child");
+        let refs1: Vec<&ProcessNode> = tree1.iter().collect();
+        acc.update(&refs1);
+
+        // Allow child to exit and parent to waitpid()
+        std::fs::write(&pipe_go, b"GO\n").unwrap();
+        line.clear();
+        stdout.read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "CHILD_WAITED");
+
+        // Sample 2: Only parent is alive, and parent's /proc/<pid>/io now includes child's 1 MiB!
+        let tree2 = sampler.collect_tree(root_pid, None, false, 1.0);
+        assert_eq!(tree2.len(), 1, "expected only parent after waitpid");
+        let refs2: Vec<&ProcessNode> = tree2.iter().collect();
+        acc.update(&refs2);
+
+        // Release parent
+        let _ = std::fs::write(&pipe_exit, b"EXIT\n");
+        let _ = parent.wait();
+
+        // Must be ~1 MiB, NEVER ~2 MiB!
+        assert!(
+            acc.totals.3 >= 1_048_576,
+            "expected >= 1 MiB logical write, got {}",
+            acc.totals.3
+        );
+        assert!(
+            acc.totals.3 < 1_500_000,
+            "double-counted waited-for child I/O: got {} bytes",
+            acc.totals.3
+        );
     }
 
     #[test]

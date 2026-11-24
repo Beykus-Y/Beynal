@@ -168,32 +168,45 @@ pub struct FrameBindingCache {
     pub per_object: std::collections::HashMap<String, EvaluatedModifiers>,
 }
 
+fn apply_modifier(
+    mods: &mut EvaluatedModifiers,
+    target: BindingTarget,
+    combine: CombineMode,
+    v: f32,
+) {
+    let slot = match target {
+        BindingTarget::ObjectScale => &mut mods.scale,
+        BindingTarget::RotationSpeed => &mut mods.rotation_speed,
+        BindingTarget::LightIntensity => &mut mods.light_intensity,
+        BindingTarget::ParticleImpulse => &mut mods.particle_impulse,
+        BindingTarget::Brightness => &mut mods.brightness,
+        BindingTarget::WaveAmplitude => &mut mods.wave_amplitude,
+    };
+    *slot = match combine {
+        CombineMode::Replace => v,
+        CombineMode::Add => *slot + v,
+        CombineMode::Multiply => *slot * v,
+        CombineMode::Max => slot.max(v),
+    };
+}
+
 impl FrameBindingCache {
     pub fn evaluate_frame(bindings: &mut [DataBinding], inputs: &BindingInputs) -> Self {
         let mut global = EvaluatedModifiers::default();
-        let mut per_object: std::collections::HashMap<String, EvaluatedModifiers> =
-            std::collections::HashMap::new();
+        let mut local_evals: Vec<(String, BindingTarget, CombineMode, f32)> = Vec::new();
         for b in bindings {
             let v = b.evaluate(inputs);
-            let mods = if let Some(oid) = &b.object_id {
-                per_object.entry(oid.clone()).or_default()
+            if let Some(oid) = &b.object_id {
+                local_evals.push((oid.clone(), b.target, b.combine, v));
             } else {
-                &mut global
-            };
-            let slot = match b.target {
-                BindingTarget::ObjectScale => &mut mods.scale,
-                BindingTarget::RotationSpeed => &mut mods.rotation_speed,
-                BindingTarget::LightIntensity => &mut mods.light_intensity,
-                BindingTarget::ParticleImpulse => &mut mods.particle_impulse,
-                BindingTarget::Brightness => &mut mods.brightness,
-                BindingTarget::WaveAmplitude => &mut mods.wave_amplitude,
-            };
-            *slot = match b.combine {
-                CombineMode::Replace => v,
-                CombineMode::Add => *slot + v,
-                CombineMode::Multiply => *slot * v,
-                CombineMode::Max => slot.max(v),
-            };
+                apply_modifier(&mut global, b.target, b.combine, v);
+            }
+        }
+        let mut per_object: std::collections::HashMap<String, EvaluatedModifiers> =
+            std::collections::HashMap::new();
+        for (oid, target, combine, v) in local_evals {
+            let mods = per_object.entry(oid).or_insert(global);
+            apply_modifier(mods, target, combine, v);
         }
         Self { global, per_object }
     }
@@ -245,5 +258,38 @@ mod tests {
         let mods = evaluate_bindings(&mut bindings, &inputs);
         assert!((mods.scale - 1.5).abs() < 1e-4);
         assert!((mods.light_intensity - 1.8).abs() < 1e-4);
+    }
+
+    #[test]
+    fn frame_binding_cache_composes_global_and_per_object_once_per_frame() {
+        let mut global_scale = DataBinding::new(
+            "g-scale",
+            DataSource::AudioBass,
+            BindingTarget::ObjectScale,
+            1.0,
+            2.0,
+        );
+        global_scale.smoothing = 0.0;
+        let mut local_rot = DataBinding::new(
+            "l-rot",
+            DataSource::AudioRms,
+            BindingTarget::RotationSpeed,
+            1.0,
+            3.0,
+        );
+        local_rot.smoothing = 0.0;
+        local_rot.object_id = Some("cube-1".into());
+
+        let mut bindings = vec![global_scale, local_rot];
+        let inputs = BindingInputs {
+            audio_bass: 0.5,
+            audio_rms: 1.0,
+            ..Default::default()
+        };
+        let cache = FrameBindingCache::evaluate_frame(&mut bindings, &inputs);
+        let cube = cache.for_object("cube-1");
+        // Local rotation binding must NOT clobber global scale binding
+        assert!((cube.scale - 1.5).abs() < 1e-4);
+        assert!((cube.rotation_speed - 3.0).abs() < 1e-4);
     }
 }
