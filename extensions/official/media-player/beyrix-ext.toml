@@ -1,0 +1,24 @@
+id = "org.beyrix.media-player"
+name = "Media Player & Visualizer"
+version = "1.0.0"
+kind = "widget"
+sdk_version = "1.0.0"
+entry = "index.js"
+author = "Beyrix"
+description = "Controls system MPRIS/GSMTC sessions and Beyrix local audio playback with reactive spectrum."
+license = "MPL-2.0"
+official = true
+permissions = ["ui", "media-control", "audio-analysis", "theme"]
+
+[placement]
+mode = "overlay"
+tui_behavior = "hidden"
+anchor = "bottom-right"
+x = -14.0
+y = -14.0
+width = 280.0
+height = 104.0
+margin = 8.0
+z_index = 25
+opacity = 0.92
+border_radius = 10.0
