@@ -21,7 +21,9 @@ use crate::config::{XRayConfig, XRayLevel};
 use crate::events::{AppEvent, EventBus, XRaySummaryPayload};
 use crate::render::{Renderer, Scene};
 use crate::theme::Theme;
-use crate::widgets::ui::{Align, UiColor, UiHitTarget, UiLayer, UiNode, emit_ui_tree};
+use crate::widgets::ui::{
+    Align, HitKind, UiColor, UiHitTarget, UiLayer, UiNode, emit_ui_tree_interactive,
+};
 
 use diagnosis::{Diagnosis, ProcessStateKind};
 use report::{CommandReport, ReportStore};
@@ -67,14 +69,41 @@ pub struct ProcessNode {
     pub diagnosis: Diagnosis,
 }
 
+/// Command-level wait-chain diagnosis derived from the foreground process tree.
+#[derive(Clone, Debug, Default)]
+pub struct CommandDiagnosis {
+    pub command_name: String,
+    pub wait_chain: Vec<String>,
+    pub summary: String,
+    pub reason: diagnosis::WaitReason,
+    pub confidence: diagnosis::Confidence,
+    pub source: String,
+    pub limitations: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum XRayTab {
+    #[default]
+    Overview,
+    Processes,
+    History,
+    Trace,
+}
+
 #[derive(Clone, Debug)]
 pub struct XRaySnapshot {
     pub level: XRayLevel,
     pub capabilities: XRayCapabilities,
     pub fg_pgid: Option<i32>,
     pub nodes: Vec<ProcessNode>,
+    pub command_diagnosis: CommandDiagnosis,
     pub total_cpu_percent: f32,
     pub total_rss_bytes: u64,
+    pub approx_io_totals: IoCounters,
+    pub seconds_since_output: f64,
+    pub command_elapsed_secs: f64,
+    pub cpu_history: Vec<f32>,
+    pub rss_mb_history: Vec<f32>,
     pub reports: Vec<CommandReport>,
 }
 
@@ -178,6 +207,11 @@ impl IoAccumulator {
 pub struct XRayEngine {
     pub config: XRayConfig,
     pub panel_open: bool,
+    pub active_tab: XRayTab,
+    pub selected_pid: Option<(i32, u64)>,
+    pub process_scroll: usize,
+    pub confirm_destructive: Option<(i32, u64, ProcessAction)>,
+    pub action_feedback: Option<String>,
     snapshot: Arc<Mutex<XRaySnapshot>>,
     last_output_at: Arc<Mutex<Instant>>,
     level: Arc<Mutex<XRayLevel>>,
@@ -199,13 +233,24 @@ impl XRayEngine {
             capabilities: caps,
             fg_pgid: None,
             nodes: Vec::new(),
+            command_diagnosis: CommandDiagnosis::default(),
             total_cpu_percent: 0.0,
             total_rss_bytes: 0,
+            approx_io_totals: (0, 0, 0, 0),
+            seconds_since_output: 0.0,
+            command_elapsed_secs: 0.0,
+            cpu_history: Vec::with_capacity(32),
+            rss_mb_history: Vec::with_capacity(32),
             reports: Vec::new(),
         }));
         Self {
             config,
             panel_open: false,
+            active_tab: XRayTab::Overview,
+            selected_pid: None,
+            process_scroll: 0,
+            confirm_destructive: None,
+            action_feedback: None,
             snapshot,
             last_output_at: Arc::new(Mutex::new(Instant::now())),
             level,
@@ -350,6 +395,7 @@ impl XRayEngine {
                         }
                     }
 
+                    let cmd_diag = diagnose_command_tree(&nodes, fg_pgid);
                     if let Some(focus_node) = select_focus_process(&nodes, fg_pgid) {
                         bus.publish(AppEvent::XRayUpdate(XRaySummaryPayload {
                             root_pid,
@@ -357,7 +403,7 @@ impl XRayEngine {
                             cpu_percent: total_cpu,
                             rss_bytes: total_rss,
                             state_label: focus_node.state.label().to_string(),
-                            waiting_reason: focus_node.diagnosis.reason.label().to_string(),
+                            waiting_reason: cmd_diag.reason.label().to_string(),
                         }));
                     }
 
@@ -366,8 +412,21 @@ impl XRayEngine {
                         snap.level = lvl;
                         snap.fg_pgid = fg_pgid;
                         snap.nodes = nodes;
+                        snap.command_diagnosis = cmd_diag;
                         snap.total_cpu_percent = total_cpu;
                         snap.total_rss_bytes = total_rss;
+                        snap.approx_io_totals = io_acc.totals;
+                        snap.seconds_since_output = secs_since_out;
+                        snap.command_elapsed_secs = cmd_started.elapsed().as_secs_f64();
+                        if snap.cpu_history.len() >= 32 {
+                            snap.cpu_history.remove(0);
+                        }
+                        snap.cpu_history.push(total_cpu);
+                        if snap.rss_mb_history.len() >= 32 {
+                            snap.rss_mb_history.remove(0);
+                        }
+                        snap.rss_mb_history
+                            .push(total_rss as f32 / (1024.0 * 1024.0));
                         snap.reports = reports.list();
                     }
                     dirty_flag.store(true, Ordering::Relaxed);
@@ -397,11 +456,79 @@ impl XRayEngine {
         })
     }
 
-    /// Render compact indicator and (if open) full X-Ray panel into `Scene` via BeyrixWidgets UI.
+    /// Handle interactive clicks inside the X-Ray compact badge or diagnostic panel.
+    pub fn handle_hit(&mut self, node_id: &str, kind: HitKind) {
+        match (node_id, kind) {
+            ("xray-toggle", _) => self.toggle_panel(),
+            ("xray-level-light", _) => self.set_level(XRayLevel::Light),
+            ("xray-level-inspect", _) => self.set_level(XRayLevel::Inspect),
+            ("xray-tabs", HitKind::Tab(idx)) => {
+                self.active_tab = match idx {
+                    0 => XRayTab::Overview,
+                    1 => XRayTab::Processes,
+                    2 => XRayTab::History,
+                    _ => XRayTab::Trace,
+                };
+                self.confirm_destructive = None;
+                self.dirty.store(true, Ordering::Relaxed);
+            }
+            ("xray-scroll-up", _) => {
+                self.process_scroll = self.process_scroll.saturating_sub(4);
+                self.dirty.store(true, Ordering::Relaxed);
+            }
+            ("xray-scroll-down", _) => {
+                self.process_scroll = self.process_scroll.saturating_add(4);
+                self.dirty.store(true, Ordering::Relaxed);
+            }
+            (id, _) if id.starts_with("xray-proc-") => {
+                if let Ok(pid) = id.trim_start_matches("xray-proc-").parse::<i32>() {
+                    let snap = self.snapshot();
+                    if let Some(node) = snap.nodes.iter().find(|n| n.pid == pid) {
+                        self.selected_pid = Some((node.pid, node.starttime));
+                        self.confirm_destructive = None;
+                        self.action_feedback = None;
+                        self.dirty.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+            ("xray-act-pause", _) => self.apply_selected_action(ProcessAction::Pause, false),
+            ("xray-act-resume", _) => self.apply_selected_action(ProcessAction::Resume, false),
+            ("xray-act-term", _) => self.apply_selected_action(ProcessAction::Terminate, true),
+            ("xray-act-kill", _) => self.apply_selected_action(ProcessAction::Kill, true),
+            _ => {}
+        }
+    }
+
+    fn apply_selected_action(&mut self, action: ProcessAction, requires_confirm: bool) {
+        let Some((pid, starttime)) = self.selected_pid else {
+            return;
+        };
+        if requires_confirm && self.confirm_destructive != Some((pid, starttime, action)) {
+            self.confirm_destructive = Some((pid, starttime, action));
+            self.action_feedback =
+                Some(format!("Click {:?} again to confirm for PID {pid}", action));
+            self.dirty.store(true, Ordering::Relaxed);
+            return;
+        }
+        self.confirm_destructive = None;
+        #[cfg(target_os = "linux")]
+        let res = linux::execute_process_action(pid, starttime, action);
+        #[cfg(not(target_os = "linux"))]
+        let res: Result<(), String> = Err("process control unavailable on this OS".into());
+        self.action_feedback = Some(match res {
+            Ok(()) => format!("{action:?} sent safely via pidfd to PID {pid}"),
+            Err(e) => format!("Action failed: {e}"),
+        });
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Render adaptive compact indicator and (if open) full diagnostic X-Ray panel.
+    #[allow(clippy::too_many_arguments)]
     pub fn emit_to_scene(
         &self,
         win_size: (f32, f32),
         scale: f32,
+        pointer_px: (f32, f32),
         theme: &Theme,
         renderer: &mut Renderer,
         scene: &mut Scene,
@@ -411,44 +538,63 @@ impl XRayEngine {
             return;
         }
         let snap = self.snapshot();
+        let logical_w = win_size.0 / scale.max(0.25);
+        let compact_win = logical_w < 720.0;
+        let status_color = match snap.command_diagnosis.reason {
+            diagnosis::WaitReason::ActiveCompute => "success",
+            diagnosis::WaitReason::WaitingFileLock | diagnosis::WaitReason::PossibleDeadlock => {
+                "error"
+            }
+            diagnosis::WaitReason::WaitingStdin | diagnosis::WaitReason::Stopped => "warning",
+            diagnosis::WaitReason::WaitingNetwork | diagnosis::WaitReason::WaitingDiskIo => "cyan",
+            _ => "muted",
+        };
 
         if self.config.compact_indicator {
-            let focus = select_focus_process(&snap.nodes, snap.fg_pgid);
-            let status_text = if let Some(last) = focus {
+            let cmd = if snap.command_diagnosis.command_name.is_empty() {
+                "idle"
+            } else {
+                snap.command_diagnosis.command_name.as_str()
+            };
+            let label = if compact_win {
                 format!(
-                    "X-Ray [{}] {} · {:.1}% CPU · {} MB · {}",
-                    snap.level.name(),
-                    last.comm,
+                    "◈ {cmd} · {:.0}% · {}",
                     snap.total_cpu_percent,
-                    snap.total_rss_bytes / (1024 * 1024),
-                    last.diagnosis.reason.label()
+                    snap.command_diagnosis.reason.label()
                 )
             } else {
-                format!("X-Ray [{}] idle", snap.level.name())
+                format!(
+                    "◈ X-Ray [{}] {cmd} · {:.1}% CPU · {} MB · {:.0}s · {}",
+                    snap.level.name(),
+                    snap.total_cpu_percent,
+                    snap.total_rss_bytes / (1024 * 1024),
+                    snap.command_elapsed_secs,
+                    snap.command_diagnosis.reason.label()
+                )
             };
-            let badge = UiNode::Container {
-                padding: 6.0,
-                bg: Some(UiColor::Token("card".into())),
-                border: Some(UiColor::Token("cyan".into())),
-                radius: 6.0,
-                width: None,
-                height: None,
-                child: Box::new(UiNode::Text {
-                    text: status_text,
-                    size: Some(11.5),
-                    color: Some(UiColor::Token("fg".into())),
-                    align: Align::Start,
-                }),
+            let w = if compact_win {
+                (210.0 * scale).min(win_size.0 * 0.52).max(120.0 * scale)
+            } else {
+                (400.0 * scale).min(win_size.0 - 24.0 * scale)
             };
-            let w = (360.0 * scale).min(win_size.0 - 24.0);
-            let h = 28.0 * scale;
-            emit_ui_tree(
+            let h = 26.0 * scale;
+            let badge = UiNode::Button {
+                id: "xray-toggle".into(),
+                label,
+                bg: Some(UiColor::Token("surface-elevated".into())),
+                color: Some(UiColor::Token(status_color.into())),
+                width: Some(w / scale),
+                height: Some(h / scale),
+                radius: 8.0,
+            };
+            emit_ui_tree_interactive(
                 "xray-indicator",
                 &badge,
                 (12.0 * scale, (win_size.1 - h - 10.0 * scale).max(0.0), w, h),
                 scale,
-                0.92,
+                0.94,
                 UiLayer::Overlay,
+                Some(pointer_px),
                 theme,
                 renderer,
                 scene,
@@ -460,73 +606,415 @@ impl XRayEngine {
             return;
         }
 
-        let mut rows = vec![UiNode::Row {
-            gap: 8.0,
-            align: Align::Center,
-            children: vec![
-                UiNode::Icon {
-                    name: "xray".into(),
-                    size: Some(15.0),
-                    color: Some(UiColor::Token("cyan".into())),
-                },
-                UiNode::Text {
-                    text: format!("Beyrix X-Ray ({})", snap.level.name()),
-                    size: Some(14.0),
+        let tabs = vec![
+            "Overview".into(),
+            format!("Processes ({})", snap.nodes.len()),
+            format!("History ({})", snap.reports.len()),
+            "Trace".into(),
+        ];
+        let active_tab_idx = match self.active_tab {
+            XRayTab::Overview => 0,
+            XRayTab::Processes => 1,
+            XRayTab::History => 2,
+            XRayTab::Trace => 3,
+        };
+
+        let mut rows = vec![
+            UiNode::Row {
+                gap: 6.0,
+                align: Align::Center,
+                children: vec![
+                    UiNode::Icon {
+                        name: "xray".into(),
+                        size: Some(14.0),
+                        color: Some(UiColor::Token("cyan".into())),
+                    },
+                    UiNode::Text {
+                        text: format!(
+                            "Beyrix X-Ray · {}",
+                            if snap.command_diagnosis.command_name.is_empty() {
+                                "shell"
+                            } else {
+                                &snap.command_diagnosis.command_name
+                            }
+                        ),
+                        size: Some(14.0),
+                        color: Some(UiColor::Token("fg".into())),
+                        align: Align::Start,
+                    },
+                    UiNode::Badge {
+                        text: snap.command_diagnosis.confidence.label().into(),
+                        color: Some(UiColor::Token(status_color.into())),
+                        bg: None,
+                    },
+                    UiNode::Button {
+                        id: "xray-level-light".into(),
+                        label: "Light".into(),
+                        bg: Some(UiColor::Token(
+                            if snap.level == XRayLevel::Light {
+                                "accent-soft"
+                            } else {
+                                "surface"
+                            }
+                            .into(),
+                        )),
+                        color: Some(UiColor::Token("fg".into())),
+                        width: Some(50.0),
+                        height: Some(22.0),
+                        radius: 5.0,
+                    },
+                    UiNode::Button {
+                        id: "xray-level-inspect".into(),
+                        label: "Inspect".into(),
+                        bg: Some(UiColor::Token(
+                            if snap.level == XRayLevel::Inspect {
+                                "accent-soft"
+                            } else {
+                                "surface"
+                            }
+                            .into(),
+                        )),
+                        color: Some(UiColor::Token("fg".into())),
+                        width: Some(60.0),
+                        height: Some(22.0),
+                        radius: 5.0,
+                    },
+                    UiNode::Button {
+                        id: "xray-toggle".into(),
+                        label: "✕".into(),
+                        bg: Some(UiColor::Token("surface".into())),
+                        color: Some(UiColor::Token("muted".into())),
+                        width: Some(26.0),
+                        height: Some(22.0),
+                        radius: 5.0,
+                    },
+                ],
+            },
+            UiNode::Tabs {
+                id: "xray-tabs".into(),
+                tabs,
+                active: active_tab_idx,
+            },
+            UiNode::Divider {
+                vertical: false,
+                color: None,
+            },
+        ];
+
+        match self.active_tab {
+            XRayTab::Overview => {
+                rows.push(UiNode::Text {
+                    text: snap.command_diagnosis.summary.clone(),
+                    size: Some(12.5),
+                    color: Some(UiColor::Token(status_color.into())),
+                    align: Align::Start,
+                });
+                if !snap.command_diagnosis.wait_chain.is_empty() {
+                    rows.push(UiNode::Text {
+                        text: format!(
+                            "Wait chain: {}",
+                            snap.command_diagnosis.wait_chain.join(" → ")
+                        ),
+                        size: Some(11.0),
+                        color: Some(UiColor::Token("fg".into())),
+                        align: Align::Start,
+                    });
+                }
+                rows.push(UiNode::Text {
+                    text: format!(
+                        "Elapsed: {:.1}s  ·  Last output: {:.1}s ago  ·  Procs: {}",
+                        snap.command_elapsed_secs,
+                        snap.seconds_since_output,
+                        snap.nodes.len()
+                    ),
+                    size: Some(11.0),
+                    color: Some(UiColor::Token("muted".into())),
+                    align: Align::Start,
+                });
+                rows.push(UiNode::Row {
+                    gap: 10.0,
+                    align: Align::Center,
+                    children: vec![
+                        UiNode::Column {
+                            gap: 2.0,
+                            align: Align::Start,
+                            children: vec![
+                                UiNode::Text {
+                                    text: format!("CPU {:.1}%", snap.total_cpu_percent),
+                                    size: Some(10.5),
+                                    color: Some(UiColor::Token("cyan".into())),
+                                    align: Align::Start,
+                                },
+                                UiNode::Sparkline {
+                                    values: snap.cpu_history.clone(),
+                                    width: 150.0,
+                                    height: 26.0,
+                                    color: Some(UiColor::Token("cyan".into())),
+                                },
+                            ],
+                        },
+                        UiNode::Column {
+                            gap: 2.0,
+                            align: Align::Start,
+                            children: vec![
+                                UiNode::Text {
+                                    text: format!(
+                                        "RSS {} MB",
+                                        snap.total_rss_bytes / (1024 * 1024)
+                                    ),
+                                    size: Some(10.5),
+                                    color: Some(UiColor::Token("accent".into())),
+                                    align: Align::Start,
+                                },
+                                UiNode::Sparkline {
+                                    values: snap.rss_mb_history.clone(),
+                                    width: 150.0,
+                                    height: 26.0,
+                                    color: Some(UiColor::Token("accent".into())),
+                                },
+                            ],
+                        },
+                    ],
+                });
+                let (pr, pw, lr, lw) = snap.approx_io_totals;
+                rows.push(UiNode::Text {
+                    text: format!(
+                        "I/O (~approx procfs): Phys R {} / W {} KB  ·  Log R {} / W {} KB",
+                        pr / 1024,
+                        pw / 1024,
+                        lr / 1024,
+                        lw / 1024
+                    ),
+                    size: Some(10.5),
+                    color: Some(UiColor::Token("muted".into())),
+                    align: Align::Start,
+                });
+                rows.push(UiNode::Text {
+                    text: format!(
+                        "Source: {}  ·  Note: {}",
+                        snap.command_diagnosis.source, snap.command_diagnosis.limitations
+                    ),
+                    size: Some(10.5),
+                    color: Some(UiColor::Token("muted".into())),
+                    align: Align::Start,
+                });
+            }
+            XRayTab::Processes => {
+                let page_size = 6usize;
+                let max_scroll = snap.nodes.len().saturating_sub(page_size);
+                let offset = self.process_scroll.min(max_scroll);
+                rows.push(UiNode::Row {
+                    gap: 6.0,
+                    align: Align::Center,
+                    children: vec![
+                        UiNode::Text {
+                            text: format!(
+                                "Showing {}-{} of {}",
+                                if snap.nodes.is_empty() { 0 } else { offset + 1 },
+                                (offset + page_size).min(snap.nodes.len()),
+                                snap.nodes.len()
+                            ),
+                            size: Some(10.5),
+                            color: Some(UiColor::Token("muted".into())),
+                            align: Align::Start,
+                        },
+                        UiNode::Button {
+                            id: "xray-scroll-up".into(),
+                            label: "▲".into(),
+                            bg: Some(UiColor::Token("surface".into())),
+                            color: Some(UiColor::Token("fg".into())),
+                            width: Some(26.0),
+                            height: Some(20.0),
+                            radius: 4.0,
+                        },
+                        UiNode::Button {
+                            id: "xray-scroll-down".into(),
+                            label: "▼".into(),
+                            bg: Some(UiColor::Token("surface".into())),
+                            color: Some(UiColor::Token("fg".into())),
+                            width: Some(26.0),
+                            height: Some(20.0),
+                            radius: 4.0,
+                        },
+                    ],
+                });
+                for node in snap.nodes.iter().skip(offset).take(page_size) {
+                    let selected = self.selected_pid == Some((node.pid, node.starttime));
+                    rows.push(UiNode::Button {
+                        id: format!("xray-proc-{}", node.pid),
+                        label: format!(
+                            "PID {} ({}) · {} · {:.1}% · {}MB · {}",
+                            node.pid,
+                            node.comm,
+                            node.state.label(),
+                            node.cpu_percent,
+                            node.rss_bytes / (1024 * 1024),
+                            node.diagnosis.reason.label()
+                        ),
+                        bg: Some(UiColor::Token(
+                            if selected { "accent-soft" } else { "surface" }.into(),
+                        )),
+                        color: Some(UiColor::Token("fg".into())),
+                        width: Some(540.0),
+                        height: Some(22.0),
+                        radius: 5.0,
+                    });
+                }
+                if let Some((spid, sstart)) = self.selected_pid
+                    && let Some(sel) = snap
+                        .nodes
+                        .iter()
+                        .find(|n| n.pid == spid && n.starttime == sstart)
+                {
+                    rows.push(UiNode::Divider {
+                        vertical: false,
+                        color: None,
+                    });
+                    rows.push(UiNode::Text {
+                        text: format!(
+                            "PID {} PPID {} PGID {} · Threads {} · FDs {} · Sockets {}",
+                            sel.pid,
+                            sel.ppid,
+                            sel.pgid,
+                            sel.threads,
+                            sel.open_fds.len(),
+                            sel.net_sockets
+                        ),
+                        size: Some(10.5),
+                        color: Some(UiColor::Token("accent".into())),
+                        align: Align::Start,
+                    });
+                    rows.push(UiNode::Text {
+                        text: format!("Evidence: {}", sel.diagnosis.evidence.join("; ")),
+                        size: Some(10.5),
+                        color: Some(UiColor::Token("muted".into())),
+                        align: Align::Start,
+                    });
+                    if snap.capabilities.process_control {
+                        rows.push(UiNode::Row {
+                            gap: 6.0,
+                            align: Align::Center,
+                            children: vec![
+                                UiNode::Button {
+                                    id: "xray-act-pause".into(),
+                                    label: "Pause".into(),
+                                    bg: Some(UiColor::Token("surface".into())),
+                                    color: Some(UiColor::Token("warning".into())),
+                                    width: Some(58.0),
+                                    height: Some(22.0),
+                                    radius: 5.0,
+                                },
+                                UiNode::Button {
+                                    id: "xray-act-resume".into(),
+                                    label: "Resume".into(),
+                                    bg: Some(UiColor::Token("surface".into())),
+                                    color: Some(UiColor::Token("success".into())),
+                                    width: Some(64.0),
+                                    height: Some(22.0),
+                                    radius: 5.0,
+                                },
+                                UiNode::Button {
+                                    id: "xray-act-term".into(),
+                                    label: "Terminate".into(),
+                                    bg: Some(UiColor::Token("surface".into())),
+                                    color: Some(UiColor::Token("error".into())),
+                                    width: Some(78.0),
+                                    height: Some(22.0),
+                                    radius: 5.0,
+                                },
+                                UiNode::Button {
+                                    id: "xray-act-kill".into(),
+                                    label: "Kill".into(),
+                                    bg: Some(UiColor::Token("surface".into())),
+                                    color: Some(UiColor::Token("error".into())),
+                                    width: Some(46.0),
+                                    height: Some(22.0),
+                                    radius: 5.0,
+                                },
+                            ],
+                        });
+                    }
+                }
+                if let Some(msg) = &self.action_feedback {
+                    rows.push(UiNode::Text {
+                        text: msg.clone(),
+                        size: Some(10.5),
+                        color: Some(UiColor::Token("warning".into())),
+                        align: Align::Start,
+                    });
+                }
+            }
+            XRayTab::History => {
+                if snap.reports.is_empty() {
+                    rows.push(UiNode::Text {
+                        text: "No completed commands recorded yet.".into(),
+                        size: Some(11.5),
+                        color: Some(UiColor::Token("muted".into())),
+                        align: Align::Start,
+                    });
+                } else {
+                    for rep in snap.reports.iter().rev().take(6) {
+                        let waits = if rep.wait_events.is_empty() {
+                            "none".to_string()
+                        } else {
+                            rep.wait_events.join(", ")
+                        };
+                        rows.push(UiNode::Text {
+                            text: format!(
+                                "#{} {} · {:.2}s · peak {}MB ({} procs) · waits: {}",
+                                rep.command_id,
+                                rep.command,
+                                rep.duration_ms as f64 / 1000.0,
+                                rep.peak_rss_bytes / (1024 * 1024),
+                                rep.peak_process_count,
+                                waits
+                            ),
+                            size: Some(11.0),
+                            color: Some(UiColor::Token("fg".into())),
+                            align: Align::Start,
+                        });
+                    }
+                    rows.push(UiNode::Text {
+                        text:
+                            "Note: Peak RSS and I/O in reports are sampled approximations (procfs)."
+                                .into(),
+                        size: Some(10.0),
+                        color: Some(UiColor::Token("muted".into())),
+                        align: Align::Start,
+                    });
+                }
+            }
+            XRayTab::Trace => {
+                rows.push(UiNode::Text {
+                    text: if snap.capabilities.trace_syscalls {
+                        "Trace backend available (opt-in only).".into()
+                    } else {
+                        "Syscall Trace mode is unavailable in unprivileged mode.".into()
+                    },
+                    size: Some(12.0),
+                    color: Some(UiColor::Token("warning".into())),
+                    align: Align::Start,
+                });
+                rows.push(UiNode::Text {
+                    text: "Why: Linux Yama ptrace_scope / CAP_BPF / SELinux restrict syscall tracing without explicit privileges. Beyrix never runs as root and never bypasses OS security."
+                        .into(),
+                    size: Some(10.5),
+                    color: Some(UiColor::Token("muted".into())),
+                    align: Align::Start,
+                });
+                rows.push(UiNode::Text {
+                    text: "Light & Inspect modes remain fully active using unprivileged /proc & /proc/locks."
+                        .into(),
+                    size: Some(10.5),
                     color: Some(UiColor::Token("fg".into())),
                     align: Align::Start,
-                },
-                UiNode::Button {
-                    id: "xray-level-light".into(),
-                    label: "Light".into(),
-                    bg: None,
-                    color: None,
-                    width: Some(54.0),
-                    height: Some(22.0),
-                    radius: 4.0,
-                },
-                UiNode::Button {
-                    id: "xray-level-inspect".into(),
-                    label: "Inspect".into(),
-                    bg: None,
-                    color: None,
-                    width: Some(64.0),
-                    height: Some(22.0),
-                    radius: 4.0,
-                },
-            ],
-        }];
-
-        for node in snap.nodes.iter().take(6) {
-            rows.push(UiNode::Text {
-                text: format!(
-                    "PID {} ({}) · {} · {:.1}% CPU · {} MB · {}",
-                    node.pid,
-                    node.comm,
-                    node.state.label(),
-                    node.cpu_percent,
-                    node.rss_bytes / (1024 * 1024),
-                    node.diagnosis.summary
-                ),
-                size: Some(11.5),
-                color: Some(UiColor::Token("fg".into())),
-                align: Align::Start,
-            });
-            rows.push(UiNode::Text {
-                text: format!(
-                    "  Confidence: {} | Source: {} | Limit: {}",
-                    node.diagnosis.confidence.label(),
-                    node.diagnosis.source,
-                    node.diagnosis.limitations
-                ),
-                size: Some(10.5),
-                color: Some(UiColor::Token("muted".into())),
-                align: Align::Start,
-            });
+                });
+            }
         }
 
         let panel = UiNode::Container {
             padding: 12.0,
-            bg: Some(UiColor::Token("card".into())),
+            bg: Some(UiColor::Token("surface-elevated".into())),
             border: Some(UiColor::Token("cyan".into())),
             radius: 10.0,
             width: None,
@@ -538,20 +1026,90 @@ impl XRayEngine {
             }),
         };
 
-        let pw = (640.0 * scale).min(win_size.0 - 32.0);
-        let ph = (320.0 * scale).min(win_size.1 - 64.0);
-        emit_ui_tree(
+        let pw = (600.0 * scale).min(win_size.0 - 24.0 * scale);
+        let ph = (360.0 * scale).min(win_size.1 - 56.0 * scale);
+        emit_ui_tree_interactive(
             "xray-panel",
             &panel,
-            (16.0 * scale, 16.0 * scale, pw, ph),
+            (12.0 * scale, 12.0 * scale, pw, ph),
             scale,
             0.96,
             UiLayer::Overlay,
+            Some(pointer_px),
             theme,
             renderer,
             scene,
             hits,
         );
+    }
+}
+
+/// Build a command-level wait-chain diagnosis from the entire process tree.
+///
+/// Walks `bash -> cargo -> rustc` so that if a leaf descendant is actively
+/// computing (e.g. `rustc` at 80% CPU while `bash` and `cargo` are in
+/// `WaitingChild`), the command-level diagnosis reports active computation
+/// rather than misreporting the command as sleeping.
+pub fn diagnose_command_tree(nodes: &[ProcessNode], fg_pgid: Option<i32>) -> CommandDiagnosis {
+    let Some(focus) = select_focus_process(nodes, fg_pgid) else {
+        return CommandDiagnosis {
+            command_name: "idle".into(),
+            summary: "No active foreground process".into(),
+            ..Default::default()
+        };
+    };
+
+    // Reconstruct ancestor chain up to the root tracked process.
+    let mut chain = vec![focus.comm.clone()];
+    let mut cur_ppid = focus.ppid;
+    for _ in 0..16 {
+        if let Some(parent) = nodes.iter().find(|n| n.pid == cur_ppid) {
+            chain.push(parent.comm.clone());
+            if parent.ppid == cur_ppid {
+                break;
+            }
+            cur_ppid = parent.ppid;
+        } else {
+            break;
+        }
+    }
+    chain.reverse();
+
+    // If any foreground descendant is actively computing (>= 5% CPU or Running)
+    // and the focus isn't blocked on a hard file lock / deadlock / stdin,
+    // surface the active computation so a waiting parent never hides real work.
+    let active_compute = nodes.iter().find(|n| {
+        fg_pgid.is_none_or(|fg| n.pgid == fg)
+            && n.diagnosis.reason == diagnosis::WaitReason::ActiveCompute
+    });
+    if let Some(worker) = active_compute
+        && !matches!(
+            focus.diagnosis.reason,
+            diagnosis::WaitReason::WaitingFileLock | diagnosis::WaitReason::PossibleDeadlock
+        )
+    {
+        return CommandDiagnosis {
+            command_name: worker.comm.clone(),
+            wait_chain: chain,
+            summary: format!(
+                "{} is actively computing ({:.1}% CPU)",
+                worker.comm, worker.cpu_percent
+            ),
+            reason: diagnosis::WaitReason::ActiveCompute,
+            confidence: worker.diagnosis.confidence,
+            source: worker.diagnosis.source.clone(),
+            limitations: worker.diagnosis.limitations.clone(),
+        };
+    }
+
+    CommandDiagnosis {
+        command_name: focus.comm.clone(),
+        wait_chain: chain,
+        summary: focus.diagnosis.summary.clone(),
+        reason: focus.diagnosis.reason,
+        confidence: focus.diagnosis.confidence,
+        source: focus.diagnosis.source.clone(),
+        limitations: focus.diagnosis.limitations.clone(),
     }
 }
 
@@ -978,5 +1536,87 @@ else:
         assert!(!engine.take_dirty());
         engine.set_level(XRayLevel::Inspect);
         assert!(engine.take_dirty());
+    }
+
+    #[test]
+    fn command_level_wait_chain_reports_active_rustc_not_sleeping_bash() {
+        let mk = |pid, ppid, pgid, comm: &str, reason, cpu| ProcessNode {
+            pid,
+            ppid,
+            pgid,
+            starttime: 100,
+            comm: comm.into(),
+            state: if reason == diagnosis::WaitReason::ActiveCompute {
+                ProcessStateKind::Running
+            } else {
+                ProcessStateKind::Sleeping
+            },
+            cpu_percent: cpu,
+            rss_bytes: 32 * 1024 * 1024,
+            threads: 1,
+            read_bytes: 0,
+            write_bytes: 0,
+            logical_read_bytes: 0,
+            logical_write_bytes: 0,
+            open_fds: Vec::new(),
+            net_sockets: 0,
+            diagnosis: Diagnosis {
+                reason,
+                summary: reason.label().into(),
+                evidence: Vec::new(),
+                source: "procfs".into(),
+                confidence: diagnosis::Confidence::High,
+                limitations: String::new(),
+                updated_at: Instant::now(),
+            },
+        };
+        let tree = vec![
+            mk(10, 1, 10, "bash", diagnosis::WaitReason::WaitingChild, 0.0),
+            mk(
+                20,
+                10,
+                20,
+                "cargo",
+                diagnosis::WaitReason::WaitingChild,
+                0.5,
+            ),
+            mk(
+                30,
+                20,
+                20,
+                "rustc",
+                diagnosis::WaitReason::ActiveCompute,
+                88.0,
+            ),
+        ];
+        let diag = diagnose_command_tree(&tree, Some(20));
+        assert_eq!(diag.reason, diagnosis::WaitReason::ActiveCompute);
+        assert_eq!(diag.command_name, "rustc");
+        assert_eq!(diag.wait_chain, vec!["bash", "cargo", "rustc"]);
+
+        // Render compact + full panel across all 4 tabs without panicking.
+        let mut engine = XRayEngine::new(XRayConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        engine.toggle_panel();
+        let mut renderer = Renderer::new().unwrap();
+        let theme = Theme::default();
+        for tab_idx in 0..4 {
+            engine.handle_hit("xray-tabs", HitKind::Tab(tab_idx));
+            let mut scene = Scene::default();
+            let mut hits = Vec::new();
+            engine.emit_to_scene(
+                (600.0, 500.0),
+                1.0,
+                (0.0, 0.0),
+                &theme,
+                &mut renderer,
+                &mut scene,
+                &mut hits,
+            );
+            assert!(!scene.overlay_rounded.is_empty());
+            assert!(!hits.is_empty());
+        }
     }
 }

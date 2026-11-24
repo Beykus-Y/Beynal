@@ -47,7 +47,7 @@ impl ProcessStateKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WaitReason {
     ActiveCompute,
     WaitingStdin,
@@ -60,6 +60,7 @@ pub enum WaitReason {
     Zombie,
     PossibleDeadlock,
     NoObservedActivity,
+    #[default]
     Unknown,
 }
 
@@ -82,11 +83,12 @@ impl WaitReason {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Confidence {
     High,
     Medium,
     Low,
+    #[default]
     Unknown,
 }
 

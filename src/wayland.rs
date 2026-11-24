@@ -1311,13 +1311,8 @@ impl State {
                 let (px, py) = (x as f32, y as f32);
                 if px >= hit.x && px <= hit.x + hit.w && py >= hit.y && py <= hit.y + hit.h {
                     if let Some(xray) = &mut self.xray {
-                        match hit.node_id.as_str() {
-                            "xray-level-light" => xray.set_level(crate::config::XRayLevel::Light),
-                            "xray-level-inspect" => {
-                                xray.set_level(crate::config::XRayLevel::Inspect)
-                            }
-                            _ => {}
-                        }
+                        xray.handle_hit(&hit.node_id, hit.kind);
+                        self.platform_dirty = true;
                         self.dirty = true;
                     }
                     return;
@@ -2741,7 +2736,15 @@ impl State {
         }
         if let Some(xray) = &self.xray {
             self.xray_hits.clear();
-            xray.emit_to_scene(win_size, scale, theme, renderer, scene, &mut self.xray_hits);
+            xray.emit_to_scene(
+                win_size,
+                scale,
+                pointer_px,
+                theme,
+                renderer,
+                scene,
+                &mut self.xray_hits,
+            );
         }
         if self.settings_overlay.open {
             self.settings_overlay.emit_to_scene(
