@@ -283,8 +283,13 @@ struct State {
     pointer_position: (f64, f64),
     wheel_axis: f64,
     wheel_steps: Option<f64>,
+    wheel_h_axis: f64,
+    wheel_h_steps: Option<f64>,
     wheel_remainder: f64,
     wheel_mouse_remainder: f64,
+    wheel_h_mouse_remainder: f64,
+    last_serial: u32,
+    default_font_size: f32,
     mouse_button: Option<crate::mouse::Button>,
     drag_scroll_at: Option<std::time::Instant>,
     selection: crate::selection::Selection,
@@ -653,8 +658,17 @@ fn row_hash(
             &mut hash,
             u64::from(cell.wide)
                 | (u64::from(cell.continuation) << 1)
-                | (u64::from(cell.written) << 2),
+                | (u64::from(cell.written) << 2)
+                | (u64::from(cell.attrs.0) << 8)
+                | ((cell.underline as u64) << 24)
+                | (u64::from(cell.hyperlink_id) << 32),
         );
+        if let Some(ulc) = cell.underline_color {
+            hash_mix(
+                &mut hash,
+                u32::from_le_bytes([ulc[0], ulc[1], ulc[2], 1]) as u64,
+            );
+        }
         hash_mix(
             &mut hash,
             u32::from_le_bytes([cell.fg[0], cell.fg[1], cell.fg[2], 0]) as u64,
@@ -887,7 +901,10 @@ impl State {
         }
         let renderer =
             render::Renderer::with_theme(theme.clone()).map_err(|e| format!("load fonts: {e}"))?;
-        let (columns, rows) = self.surface_sizes().grid_size(&renderer);
+        self.default_font_size = theme.font_size;
+        let sizes = self.surface_sizes();
+        let (columns, rows) = sizes.grid_size(&renderer);
+        let init_geom = sizes.geometry(&renderer);
         let requested = theme.renderer;
         let mut gl = None;
         let reason;
@@ -940,7 +957,11 @@ impl State {
         if let Some(control) = &self.control {
             control.set_prompt(&theme)?;
         }
-        let terminal = Terminal::with_theme(columns, rows, theme);
+        let mut terminal = Terminal::with_theme(columns, rows, theme);
+        terminal.screen_mut().set_pixel_metrics(
+            (columns * init_geom.cell_width, rows * init_geom.cell_height),
+            (init_geom.cell_width, init_geom.cell_height),
+        );
         self.damage_full = true;
 
         // Начальный commit без буфера:
@@ -1151,14 +1172,21 @@ impl State {
             self.generation += 1;
             self.buffers.retain(|frame| frame.busy);
         }
-        if let Some(terminal) = &mut self.terminal
-            && (terminal.screen().columns, terminal.screen().rows) != (columns, rows)
-        {
-            if let Some(pty) = &self.pty {
-                pty.resize(columns as u16, rows as u16)
-                    .map_err(|e| format!("TIOCSWINSZ: {e}"))?;
+        if let Some(terminal) = &mut self.terminal {
+            let geom = self.renderer.as_ref().map(|r| sizes.geometry(r));
+            let (cw, ch) = geom.map_or((9, 18), |g| (g.cell_width, g.cell_height));
+            let xpix = (columns * cw).min(u16::MAX as usize) as u16;
+            let ypix = (rows * ch).min(u16::MAX as usize) as u16;
+            terminal
+                .screen_mut()
+                .set_pixel_metrics((columns * cw, rows * ch), (cw, ch));
+            if (terminal.screen().columns, terminal.screen().rows) != (columns, rows) {
+                if let Some(pty) = &self.pty {
+                    pty.resize_with_pixels(columns as u16, rows as u16, xpix, ypix)
+                        .map_err(|e| format!("TIOCSWINSZ: {e}"))?;
+                }
+                terminal.resize(columns, rows);
             }
-            terminal.resize(columns, rows);
         }
         if let Some(editor) = &mut self.editor {
             editor.follow_cursor();
@@ -1215,10 +1243,10 @@ impl State {
         pressed: bool,
         motion: bool,
     ) -> bool {
-        let Some((mode, sgr)) = self.terminal.as_ref().map(|terminal| {
+        let Some((mode, encoding)) = self.terminal.as_ref().map(|terminal| {
             (
                 terminal.screen().mouse_mode(),
-                terminal.screen().mouse_sgr(),
+                terminal.screen().mouse_encoding(),
             )
         }) else {
             return false;
@@ -1226,12 +1254,21 @@ impl State {
         let Some((column, row)) = self.mouse_cell() else {
             return false;
         };
+        let (pixel_x, pixel_y) = self.pointer_geometry().map_or((0, 0), |g| {
+            let (px, py) = self.surface_sizes().physical_point(self.pointer_position);
+            (
+                (px - g.origin_x() as f64).max(0.0).round() as usize,
+                (py - g.origin_y() as f64).max(0.0).round() as usize,
+            )
+        });
         let Some(bytes) = crate::mouse::encode(crate::mouse::Event {
             mode,
-            sgr,
+            encoding,
             button,
             column,
             row,
+            pixel_x,
+            pixel_y,
             pressed,
             motion,
             modifiers: self.pointer_modifiers(),
@@ -1294,13 +1331,7 @@ impl State {
                     .handle_click((x as f32, y as f32), &mut self.platform_config);
                 if consumed {
                     if changed {
-                        if let Some(bg) = &mut self.background {
-                            bg.config = self.platform_config.background.clone();
-                        }
-                        if let Some(xr) = &mut self.xray {
-                            xr.set_level(self.platform_config.xray.level);
-                            xr.config = self.platform_config.xray.clone();
-                        }
+                        self.reconcile_platform_subsystems();
                     }
                     self.platform_dirty = true;
                     self.dirty = true;
@@ -1326,6 +1357,16 @@ impl State {
             }
             if self.mouse_reporting() && self.report_mouse(Some(button), true, false) {
                 self.mouse_button = Some(button);
+                return;
+            }
+            if button == crate::mouse::Button::Left
+                && self.pointer_modifiers().ctrl
+                && let Some((col, row)) = self.mouse_cell()
+                && let Some(terminal) = &self.terminal
+                && let Some(cell) = terminal.screen().get(col, row)
+                && let Some(url) = terminal.screen().hyperlink_url(cell.hyperlink_id)
+            {
+                open_safe_hyperlink(url);
                 return;
             }
             if button == crate::mouse::Button::Left
@@ -1394,7 +1435,22 @@ impl State {
         let steps = self.wheel_steps.take().unwrap_or(self.wheel_axis / 10.0);
         self.wheel_axis = 0.0;
         let steps = if steps.is_finite() { steps } else { 0.0 };
+        let h_steps = self
+            .wheel_h_steps
+            .take()
+            .unwrap_or(self.wheel_h_axis / 10.0);
+        self.wheel_h_axis = 0.0;
+        let h_steps = if h_steps.is_finite() { h_steps } else { 0.0 };
         let sizes = self.surface_sizes();
+        let (px, py) = sizes.physical_point(self.pointer_position);
+        if self.editor.is_none()
+            && steps.abs() > 0.0
+            && let Some(widgets) = &mut self.widgets
+            && widgets.handle_pointer_scroll((px as f32, py as f32), (steps * 24.0) as f32)
+        {
+            self.dirty = true;
+            return;
+        }
         if let Some(editor) = &mut self.editor {
             let (rows, remainder) = wheel_rows(self.wheel_remainder, steps, 3);
             self.wheel_remainder = remainder;
@@ -1404,8 +1460,7 @@ impl State {
                 self.dirty |= editor.scroll(-rows, x, y, metrics(geometry, sizes));
             }
         } else if self.mouse_reporting() {
-            // Report whole wheel notches and keep the fractional remainder so
-            // high-resolution touchpad scrolling does not lose events.
+            // Report whole vertical wheel notches and keep fractional remainder.
             self.wheel_mouse_remainder += steps;
             let notches = self.wheel_mouse_remainder.trunc();
             self.wheel_mouse_remainder -= notches;
@@ -1417,11 +1472,36 @@ impl State {
             for _ in 0..notches.abs().min(64.0) as usize {
                 self.report_mouse(Some(button), true, false);
             }
+            // Horizontal wheel notches (WheelLeft / WheelRight).
+            self.wheel_h_mouse_remainder += h_steps;
+            let h_notches = self.wheel_h_mouse_remainder.trunc();
+            self.wheel_h_mouse_remainder -= h_notches;
+            let h_button = if h_notches > 0.0 {
+                crate::mouse::Button::WheelRight
+            } else {
+                crate::mouse::Button::WheelLeft
+            };
+            for _ in 0..h_notches.abs().min(64.0) as usize {
+                self.report_mouse(Some(h_button), true, false);
+            }
         } else if let Some(terminal) = &mut self.terminal {
             let screen = terminal.screen_mut();
-            let (rows, remainder) = wheel_rows(self.wheel_remainder, steps, screen.scroll_speed());
-            self.wheel_remainder = remainder;
-            self.dirty |= screen.scroll_view(rows);
+            if screen.is_alternate_screen() && screen.alternate_scroll {
+                // DEC ?1007 Alternate Scroll Mode: translate wheel to Up/Down arrow keys.
+                self.wheel_mouse_remainder += steps;
+                let notches = self.wheel_mouse_remainder.trunc();
+                self.wheel_mouse_remainder -= notches;
+                let up = notches < 0.0;
+                let seq = crate::keyboard::alternate_scroll_sequence(up, screen.app_cursor_keys);
+                for _ in 0..notches.abs().min(32.0) as usize {
+                    self.input.extend(seq);
+                }
+            } else {
+                let (rows, remainder) =
+                    wheel_rows(self.wheel_remainder, steps, screen.scroll_speed());
+                self.wheel_remainder = remainder;
+                self.dirty |= screen.scroll_view(rows);
+            }
         }
         self.update_drag(false);
     }
@@ -1767,24 +1847,102 @@ impl State {
                     self.editor_key(key, serial, qh);
                 }
             } else {
-                self.dispatch_terminal_key_press(key, serial, qh);
+                self.dispatch_terminal_key_event(
+                    key,
+                    serial,
+                    qh,
+                    crate::keyboard::KeyEventType::Repeat,
+                );
             }
         }
     }
 
-    /// Route a terminal key press (from live Wayland or E2E input tests) through
-    /// configurable hotkeys, Smart Ctrl+C / Ctrl+V, scrollback, and XKB translation.
-    /// Returns `true` if the key is eligible for Wayland autorepeat.
     fn dispatch_terminal_key_press(
         &mut self,
         key: u32,
         serial: u32,
         qh: Option<&QueueHandle<Self>>,
     ) -> bool {
+        self.dispatch_terminal_key_event(key, serial, qh, crate::keyboard::KeyEventType::Press)
+    }
+
+    /// Route a terminal key press/repeat (from live Wayland or E2E input tests) through
+    /// configurable hotkeys, Smart Ctrl+C / Ctrl+V, scrollback, font zoom, and mode-aware XKB translation.
+    /// Returns `true` if the key is eligible for Wayland autorepeat.
+    fn dispatch_terminal_key_event(
+        &mut self,
+        key: u32,
+        serial: u32,
+        qh: Option<&QueueHandle<Self>>,
+        event_type: crate::keyboard::KeyEventType,
+    ) -> bool {
+        self.last_serial = serial;
         let Some((ctrl, shift, alt)) = self.xkb.as_ref().map(|x| (x.control(), x.shift(), x.alt()))
         else {
             return false;
         };
+
+        // Escape closes open native Settings Overlay or Visual Layout Editor without leaking to PTY.
+        if key == 1 && !ctrl && !shift && !alt {
+            if self.settings_overlay.open {
+                self.settings_overlay.open = false;
+                self.platform_dirty = true;
+                self.dirty = true;
+                return false;
+            }
+            if let Some(w) = &mut self.widgets
+                && w.editor.active
+            {
+                w.editor.toggle();
+                self.platform_dirty = true;
+                self.dirty = true;
+                return false;
+            }
+        }
+
+        // Live font zoom: Ctrl+= / Ctrl++ (evdev 13/78), Ctrl+- (12/74), Ctrl+0 (11/82).
+        if ctrl && !alt && matches!(key, 13 | 78 | 12 | 74 | 11 | 82) {
+            if let Some(renderer) = &mut self.renderer {
+                let next = match key {
+                    13 | 78 => renderer.font_size() + 1.5,
+                    12 | 74 => renderer.font_size() - 1.5,
+                    _ => {
+                        if self.default_font_size > 0.0 {
+                            self.default_font_size
+                        } else {
+                            16.0
+                        }
+                    }
+                };
+                renderer.set_font_size(next);
+                if let Some(gl) = &mut self.gl {
+                    gl.invalidate_atlas();
+                }
+            }
+            self.sync_pty_grid_after_layout_change();
+            self.damage_full = true;
+            self.dirty = true;
+            return false;
+        }
+
+        // Ctrl+Shift+Up/Down: jump between OSC 133 semantic command prompts in scrollback.
+        if ctrl && shift && !alt && matches!(key, 103 | 108) {
+            if let Some(t) = &mut self.terminal {
+                let current = t.screen().visible_start();
+                let target = if key == 103 {
+                    t.screen().prev_command_row(current)
+                } else {
+                    t.screen().next_command_row(current)
+                };
+                if let Some(row) = target {
+                    self.dirty |= t.screen_mut().scroll_to_absolute_row(row);
+                } else if key == 108 {
+                    self.dirty |= t.screen().view_offset() > 0;
+                    t.screen_mut().reset_view();
+                }
+            }
+            return false;
+        }
 
         // Shift + Home / End / PageUp / PageDown -> scrollback navigation.
         if shift && !ctrl && !alt && matches!(key, 102 | 107 | 104 | 109) {
@@ -1906,7 +2064,14 @@ impl State {
             return false;
         }
 
-        let bytes = self.xkb.as_ref().map_or_else(Vec::new, |x| x.key(key));
+        let modes = self
+            .terminal
+            .as_ref()
+            .map_or_else(Default::default, |t| t.screen().input_modes());
+        let bytes = self
+            .xkb
+            .as_ref()
+            .map_or_else(Vec::new, |x| x.key_with_modes(key, modes, event_type));
         if !bytes.is_empty()
             && let Some(t) = &mut self.terminal
         {
@@ -1987,6 +2152,31 @@ impl State {
                     );
                 }
                 self.input.extend(terminal.take_responses());
+                if let Some(title) = terminal.screen_mut().take_title()
+                    && self.editor.is_none()
+                    && let Some(toplevel) = &self.toplevel
+                {
+                    toplevel.set_title(if title.is_empty() {
+                        "Beyrix".to_string()
+                    } else {
+                        title
+                    });
+                }
+                if let Some(clip_text) = terminal.screen_mut().take_clipboard_write() {
+                    #[cfg(test)]
+                    {
+                        self.test_clipboard = Some(clip_text.clone());
+                    }
+                    let _ = clip_text;
+                }
+                let shell_events = terminal.screen_mut().drain_shell_events();
+                if !shell_events.is_empty()
+                    && let Some(xray) = &self.xray
+                {
+                    for ev in shell_events {
+                        xray.notify_shell_event(ev);
+                    }
+                }
                 if total >= MAX_BURST {
                     break;
                 }
@@ -2104,6 +2294,16 @@ impl State {
 
     fn redraw(&mut self, qh: &QueueHandle<Self>) -> Result<(), Box<dyn Error>> {
         if !self.configured || !self.dirty || self.frame_pending {
+            return Ok(());
+        }
+        // DEC mode 2026 Synchronized Output: defer presenting intermediate frames
+        // until the application ends the synchronized update (or safety timeout elapses).
+        if self.editor.is_none()
+            && self
+                .terminal
+                .as_ref()
+                .is_some_and(|t| t.screen().is_synchronized_active())
+        {
             return Ok(());
         }
         if self.backend == ActiveBackend::OpenGl && self.gl.is_some() {
@@ -2441,6 +2641,113 @@ impl State {
             .grid_size(w, h)
     }
 
+    fn sync_pty_grid_after_layout_change(&mut self) {
+        let Some(renderer) = &self.renderer else {
+            return;
+        };
+        let sizes = self.surface_sizes();
+        let (cols, rows) = self.effective_grid_size(sizes, renderer);
+        let geom = sizes.geometry(renderer);
+        let xpix = (cols * geom.cell_width).min(u16::MAX as usize) as u16;
+        let ypix = (rows * geom.cell_height).min(u16::MAX as usize) as u16;
+        if let Some(terminal) = &mut self.terminal {
+            terminal.screen_mut().set_pixel_metrics(
+                (cols * geom.cell_width, rows * geom.cell_height),
+                (geom.cell_width, geom.cell_height),
+            );
+            if (terminal.screen().columns, terminal.screen().rows) != (cols, rows) {
+                if let Some(pty) = &self.pty {
+                    let _ = pty.resize_with_pixels(cols as u16, rows as u16, xpix, ypix);
+                }
+                terminal.resize(cols, rows);
+                self.damage_full = true;
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Reconcile live runtime subsystems (Widgets, Background, Media, Audio, X-Ray)
+    /// against `self.platform_config`. Starts newly enabled subsystems, cleanly drops
+    /// disabled ones, updates live configs, and adjusts PTY viewport if Dock insets changed.
+    fn reconcile_platform_subsystems(&mut self) {
+        let cfg = self.platform_config.clone();
+        let theme = self
+            .terminal
+            .as_ref()
+            .map_or_else(crate::theme::Theme::default, |t| t.screen().theme().clone());
+
+        // 1. Media & System Audio Capture
+        if cfg.media.enabled {
+            let needs_restart = self.media.as_ref().is_none_or(|m| {
+                m.config.mpris_enabled != cfg.media.mpris_enabled
+                    || m.config.player_enabled != cfg.media.player_enabled
+                    || m.config.audio_capture_enabled != cfg.media.audio_capture_enabled
+                    || m.config.audio_capture_source != cfg.media.audio_capture_source
+            });
+            if needs_restart {
+                self.media = None;
+                let mut media = crate::media::MediaManager::new(cfg.media.clone());
+                media.ensure_started(self.bus.clone());
+                self.media = Some(media);
+            }
+        } else {
+            self.media = None;
+        }
+
+        // 2. 3D Background Engine
+        if cfg.background.enabled {
+            if let Some(bg) = &mut self.background {
+                bg.config = cfg.background.clone();
+            } else {
+                self.background = Some(crate::background::BackgroundEngine::new(
+                    cfg.background.clone(),
+                ));
+            }
+        } else {
+            self.background = None;
+        }
+
+        // 3. X-Ray Diagnostics
+        if cfg.xray.enabled {
+            if let Some(xr) = &mut self.xray {
+                xr.set_level(cfg.xray.level);
+                xr.config = cfg.xray.clone();
+            } else if let Some(pty) = &self.pty {
+                let mut xray = crate::xray::XRayEngine::new(cfg.xray.clone());
+                xray.ensure_started(
+                    pty.child_pid,
+                    Some(pty.master.as_raw_fd()),
+                    self.bus.clone(),
+                );
+                self.xray = Some(xray);
+            }
+        } else {
+            self.xray = None;
+            self.xray_hits.clear();
+        }
+
+        // 4. BeyrixWidgets JS Runtime
+        if cfg.widgets.enabled {
+            if let Some(w) = &mut self.widgets {
+                w.config = cfg.widgets.clone();
+            } else {
+                let mut widgets = crate::widgets::WidgetManager::new(cfg.widgets.clone());
+                if let Err(e) = widgets.ensure_started(theme, self.bus.clone()) {
+                    self.settings_overlay.status_message = Some(format!("Widgets error: {e}"));
+                }
+                self.widgets = Some(widgets);
+            }
+        } else {
+            self.widgets = None;
+        }
+
+        // 5. Recompute PTY viewport in case Dock insets appeared or disappeared.
+        self.sync_pty_grid_after_layout_change();
+        self.damage_full = true;
+        self.platform_dirty = true;
+        self.dirty = true;
+    }
+
     fn init_platform_subsystems(&mut self, child_pid: libc::pid_t, pty_master_fd: i32) {
         let cfg = load_platform_config();
         self.platform_config = cfg.clone();
@@ -2474,6 +2781,10 @@ impl State {
 
     fn pump_platform(&mut self) {
         if let Some(widgets) = &mut self.widgets {
+            if widgets.poll_hot_reload() > 0 {
+                self.platform_dirty = true;
+                self.dirty = true;
+            }
             if widgets.take_dirty() {
                 self.platform_dirty = true;
                 self.dirty = true;
@@ -2758,6 +3069,24 @@ impl State {
             );
         }
     }
+}
+
+/// Safely open an OSC 8 hyperlink only if its scheme is explicitly allowlisted
+/// (`http://`, `https://`, or `file://`) and it contains no control characters.
+fn open_safe_hyperlink(url: &str) {
+    let trimmed = url.trim();
+    let allowed = trimmed.starts_with("https://")
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("file://");
+    if !allowed || trimmed.len() > 2048 || trimmed.chars().any(|c| c.is_control()) {
+        return;
+    }
+    let _ = std::process::Command::new("xdg-open")
+        .arg(trimmed)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 fn load_platform_config() -> crate::config::PlatformConfig {
@@ -3119,17 +3448,39 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                     state.scroll_pointer();
                 }
             }
+            wl_pointer::Event::Axis {
+                axis: wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll),
+                value,
+                ..
+            } if state.pointer_focus => {
+                state.wheel_h_axis += value;
+                if pointer.version() < 5 {
+                    state.scroll_pointer();
+                }
+            }
             wl_pointer::Event::AxisDiscrete {
                 axis: wayland_client::WEnum::Value(wl_pointer::Axis::VerticalScroll),
                 discrete,
             } if state.pointer_focus => {
                 *state.wheel_steps.get_or_insert(0.0) += f64::from(discrete);
             }
+            wl_pointer::Event::AxisDiscrete {
+                axis: wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll),
+                discrete,
+            } if state.pointer_focus => {
+                *state.wheel_h_steps.get_or_insert(0.0) += f64::from(discrete);
+            }
             wl_pointer::Event::AxisValue120 {
                 axis: wayland_client::WEnum::Value(wl_pointer::Axis::VerticalScroll),
                 value120,
             } if state.pointer_focus => {
                 *state.wheel_steps.get_or_insert(0.0) += f64::from(value120) / 120.0;
+            }
+            wl_pointer::Event::AxisValue120 {
+                axis: wayland_client::WEnum::Value(wl_pointer::Axis::HorizontalScroll),
+                value120,
+            } if state.pointer_focus => {
+                *state.wheel_h_steps.get_or_insert(0.0) += f64::from(value120) / 120.0;
             }
             wl_pointer::Event::Frame if state.pointer_focus => state.scroll_pointer(),
             wl_pointer::Event::Motion {
@@ -3205,8 +3556,18 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 }
             }
             wl_keyboard::Event::Enter { surface, .. } => {
-                state.keyboard_focus = state.surface.as_ref() == Some(&surface);
+                let focused = state.surface.as_ref() == Some(&surface);
+                state.keyboard_focus = focused;
                 state.dirty = true;
+                if focused
+                    && state.editor.is_none()
+                    && state
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|t| t.screen().focus_reporting)
+                {
+                    state.input.extend(b"\x1b[I");
+                }
                 if state.debug_input {
                     eprintln!("[input] keyboard enter: focused={}", state.keyboard_focus);
                 }
@@ -3215,6 +3576,14 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 state.keyboard_focus = false;
                 state.repeat_key = None;
                 state.dirty = true;
+                if state.editor.is_none()
+                    && state
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|t| t.screen().focus_reporting)
+                {
+                    state.input.extend(b"\x1b[O");
+                }
                 if state.debug_input {
                     eprintln!("[input] keyboard leave");
                 }
@@ -3272,6 +3641,20 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 if key_state == wayland_client::WEnum::Value(wl_keyboard::KeyState::Released) {
                     if state.repeat_key.as_ref().is_some_and(|r| r.key == key) {
                         state.repeat_key = None;
+                    }
+                    if state.keyboard_focus
+                        && state.editor.is_none()
+                        && let (Some(xkb), Some(term)) = (&state.xkb, &state.terminal)
+                    {
+                        let modes = term.screen().input_modes();
+                        if (modes.kitty_flags & 2) != 0 {
+                            let bytes = xkb.key_with_modes(
+                                key,
+                                modes,
+                                crate::keyboard::KeyEventType::Release,
+                            );
+                            state.input.extend(bytes);
+                        }
                     }
                     return;
                 }

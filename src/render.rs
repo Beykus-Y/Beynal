@@ -274,6 +274,18 @@ impl Renderer {
         }
         Ok(())
     }
+    pub fn set_font_size(&mut self, size: f32) {
+        let clamped = size.clamp(6.0, 96.0);
+        if (self.theme.font_size - clamped).abs() > 0.05 {
+            self.theme.font_size = clamped;
+            self.font_geometry.set(None);
+            self.cache.clear();
+            self.cache_bytes = 0;
+        }
+    }
+    pub fn font_size(&self) -> f32 {
+        self.theme.font_size
+    }
     pub fn cursor_blinks(&self, screen: &Screen) -> bool {
         self.theme.cursor_blink && screen.cursor_style.is_none_or(|style| style.blink)
     }
@@ -517,38 +529,249 @@ impl Renderer {
                 if cell.continuation {
                     continue;
                 }
-                let foreground = if block_covers(x, y) {
+                let mut foreground = if block_covers(x, y) {
                     background
                 } else if selection.contains(screen, y, x) {
                     selection_foreground
                 } else {
                     rgba(resolve_color(cell.fg, cell.fg_origin, &self.theme))
                 };
+                if cell.attrs.contains(crate::terminal::CellAttrs::DIM) {
+                    foreground[3] *= 0.58;
+                }
+                if cell.attrs.contains(crate::terminal::CellAttrs::BOLD) && !block_covers(x, y) {
+                    foreground[0] = (foreground[0] * 1.12).min(1.0);
+                    foreground[1] = (foreground[1] * 1.12).min(1.0);
+                    foreground[2] = (foreground[2] * 1.12).min(1.0);
+                }
                 let cell_left = inner_left + x as f32 * cell_w;
                 let cell_right = cell_left + cell_w * if cell.wide { 2.0 } else { 1.0 };
-                for (index, ch) in std::iter::once(cell.character)
-                    .chain(cell.combining.iter().copied())
-                    .enumerate()
-                {
-                    if ch == ' ' {
-                        continue;
+                let hidden = cell.attrs.contains(crate::terminal::CellAttrs::CONCEAL)
+                    || (cell.attrs.contains(crate::terminal::CellAttrs::BLINK) && !blink_on);
+                if !hidden {
+                    for (index, ch) in std::iter::once(cell.character)
+                        .chain(cell.combining.iter().copied())
+                        .enumerate()
+                    {
+                        if ch == ' ' {
+                            continue;
+                        }
+                        self.push_scene_glyph(
+                            &mut scene,
+                            ch,
+                            index != 0,
+                            px_size,
+                            cell_left,
+                            cell_right,
+                            top,
+                            bottom,
+                            baseline,
+                            inner_left,
+                            inner_right,
+                            foreground,
+                        );
+                        // Synthetic bold weight: subtle +1px horizontal double-strike.
+                        if cell.attrs.contains(crate::terminal::CellAttrs::BOLD)
+                            && index == 0
+                            && cell_left + 1.0 < cell_right
+                        {
+                            self.push_scene_glyph(
+                                &mut scene,
+                                ch,
+                                false,
+                                px_size,
+                                cell_left + scale.max(1.0) * 0.65,
+                                cell_right,
+                                top,
+                                bottom,
+                                baseline,
+                                inner_left,
+                                inner_right,
+                                [
+                                    foreground[0],
+                                    foreground[1],
+                                    foreground[2],
+                                    foreground[3] * 0.55,
+                                ],
+                            );
+                        }
                     }
-                    self.push_scene_glyph(
-                        &mut scene,
-                        ch,
-                        index != 0,
-                        px_size,
-                        cell_left,
-                        cell_right,
-                        top,
-                        bottom,
-                        baseline,
-                        inner_left,
-                        inner_right,
-                        foreground,
-                    );
+                }
+                // Text decorations: Underline (Single/Double/Curly/Dotted/Dashed), Strikethrough, Overline
+                let thickness = scale.round().max(1.0);
+                let deco_w = (cell_right.min(inner_right) - cell_left).max(0.0);
+                if deco_w > 0.0 {
+                    let ul_style = if cell.underline != crate::terminal::UnderlineStyle::None {
+                        cell.underline
+                    } else if cell.hyperlink_id != 0 {
+                        crate::terminal::UnderlineStyle::Dotted
+                    } else {
+                        crate::terminal::UnderlineStyle::None
+                    };
+                    if ul_style != crate::terminal::UnderlineStyle::None {
+                        let ul_color = cell.underline_color.map_or(foreground, rgba);
+                        let ul_y = (top + baseline + thickness * 1.5).min(bottom - thickness);
+                        match ul_style {
+                            crate::terminal::UnderlineStyle::Single => {
+                                scene.overlays.push(SceneRect {
+                                    x: cell_left,
+                                    y: ul_y,
+                                    w: deco_w,
+                                    h: thickness,
+                                    color: ul_color,
+                                });
+                            }
+                            crate::terminal::UnderlineStyle::Double => {
+                                scene.overlays.push(SceneRect {
+                                    x: cell_left,
+                                    y: (ul_y - thickness).max(top),
+                                    w: deco_w,
+                                    h: thickness,
+                                    color: ul_color,
+                                });
+                                scene.overlays.push(SceneRect {
+                                    x: cell_left,
+                                    y: (ul_y + thickness).min(bottom - thickness),
+                                    w: deco_w,
+                                    h: thickness,
+                                    color: ul_color,
+                                });
+                            }
+                            crate::terminal::UnderlineStyle::Curly => {
+                                let step = (2.0 * scale).max(2.0);
+                                let mut cx = cell_left;
+                                let mut up = false;
+                                while cx < cell_left + deco_w {
+                                    let seg_w = step.min(cell_left + deco_w - cx);
+                                    let cy = if up {
+                                        (ul_y - thickness).max(top)
+                                    } else {
+                                        ul_y
+                                    };
+                                    scene.overlays.push(SceneRect {
+                                        x: cx,
+                                        y: cy,
+                                        w: seg_w,
+                                        h: thickness,
+                                        color: ul_color,
+                                    });
+                                    cx += step;
+                                    up = !up;
+                                }
+                            }
+                            crate::terminal::UnderlineStyle::Dotted => {
+                                let step = (3.0 * scale).max(3.0);
+                                let mut cx = cell_left;
+                                while cx < cell_left + deco_w {
+                                    let seg_w = thickness.min(cell_left + deco_w - cx);
+                                    scene.overlays.push(SceneRect {
+                                        x: cx,
+                                        y: ul_y,
+                                        w: seg_w,
+                                        h: thickness,
+                                        color: ul_color,
+                                    });
+                                    cx += step;
+                                }
+                            }
+                            crate::terminal::UnderlineStyle::Dashed => {
+                                let dash = (4.0 * scale).max(3.0);
+                                let step = dash * 1.6;
+                                let mut cx = cell_left;
+                                while cx < cell_left + deco_w {
+                                    let seg_w = dash.min(cell_left + deco_w - cx);
+                                    scene.overlays.push(SceneRect {
+                                        x: cx,
+                                        y: ul_y,
+                                        w: seg_w,
+                                        h: thickness,
+                                        color: ul_color,
+                                    });
+                                    cx += step;
+                                }
+                            }
+                            crate::terminal::UnderlineStyle::None => {}
+                        }
+                    }
+                    if cell
+                        .attrs
+                        .contains(crate::terminal::CellAttrs::STRIKETHROUGH)
+                    {
+                        scene.overlays.push(SceneRect {
+                            x: cell_left,
+                            y: top + cell_h * 0.52,
+                            w: deco_w,
+                            h: thickness,
+                            color: foreground,
+                        });
+                    }
+                    if cell.attrs.contains(crate::terminal::CellAttrs::OVERLINE) {
+                        scene.overlays.push(SceneRect {
+                            x: cell_left,
+                            y: top,
+                            w: deco_w,
+                            h: thickness,
+                            color: foreground,
+                        });
+                    }
                 }
             }
+        }
+
+        // Emit inline terminal graphics (Kitty Graphics Protocol & SIXEL) visible in viewport.
+        let is_alt = screen.is_alternate_screen();
+        let top_abs = screen.visible_start();
+        let layout_off = screen.layout_offset();
+        for img in &screen.graphics.placements {
+            if img.alternate != is_alt {
+                continue;
+            }
+            let img_end_abs = img.abs_row + img.rows;
+            if img_end_abs <= top_abs || img.abs_row >= top_abs + screen.rows {
+                continue;
+            }
+            let rel_row = img.abs_row as isize - top_abs as isize + layout_off as isize;
+            let ix = inner_left + img.col as f32 * cell_w;
+            let iy = inner_top + rel_row as f32 * cell_h;
+            let iw = img.cols as f32 * cell_w;
+            let ih = img.rows as f32 * cell_h;
+            if iw > 0.0 && ih > 0.0 {
+                scene.overlay_images.push(SceneImage {
+                    id: img.id,
+                    src_w: img.src_w,
+                    src_h: img.src_h,
+                    rgba: std::sync::Arc::clone(&img.rgba),
+                    x: ix,
+                    y: iy,
+                    w: iw,
+                    h: ih,
+                    alpha: 1.0,
+                    radius: 0.0,
+                });
+            }
+        }
+
+        // Emit OSC 9;4 progress bar at the top edge when active.
+        if let Some((state, pct)) = screen.progress
+            && state > 0
+        {
+            let bar_color = match state {
+                2 => rgba(self.theme.ansi[1]), // error (red)
+                4 => rgba(self.theme.ansi[3]), // paused/warning (yellow)
+                _ => cursor_color,
+            };
+            let frac = if state == 3 {
+                0.35
+            } else {
+                (pct as f32 / 100.0).clamp(0.02, 1.0)
+            };
+            scene.overlays.push(SceneRect {
+                x: inner_left,
+                y: inner_top,
+                w: (inner_right - inner_left) * frac,
+                h: (2.5 * scale).max(2.0),
+                color: bar_color,
+            });
         }
 
         if cursor_shown && !block && cursor_row >= row_start && cursor_row < row_end {

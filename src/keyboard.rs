@@ -11,6 +11,34 @@ const XKB_KEY_DELETE: u32 = 0xffff;
 const XKB_KEY_LEFT: u32 = 0xff51;
 const XKB_KEY_RIGHT: u32 = 0xff53;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyEventType {
+    #[default]
+    Press,
+    Repeat,
+    Release,
+}
+
+impl KeyEventType {
+    fn kitty_code(self) -> u8 {
+        match self {
+            Self::Press => 1,
+            Self::Repeat => 2,
+            Self::Release => 3,
+        }
+    }
+}
+
+/// Encode arrow Up/Down for Alternate Scroll Mode (DEC ?1007).
+pub fn alternate_scroll_sequence(up: bool, app_cursor_keys: bool) -> &'static [u8] {
+    match (up, app_cursor_keys) {
+        (true, true) => b"\x1bOA",
+        (true, false) => b"\x1b[A",
+        (false, true) => b"\x1bOB",
+        (false, false) => b"\x1b[B",
+    }
+}
+
 fn ctrl_edit_sequence(sym: u32) -> Option<&'static [u8]> {
     match sym {
         // Ctrl+W (ETB): Readline's unix-word-rubout, which uses blanks and tabs
@@ -312,7 +340,23 @@ impl Keyboard {
         let text = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_bytes();
         translate(sym, text)
     }
+    #[cfg(test)]
     pub fn key(&self, key: u32) -> Vec<u8> {
+        self.key_with_modes(
+            key,
+            crate::terminal::TerminalInputModes::default(),
+            KeyEventType::Press,
+        )
+    }
+
+    /// Encode a key event according to active terminal modes (DECCKM, DECKPAM,
+    /// DECBKM, modifyOtherKeys, and Kitty Keyboard Protocol).
+    pub fn key_with_modes(
+        &self,
+        key: u32,
+        modes: crate::terminal::TerminalInputModes,
+        event_type: KeyEventType,
+    ) -> Vec<u8> {
         if self.state.is_null() {
             return Vec::new();
         }
@@ -321,24 +365,8 @@ impl Keyboard {
         let ctrl = self.control();
         let shift = self.shift();
         let alt = self.alt();
-        let super_mod = self.modifier(c"Mod4") || self.modifier(c"Mod5");
-
-        // Preserve existing Ctrl+Backspace/Delete/Left/Right editing semantics.
-        if let Some(sequence) = ctrl_edit_sequence(sym)
-            && ctrl
-            && !shift
-            && !alt
-            && !super_mod
-        {
-            return sequence.to_vec();
-        }
-
-        // Preserve Shift+Ctrl+Backspace/Delete/Left/Right falling back to plain
-        // only when specifically expected by existing tests; Wait: let's handle
-        // modified navigation/function keys cleanly!
-        if !super_mod && let Some(seq) = translate_modified_special(sym, shift, alt, ctrl) {
-            return seq;
-        }
+        let super_mod = self.modifier(c"Mod4");
+        let altgr = self.modifier(c"Mod5");
 
         let mut buffer = [0i8; 64];
         unsafe {
@@ -346,9 +374,74 @@ impl Keyboard {
         }
         let text = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_bytes();
 
-        // Ctrl+A..Z / Ctrl+Space / Ctrl+[\]^_ fallback for non-Latin layouts (e.g. Russian)
+        // 1. Kitty Keyboard Protocol (active when stack top > 0).
+        if modes.kitty_flags != 0 {
+            let report_events = (modes.kitty_flags & 2) != 0;
+            if event_type == KeyEventType::Release && !report_events {
+                return Vec::new();
+            }
+            if let Some(seq) = encode_kitty_key(
+                sym,
+                key,
+                text,
+                shift,
+                alt,
+                ctrl,
+                super_mod,
+                modes.kitty_flags,
+                event_type,
+            ) {
+                return seq;
+            }
+            if event_type == KeyEventType::Release {
+                return Vec::new();
+            }
+        } else if event_type == KeyEventType::Release {
+            // Legacy protocols never send key release events.
+            return Vec::new();
+        }
+
+        // 2. XTerm modifyOtherKeys (CSI > 4 ; 1/2 m).
+        if modes.modify_other_keys >= 1
+            && !super_mod
+            && let Some(seq) =
+                encode_modify_other_keys(sym, text, shift, alt, ctrl, modes.modify_other_keys)
+        {
+            return seq;
+        }
+
+        // 3. Preserve existing Ctrl+Backspace/Delete/Left/Right editing semantics.
+        if let Some(sequence) = ctrl_edit_sequence(sym)
+            && ctrl
+            && !shift
+            && !alt
+            && !super_mod
+            && !altgr
+        {
+            return sequence.to_vec();
+        }
+
+        // 4. Modified navigation & function keys (xterm CSI 1;mod ...).
+        if !super_mod
+            && !altgr
+            && let Some(seq) = translate_modified_special(sym, shift, alt, ctrl)
+        {
+            return seq;
+        }
+
+        // 5. Application Keypad (DECKPAM) for unmodified numpad keys.
+        if modes.app_keypad
+            && !ctrl
+            && !alt
+            && !super_mod
+            && let Some(seq) = translate_app_keypad(sym)
+        {
+            return seq.to_vec();
+        }
+
+        // 6. Ctrl+A..Z / Ctrl+Space / Ctrl+[\]^_ fallback for non-Latin layouts (e.g. Russian)
         // when XKB did not produce an ASCII control character.
-        if ctrl && !super_mod {
+        if ctrl && !super_mod && !altgr {
             let has_ascii_ctrl = text.len() == 1 && text[0] < 0x20;
             if !has_ascii_ctrl && let Some(ctrl_byte) = evdev_ctrl_byte(key) {
                 return if alt {
@@ -359,11 +452,11 @@ impl Keyboard {
             }
         }
 
-        let mut out = translate(sym, text);
+        let mut out = translate_with_modes(sym, text, modes.app_cursor_keys, modes.backarrow_key);
 
         // Alt+key sends ESC prefix for Meta bindings in Bash/Readline/Vim/tmux
         // (e.g. Alt+b, Alt+f, Alt+d, Alt+Backspace, Alt+.).
-        if alt && !super_mod && !out.is_empty() && out[0] != 0x1b {
+        if alt && !super_mod && !altgr && !out.is_empty() && out[0] != 0x1b {
             let mut prefixed = Vec::with_capacity(out.len() + 1);
             prefixed.push(0x1b);
             prefixed.extend_from_slice(&out);
@@ -429,14 +522,33 @@ fn translate_modified_special(sym: u32, shift: bool, alt: bool, ctrl: bool) -> O
 }
 
 fn translate(sym: u32, text: &[u8]) -> Vec<u8> {
+    translate_with_modes(sym, text, false, false)
+}
+
+fn translate_with_modes(
+    sym: u32,
+    text: &[u8],
+    app_cursor_keys: bool,
+    backarrow_key: bool,
+) -> Vec<u8> {
     match sym {
         0xff0d | 0xff8d => b"\r".to_vec(),
-        XKB_KEY_BACKSPACE => vec![0x7f],
+        XKB_KEY_BACKSPACE => vec![if backarrow_key { 0x08 } else { 0x7f }],
         0xff09 => vec![9],
         0xfe20 => b"\x1b[Z".to_vec(),
         0xff1b => vec![27],
-        0xff50 => b"\x1b[H".to_vec(),
-        0xff57 => b"\x1b[F".to_vec(),
+        0xff50 => if app_cursor_keys {
+            b"\x1bOH"
+        } else {
+            b"\x1b[H"
+        }
+        .to_vec(),
+        0xff57 => if app_cursor_keys {
+            b"\x1bOF"
+        } else {
+            b"\x1b[F"
+        }
+        .to_vec(),
         XKB_KEY_DELETE => b"\x1b[3~".to_vec(),
         0xff55 => b"\x1b[5~".to_vec(),
         0xff56 => b"\x1b[6~".to_vec(),
@@ -446,11 +558,228 @@ fn translate(sym: u32, text: &[u8]) -> Vec<u8> {
             let codes = [15, 17, 18, 19, 20, 21, 23, 24];
             format!("\x1b[{}~", codes[(sym - 0xffc2) as usize]).into_bytes()
         }
-        XKB_KEY_LEFT => b"\x1b[D".to_vec(),
-        0xff52 => b"\x1b[A".to_vec(),
-        XKB_KEY_RIGHT => b"\x1b[C".to_vec(),
-        0xff54 => b"\x1b[B".to_vec(),
+        XKB_KEY_LEFT => if app_cursor_keys {
+            b"\x1bOD"
+        } else {
+            b"\x1b[D"
+        }
+        .to_vec(),
+        0xff52 => if app_cursor_keys {
+            b"\x1bOA"
+        } else {
+            b"\x1b[A"
+        }
+        .to_vec(),
+        XKB_KEY_RIGHT => if app_cursor_keys {
+            b"\x1bOC"
+        } else {
+            b"\x1b[C"
+        }
+        .to_vec(),
+        0xff54 => if app_cursor_keys {
+            b"\x1bOB"
+        } else {
+            b"\x1b[B"
+        }
+        .to_vec(),
         _ => text.to_vec(),
+    }
+}
+
+fn translate_app_keypad(sym: u32) -> Option<&'static [u8]> {
+    match sym {
+        0xff8d => Some(b"\x1bOM"), // KP_Enter
+        0xffaa => Some(b"\x1bOj"), // KP_Multiply
+        0xffab => Some(b"\x1bOk"), // KP_Add
+        0xffac => Some(b"\x1bOl"), // KP_Separator
+        0xffad => Some(b"\x1bOm"), // KP_Subtract
+        0xffae => Some(b"\x1bOn"), // KP_Decimal
+        0xffaf => Some(b"\x1bOo"), // KP_Divide
+        0xffb0 => Some(b"\x1bOp"), // KP_0
+        0xffb1 => Some(b"\x1bOq"), // KP_1
+        0xffb2 => Some(b"\x1bOr"), // KP_2
+        0xffb3 => Some(b"\x1bOs"), // KP_3
+        0xffb4 => Some(b"\x1bOt"), // KP_4
+        0xffb5 => Some(b"\x1bOu"), // KP_5
+        0xffb6 => Some(b"\x1bOv"), // KP_6
+        0xffb7 => Some(b"\x1bOw"), // KP_7
+        0xffb8 => Some(b"\x1bOx"), // KP_8
+        0xffb9 => Some(b"\x1bOy"), // KP_9
+        _ => None,
+    }
+}
+
+fn encode_modify_other_keys(
+    sym: u32,
+    text: &[u8],
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+    mode: u8,
+) -> Option<Vec<u8>> {
+    let m = xterm_modifier(shift, alt, ctrl)?;
+    let codepoint = match sym {
+        0xff0d => 13u32,
+        0xff09 => 9,
+        0xff1b => 27,
+        XKB_KEY_BACKSPACE => 127,
+        _ if mode >= 2 && (ctrl || alt) => {
+            if (0x20..=0x7e).contains(&sym) {
+                sym
+            } else if let Ok(s) = std::str::from_utf8(text)
+                && let Some(ch) = s.chars().next()
+                && s.chars().count() == 1
+                && (ch as u32) >= 0x20
+            {
+                ch as u32
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    Some(format!("\x1b[27;{m};{codepoint}~").into_bytes())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_kitty_key(
+    sym: u32,
+    evdev_key: u32,
+    text: &[u8],
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+    super_mod: bool,
+    flags: u8,
+    event_type: KeyEventType,
+) -> Option<Vec<u8>> {
+    let disambiguate = (flags & 1) != 0;
+    let report_events = (flags & 2) != 0;
+    let report_all = (flags & 8) != 0;
+    let report_text = (flags & 16) != 0;
+
+    let mod_bits =
+        u8::from(shift) | (u8::from(alt) << 1) | (u8::from(ctrl) << 2) | (u8::from(super_mod) << 3);
+    let mod_param = mod_bits + 1;
+    let needs_event_suffix = report_events && event_type != KeyEventType::Press;
+
+    // Special functional keys using CSI 1 ; mod[:ev] final or CSI num ; mod[:ev] ~
+    let functional_suffix = |prefix_num: u32, final_ch: char| -> Vec<u8> {
+        if mod_bits == 0 && !needs_event_suffix {
+            if prefix_num == 1 {
+                format!("\x1b[{final_ch}").into_bytes()
+            } else {
+                format!("\x1b[{prefix_num}{final_ch}").into_bytes()
+            }
+        } else if needs_event_suffix {
+            format!(
+                "\x1b[{prefix_num};{mod_param}:{}{final_ch}",
+                event_type.kitty_code()
+            )
+            .into_bytes()
+        } else {
+            format!("\x1b[{prefix_num};{mod_param}{final_ch}").into_bytes()
+        }
+    };
+
+    match sym {
+        0xff52 => return Some(functional_suffix(1, 'A')),
+        0xff54 => return Some(functional_suffix(1, 'B')),
+        XKB_KEY_RIGHT => return Some(functional_suffix(1, 'C')),
+        XKB_KEY_LEFT => return Some(functional_suffix(1, 'D')),
+        0xff50 => return Some(functional_suffix(1, 'H')),
+        0xff57 => return Some(functional_suffix(1, 'F')),
+        0xff63 => return Some(functional_suffix(2, '~')),
+        XKB_KEY_DELETE => return Some(functional_suffix(3, '~')),
+        0xff55 => return Some(functional_suffix(5, '~')),
+        0xff56 => return Some(functional_suffix(6, '~')),
+        0xffbe..=0xffc1 => {
+            let ch = (b'P' + (sym - 0xffbe) as u8) as char;
+            return Some(functional_suffix(1, ch));
+        }
+        0xffc2..=0xffc9 => {
+            let codes = [15, 17, 18, 19, 20, 21, 23, 24];
+            return Some(functional_suffix(codes[(sym - 0xffc2) as usize], '~'));
+        }
+        _ => {}
+    }
+
+    // Unicode keycode for CSI u
+    let keycode = match sym {
+        0xff1b => 27u32,
+        0xff0d | 0xff8d => 13,
+        0xff09 | 0xfe20 => 9,
+        XKB_KEY_BACKSPACE => 127,
+        _ if (0x20..=0x7e).contains(&sym) => sym.to_ascii_lowercase_u32(),
+        _ => {
+            if let Ok(s) = std::str::from_utf8(text)
+                && let Some(ch) = s.chars().next()
+                && s.chars().count() == 1
+                && (ch as u32) >= 0x20
+            {
+                ch.to_lowercase().next().unwrap_or(ch) as u32
+            } else if ctrl && let Some(ctrl_b) = evdev_ctrl_byte(evdev_key) {
+                match ctrl_b {
+                    0x01..=0x1a => (b'a' + ctrl_b - 1) as u32,
+                    0x00 => b' ' as u32,
+                    _ => return None,
+                }
+            } else {
+                return None;
+            }
+        }
+    };
+
+    let should_csi_u = report_all
+        || needs_event_suffix
+        || (disambiguate && (keycode == 27 || ctrl || alt || super_mod))
+        || (disambiguate && shift && matches!(keycode, 9 | 13 | 127));
+    if !should_csi_u {
+        return None;
+    }
+
+    let mut seq = format!("\x1b[{keycode}");
+    let text_part = if report_text
+        && event_type != KeyEventType::Release
+        && !ctrl
+        && !alt
+        && !super_mod
+        && let Ok(s) = std::str::from_utf8(text)
+        && !s.is_empty()
+        && !s.chars().any(|c| c.is_control())
+    {
+        let cps: Vec<String> = s.chars().map(|c| (c as u32).to_string()).collect();
+        Some(cps.join(":"))
+    } else {
+        None
+    };
+
+    if mod_bits != 0 || needs_event_suffix || text_part.is_some() {
+        seq.push(';');
+        seq.push_str(&mod_param.to_string());
+        if needs_event_suffix {
+            seq.push(':');
+            seq.push_str(&event_type.kitty_code().to_string());
+        }
+        if let Some(tp) = text_part {
+            seq.push(';');
+            seq.push_str(&tp);
+        }
+    }
+    seq.push('u');
+    Some(seq.into_bytes())
+}
+
+trait AsciiLowerU32 {
+    fn to_ascii_lowercase_u32(self) -> u32;
+}
+impl AsciiLowerU32 for u32 {
+    fn to_ascii_lowercase_u32(self) -> u32 {
+        if (b'A' as u32..=b'Z' as u32).contains(&self) {
+            self + 32
+        } else {
+            self
+        }
     }
 }
 #[cfg(test)]

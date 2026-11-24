@@ -214,6 +214,7 @@ pub struct XRayEngine {
     pub action_feedback: Option<String>,
     snapshot: Arc<Mutex<XRaySnapshot>>,
     last_output_at: Arc<Mutex<Instant>>,
+    shell_events: Arc<Mutex<Vec<crate::terminal::ShellEvent>>>,
     level: Arc<Mutex<XRayLevel>>,
     dirty: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
@@ -253,6 +254,7 @@ impl XRayEngine {
             action_feedback: None,
             snapshot,
             last_output_at: Arc::new(Mutex::new(Instant::now())),
+            shell_events: Arc::new(Mutex::new(Vec::new())),
             level,
             dirty: Arc::new(AtomicBool::new(false)),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -273,6 +275,17 @@ impl XRayEngine {
         }
     }
 
+    /// Feed an OSC 133 semantic shell lifecycle event into X-Ray so command
+    /// reports capture exact exit codes, short commands, and shell builtins.
+    pub fn notify_shell_event(&self, event: crate::terminal::ShellEvent) {
+        if self.config.enabled {
+            let mut q = self.shell_events.lock().unwrap_or_else(|e| e.into_inner());
+            if q.len() < 64 {
+                q.push(event);
+            }
+        }
+    }
+
     pub fn toggle_panel(&mut self) {
         self.panel_open = !self.panel_open;
         self.dirty.store(true, Ordering::Relaxed);
@@ -290,6 +303,7 @@ impl XRayEngine {
         }
         let snapshot = Arc::clone(&self.snapshot);
         let last_out = Arc::clone(&self.last_output_at);
+        let shell_events = Arc::clone(&self.shell_events);
         let level_shared = Arc::clone(&self.level);
         let dirty_flag = Arc::clone(&self.dirty);
         let shutdown = Arc::clone(&self.shutdown);
@@ -315,8 +329,54 @@ impl XRayEngine {
                 let mut io_acc = IoAccumulator::default();
                 let mut wait_events: Vec<String> = Vec::new();
                 let mut cmd_seq = 1u64;
+                let mut shell_cmd_active = false;
+                let mut shell_cmd_started = Instant::now();
+                let mut shell_cmd_wall = SystemTime::now();
 
                 while !shutdown.load(Ordering::Relaxed) {
+                    let pending_shell: Vec<crate::terminal::ShellEvent> = {
+                        let mut q = shell_events.lock().unwrap_or_else(|e| e.into_inner());
+                        std::mem::take(&mut *q)
+                    };
+                    for ev in pending_shell {
+                        match ev {
+                            crate::terminal::ShellEvent::CommandExecuted { .. } => {
+                                shell_cmd_active = true;
+                                shell_cmd_started = Instant::now();
+                                shell_cmd_wall = SystemTime::now();
+                            }
+                            crate::terminal::ShellEvent::CommandFinished { exit_code, .. }
+                                if shell_cmd_active =>
+                            {
+                                shell_cmd_active = false;
+                                let label = if !cmd_name.is_empty() && prev_fg != Some(root_pid) {
+                                    cmd_name.clone()
+                                } else {
+                                    "shell-command".to_string()
+                                };
+                                reports.push(CommandReport {
+                                    command_id: cmd_seq,
+                                    command: label,
+                                    exit_code,
+                                    signal: None,
+                                    started_at: shell_cmd_wall,
+                                    duration_ms: shell_cmd_started.elapsed().as_millis() as u64,
+                                    peak_rss_bytes: peak_rss,
+                                    peak_process_count: peak_procs.max(1),
+                                    physical_read_bytes: io_acc.totals.0,
+                                    physical_write_bytes: io_acc.totals.1,
+                                    logical_read_bytes: io_acc.totals.2,
+                                    logical_write_bytes: io_acc.totals.3,
+                                    wait_events: std::mem::take(&mut wait_events),
+                                    trace_active: false,
+                                    io_is_approximate: true,
+                                });
+                                cmd_seq += 1;
+                                cmd_name.clear();
+                            }
+                            _ => {}
+                        }
+                    }
                     let lvl = *level_shared.lock().unwrap_or_else(|e| e.into_inner());
                     let inspect = matches!(lvl, XRayLevel::Inspect | XRayLevel::Trace);
                     #[cfg(target_os = "linux")]
