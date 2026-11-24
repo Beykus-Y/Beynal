@@ -2573,6 +2573,98 @@ mod input_tests {
     }
 
     #[test]
+    fn shm_layout_bounds_hidpi_stride_and_size() {
+        for (logical, scale, expected) in [
+            ((2560, 1440), 150, (3200, 1800)),
+            ((3840, 2160), 120, (3840, 2160)),
+            ((3840, 2160), 240, (7680, 4320)),
+            ((801, 501), 180, (1202, 752)),
+            ((3, 9), 140, (4, 11)),
+        ] {
+            let sizes = SurfaceSizes::new(logical, Scale(scale));
+            assert_eq!(sizes.physical, expected);
+            assert_eq!(
+                shm_layout(sizes.physical),
+                Some((expected.0 * 4, expected.0 * expected.1 * 4))
+            );
+            assert_eq!(sizes.buffer_scale(true), 1);
+        }
+        assert_eq!(
+            SurfaceSizes::new((800, 500), Scale(240)).buffer_scale(false),
+            2
+        );
+        assert_eq!(shm_layout((i32::MAX, 2)), None);
+        assert_eq!(shm_layout((3840 * 4, 2160 * 4)), None);
+        assert_eq!(shm_layout((-1, -1)), None);
+    }
+
+    #[test]
+    fn resize_mouse_selection_and_damage_follow_the_physical_grid() {
+        let renderer = render::Renderer::new().unwrap();
+        let mut state = State {
+            renderer: Some(renderer),
+            terminal: Some(Terminal::new(80, 24)),
+            width: 800,
+            height: 500,
+            ..Default::default()
+        };
+        let mut initial = None;
+        for (width, height, factor) in [
+            (801, 501, 120),
+            (813, 503, 150),
+            (819, 513, 180),
+            (821, 515, 210),
+            (831, 519, 240),
+            (801, 501, 120),
+        ] {
+            let scale = Scale(factor);
+            state.resize((width, height), scale).unwrap();
+            let sizes = state.surface_sizes();
+            let renderer = state.renderer.as_mut().unwrap();
+            let g = sizes.geometry(renderer);
+            let terminal = state.terminal.as_mut().unwrap();
+            let screen = terminal.screen();
+            assert_eq!((screen.columns, screen.rows), sizes.grid_size(renderer));
+            terminal.process(b"\x1b[4;3H");
+            let screen = terminal.screen();
+            let rect = row_pixel_rect(g, sizes.physical, (3, 4));
+            assert_eq!(rect.y as usize, g.padding + 3 * g.cell_height);
+            assert_eq!(rect.h as usize, g.cell_height);
+            let cursor = renderer
+                .build_terminal_scene(
+                    screen,
+                    sizes.buffer_dimensions(),
+                    &state.selection,
+                    true,
+                    true,
+                    scale.factor(),
+                    Some((3, 4)),
+                )
+                .rects[0];
+            assert_eq!(cursor.x as usize, g.padding + 2 * g.cell_width);
+            assert_eq!(cursor.y as usize, rect.y as usize);
+
+            let (lx, ly) = sizes.logical_per_pixel();
+            state.pointer_position = (
+                (f64::from(cursor.x) + 0.25) * lx,
+                (f64::from(cursor.y) + 0.25) * ly,
+            );
+            let (px, py) = sizes.physical_point(state.pointer_position);
+            let selection = crate::selection::position(g, px, py, screen);
+            assert_eq!(selection.col, 2);
+            assert_eq!(selection.row, screen.display_row(3).unwrap());
+            assert_eq!(state.mouse_cell(), Some((2, 3)));
+            let generation = state.generation;
+            state.resize((width, height), scale).unwrap();
+            assert_eq!(state.generation, generation);
+
+            if factor == 120 {
+                assert_eq!(*initial.get_or_insert((sizes, g)), (sizes, g));
+            }
+        }
+    }
+
+    #[test]
     fn toplevel_configure_zero_axis_keeps_previous_dimension() {
         assert_eq!(
             resolve_toplevel_configure((800, 500), 1528, 812),

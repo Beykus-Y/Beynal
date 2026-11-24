@@ -1883,34 +1883,51 @@ mod tests {
 
     #[test]
     fn pointer_hits_explorer_tabs_document_and_close_prompt() {
-        let (_dir, mut editor) = fixture();
-        editor.view(80, 24);
-        let metrics = Metrics {
-            cell_width: 10,
-            cell_height: 18,
-            padding: 12,
-            logical_per_pixel: (1.0, 1.0),
-        };
-        let click = |editor: &mut BEdit, hit: Hit| {
-            let region = editor.hits.iter().find(|region| region.hit == hit).unwrap();
-            let x = (metrics.padding + region.col * metrics.cell_width + 1) as f64;
-            let y = (metrics.padding + region.row * metrics.cell_height + 1) as f64;
-            if let Some(effect) = editor.mouse_confirmation(x, y, metrics) {
-                return effect;
-            }
+        let renderer = crate::render::Renderer::new().unwrap();
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            let (_dir, mut editor) = fixture();
+            editor.view(80, 24);
+            let geometry = renderer.geometry(scale);
+            let logical_per_pixel = 1.0 / f64::from(scale);
+            let metrics = Metrics {
+                cell_width: geometry.cell_width,
+                cell_height: geometry.cell_height,
+                padding: geometry.padding,
+                logical_per_pixel: (logical_per_pixel, logical_per_pixel),
+            };
+            let click = |editor: &mut BEdit, hit: Hit| {
+                let region = editor.hits.iter().find(|region| region.hit == hit).unwrap();
+                let x = (metrics.padding + region.col * metrics.cell_width + 1) as f64;
+                let y = (metrics.padding + region.row * metrics.cell_height + 1) as f64;
+                if let Some(effect) = editor.mouse_confirmation(x, y, metrics) {
+                    return effect;
+                }
+                editor.mouse_press(x, y, metrics, 100);
+                Effect::Changed
+            };
+            click(&mut editor, Hit::Tab(0));
+            assert_eq!(editor.document().unwrap().label(), "a.rs");
+            editor.view(80, 24);
+            click(&mut editor, Hit::Explorer);
+            assert_eq!(editor.view(80, 24).text_offset.0, 0);
+            click(&mut editor, Hit::Search);
+            assert!(matches!(editor.panel, Panel::Search { .. }));
+            editor.handle(Command::Escape);
+            let view = editor.view(80, 24);
+            let x = (metrics.padding
+                + (view.text_offset.0 + view.gutter_cells + 2) * metrics.cell_width
+                + 1) as f64;
+            let y = (metrics.padding + view.text_offset.1 * metrics.cell_height + 1) as f64;
             editor.mouse_press(x, y, metrics, 100);
-            Effect::Changed
-        };
-        click(&mut editor, Hit::Tab(0));
-        assert_eq!(editor.document().unwrap().label(), "a.rs");
-        editor.view(80, 24);
-        click(&mut editor, Hit::Explorer);
-        assert_eq!(editor.view(80, 24).text_offset.0, 0);
-        editor.handle(Command::Insert("dirty ".into()));
-        click(&mut editor, Hit::CloseTab(0));
-        editor.view(80, 24);
-        click(&mut editor, Hit::ConfirmCancel);
-        assert!(editor.document().unwrap().is_modified());
-        assert_eq!(editor.tabs.len(), 2);
+            editor.mouse_drag(x + 2.0 * metrics.cell_width as f64, y, metrics, false);
+            editor.mouse_release();
+            assert_eq!(editor.selection_text().as_deref(), Some("t "));
+            editor.handle(Command::Insert("dirty ".into()));
+            click(&mut editor, Hit::CloseTab(0));
+            editor.view(80, 24);
+            click(&mut editor, Hit::ConfirmCancel);
+            assert!(editor.document().unwrap().is_modified());
+            assert_eq!(editor.tabs.len(), 2);
+        }
     }
 }

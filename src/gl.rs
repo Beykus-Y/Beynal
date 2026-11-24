@@ -62,17 +62,15 @@ impl GlyphAtlas {
     }
 
     fn insert(&mut self, key: (char, u32), w: u32, h: u32) -> Option<Slot> {
+        if !(1..=ATLAS_SIZE).contains(&w) || !(1..=ATLAS_SIZE).contains(&h) {
+            return None;
+        }
         let (x, y, shelf_h) = if self.shelf_x + w > ATLAS_SIZE {
             (0, self.shelf_y + self.shelf_h, 0)
         } else {
             (self.shelf_x, self.shelf_y, self.shelf_h)
         };
-        if w == 0
-            || h == 0
-            || w > ATLAS_SIZE
-            || y + h > ATLAS_SIZE
-            || self.map.len() >= ATLAS_ENTRIES
-        {
+        if y + h > ATLAS_SIZE || self.map.len() >= ATLAS_ENTRIES {
             return None;
         }
         let slot = Slot { x, y, w, h };
@@ -877,4 +875,102 @@ void main() {
     )?;
     let size = unsafe { gl.get_uniform_location(program, "u_size") };
     Ok((program, 0, 1, 2, size))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_glyph_preserves_atlas_slots() {
+        let mut atlas = GlyphAtlas::default();
+        let key = ('x', 16.0_f32.to_bits());
+        let slot = atlas.insert(key, ATLAS_SIZE, ATLAS_SIZE).unwrap();
+        assert!(atlas.insert(('界', key.1), u32::MAX, 2).is_none());
+        assert!(atlas.insert(('界', key.1), 1, 1).is_none());
+        assert_eq!(atlas.map[&key].x, slot.x);
+        assert_eq!(atlas.map[&key].y, slot.y);
+    }
+
+    #[test]
+    fn unicode_overflow_preserves_slots_until_each_batch_is_consumed() {
+        let mut atlas = GlyphAtlas::default();
+        let mut batch = Vec::new();
+        let mut consumed = Vec::new();
+        let mut resets = 0;
+        let px_size = 48.0_f32;
+        let unique: Vec<_> = (0x4e00..0x4e00 + 6500)
+            .map(|n| char::from_u32(n).unwrap())
+            .collect();
+        let consume =
+            |atlas: &GlyphAtlas, batch: &mut Vec<((char, u32), Slot)>, consumed: &mut Vec<char>| {
+                let mut region = vec![false; (ATLAS_SIZE * ATLAS_SIZE) as usize];
+                for (key, slot) in batch.drain(..) {
+                    let actual = atlas.map[&key];
+                    assert_eq!(
+                        (actual.x, actual.y, actual.w, actual.h),
+                        (slot.x, slot.y, slot.w, slot.h)
+                    );
+                    for y in slot.y..slot.y + slot.h {
+                        let start = (y * ATLAS_SIZE + slot.x) as usize;
+                        let row = &mut region[start..start + slot.w as usize];
+                        assert!(!row.iter().any(|filled| *filled));
+                        row.fill(true);
+                    }
+                    consumed.push(key.0);
+                }
+            };
+        for (i, &ch) in unique.iter().enumerate() {
+            let key = (ch, px_size.to_bits());
+            let w = 19 + (i % 23) as u32;
+            let h = 24 + (i % 31) as u32;
+            let slot = if let Some(slot) = atlas.insert(key, w, h) {
+                slot
+            } else {
+                consume(&atlas, &mut batch, &mut consumed);
+                atlas.clear();
+                resets += 1;
+                atlas.insert(key, w, h).unwrap()
+            };
+            batch.push((key, slot));
+        }
+        consume(&atlas, &mut batch, &mut consumed);
+        assert!(resets > 5);
+        assert_eq!(consumed, unique);
+    }
+
+    #[test]
+    fn glyph_vertices_address_exactly_the_clipped_bitmap_region() {
+        let glyph = SceneGlyph {
+            ch: 'Ж',
+            px_size: 20.0,
+            x: 27,
+            y: 18,
+            w: 6,
+            h: 11,
+            source: (2, 3),
+            color: [1.0; 4],
+        };
+        let slot = Slot {
+            x: 740,
+            y: 915,
+            w: 8,
+            h: 15,
+        };
+        let mut vertices = Vec::new();
+        append_glyph(&mut vertices, &glyph, slot);
+        let vertex = |index: usize| {
+            let p = &vertices[index * 8..index * 8 + 4];
+            (
+                p[0],
+                p[1],
+                p[2] * ATLAS_SIZE as f32,
+                p[3] * ATLAS_SIZE as f32,
+            )
+        };
+        assert_eq!(vertex(0), (27.0, 18.0, 742.0, 918.0));
+        assert_eq!(vertex(1), (33.0, 18.0, 748.0, 918.0));
+        assert_eq!(vertex(2), (33.0, 29.0, 748.0, 929.0));
+        assert_eq!(vertex(5), (27.0, 29.0, 742.0, 929.0));
+    }
 }
