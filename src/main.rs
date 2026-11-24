@@ -2,14 +2,18 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+mod background;
 mod bedit;
 mod compat;
+mod config;
 mod control;
 mod editor;
+mod events;
 mod file_metadata;
 mod gl;
 mod gpu;
 mod keyboard;
+mod media;
 mod mouse;
 mod project;
 mod prompt;
@@ -20,6 +24,8 @@ mod syntax;
 mod terminal;
 mod theme;
 mod wayland;
+mod widgets;
+mod xray;
 use pty::Pty;
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::fd::AsRawFd;

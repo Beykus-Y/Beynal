@@ -148,6 +148,12 @@ pub struct Screen {
 }
 
 impl Screen {
+    pub fn theme(&self) -> &crate::theme::Theme {
+        &self.theme
+    }
+    pub fn is_alternate_screen(&self) -> bool {
+        self.alternate.is_some()
+    }
     #[cfg(test)]
     pub fn new(columns: usize, rows: usize) -> Self {
         Self::with_theme(columns, rows, crate::theme::Theme::default())

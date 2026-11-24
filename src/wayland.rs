@@ -296,6 +296,13 @@ struct State {
     fractional_manager: Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
     fractional_scale: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
     pty: Option<Pty>,
+
+    bus: crate::events::EventBus,
+    widgets: Option<crate::widgets::WidgetManager>,
+    media: Option<crate::media::MediaManager>,
+    background: Option<crate::background::BackgroundEngine>,
+    xray: Option<crate::xray::XRayEngine>,
+    xray_hits: Vec<crate::widgets::ui::UiHitTarget>,
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
@@ -418,6 +425,7 @@ fn run_with(editor: Option<BEdit>) -> Result<(), Box<dyn Error>> {
                 .map_err(|e| format!("resize window: {e}"))?;
         }
         state.update_drag(true);
+        state.pump_platform();
         state
             .redraw(&qh)
             .map_err(|e| format!("update shared buffer: {e}"))?;
@@ -924,7 +932,10 @@ impl State {
         if self.debug_input {
             eprintln!("[output] spawned bash pid={}", pty.child_pid);
         }
+        let child_pid = pty.child_pid;
+        let master_fd = pty.master.as_raw_fd();
         self.pty = Some(pty);
+        self.init_platform_subsystems(child_pid, master_fd);
 
         Ok(())
     }
@@ -1233,6 +1244,28 @@ impl State {
             return;
         }
         if pressed {
+            for hit in &self.xray_hits {
+                let (px, py) = (x as f32, y as f32);
+                if px >= hit.x && px <= hit.x + hit.w && py >= hit.y && py <= hit.y + hit.h {
+                    if let Some(xray) = &mut self.xray {
+                        match hit.node_id.as_str() {
+                            "xray-level-light" => xray.set_level(crate::config::XRayLevel::Light),
+                            "xray-level-inspect" => {
+                                xray.set_level(crate::config::XRayLevel::Inspect)
+                            }
+                            _ => {}
+                        }
+                        self.dirty = true;
+                    }
+                    return;
+                }
+            }
+            if let Some(widgets) = &mut self.widgets
+                && widgets.handle_pointer_press((x as f32, y as f32), sizes.scale.factor())
+            {
+                self.dirty = true;
+                return;
+            }
             if self.mouse_reporting() && self.report_mouse(Some(button), true, false) {
                 self.mouse_button = Some(button);
                 return;
@@ -1252,11 +1285,33 @@ impl State {
                 self.report_mouse(Some(held), false, false);
             }
         } else if button == crate::mouse::Button::Left {
+            if let Some(widgets) = &mut self.widgets {
+                widgets.handle_pointer_release();
+            }
             self.selection.release();
         }
     }
 
     fn pointer_motion(&mut self) {
+        if self.widgets.is_some() {
+            let sizes = self.surface_sizes();
+            let (px, py) = sizes.physical_point(self.pointer_position);
+            let cell = self.renderer.as_ref().map_or((10.0, 18.0), |r| {
+                let g = r.geometry(sizes.scale.factor());
+                (g.cell_width as f32, g.cell_height as f32)
+            });
+            if let Some(widgets) = &mut self.widgets
+                && widgets.handle_pointer_motion(
+                    (px as f32, py as f32),
+                    (sizes.physical.0 as f32, sizes.physical.1 as f32),
+                    sizes.scale.factor(),
+                    cell,
+                )
+            {
+                self.dirty = true;
+                return;
+            }
+        }
         if self.editor.is_some() || self.selection.is_dragging() {
             self.update_drag(false);
             return;
@@ -1588,6 +1643,9 @@ impl State {
                 let terminal = self.terminal.as_mut().unwrap();
                 let old_bracketed = terminal.screen().bracketed_paste;
                 terminal.process(&bytes[..n]);
+                if let Some(xray) = &self.xray {
+                    xray.notify_terminal_output();
+                }
                 if self.debug_input && old_bracketed != terminal.screen().bracketed_paste {
                     eprintln!(
                         "[clipboard] bracketed paste={}",
@@ -1716,7 +1774,7 @@ impl State {
         }
         if self.backend == ActiveBackend::OpenGl && self.gl.is_some() {
             let logical = (self.width as usize, self.height as usize);
-            let force_full = self.damage_full || self.editor.is_some();
+            let force_full = self.damage_full || self.editor.is_some() || self.platform_active();
             self.damage_full = false;
             let mut damage = if let Some(terminal) = &self.terminal {
                 terminal_damage(
@@ -1790,12 +1848,11 @@ impl State {
         if let Some(surface) = &self.surface {
             self.map_surface_buffer(surface, sizes);
         }
-        if let (Some(surface), Some(terminal), Some(renderer)) =
+        if let (Some(_), Some(terminal), Some(renderer)) =
             (&self.surface, &self.terminal, &mut self.renderer)
         {
-            let frame = &mut self.buffers[index];
             let dimensions = sizes.buffer_dimensions();
-            let scene = match &mut self.editor {
+            let mut scene = match &mut self.editor {
                 Some(editor) => {
                     let (columns, rows) = sizes.grid_size(renderer);
                     let view = editor.view(columns, rows);
@@ -1816,6 +1873,24 @@ impl State {
                     sizes.scale.factor(),
                     None,
                 ),
+            };
+            let in_tui = self.in_tui_mode();
+            let ptr = sizes.physical_point(self.pointer_position);
+            let theme = self
+                .terminal
+                .as_ref()
+                .map_or_else(crate::theme::Theme::default, |t| t.screen().theme().clone());
+            self.emit_platform_layers(
+                &mut scene,
+                (dimensions.0 as f32, dimensions.1 as f32),
+                sizes.scale.factor(),
+                in_tui,
+                (ptr.0 as f32, ptr.1 as f32),
+                &theme,
+            );
+            let frame = &mut self.buffers[index];
+            let (Some(surface), Some(renderer)) = (&self.surface, &mut self.renderer) else {
+                return Ok(());
             };
             renderer.paint_scene(&scene, dimensions.0, frame.pixels());
             surface.attach(Some(&frame.buffer), 0, 0);
@@ -1867,9 +1942,8 @@ impl State {
             self.map_surface_buffer(surface, sizes);
         }
         let renderer = self.renderer.as_mut().ok_or("renderer unavailable")?;
-        let gl = self.gl.as_mut().ok_or("OpenGL backend unavailable")?;
         if full {
-            let scene = match &mut self.editor {
+            let mut scene = match &mut self.editor {
                 Some(editor) => {
                     let (columns, rows) = grid;
                     let view = editor.view(columns, rows);
@@ -1894,8 +1968,26 @@ impl State {
                     )
                 }
             };
+            let in_tui = self.in_tui_mode();
+            let ptr = sizes.physical_point(self.pointer_position);
+            let theme = self
+                .terminal
+                .as_ref()
+                .map_or_else(crate::theme::Theme::default, |t| t.screen().theme().clone());
+            self.emit_platform_layers(
+                &mut scene,
+                (dimensions.0 as f32, dimensions.1 as f32),
+                scale,
+                in_tui,
+                (ptr.0 as f32, ptr.1 as f32),
+                &theme,
+            );
+            let renderer = self.renderer.as_mut().ok_or("renderer unavailable")?;
+            let gl = self.gl.as_mut().ok_or("OpenGL backend unavailable")?;
             gl.draw(renderer, &scene, &rects, true)?;
         } else {
+            let renderer = self.renderer.as_mut().ok_or("renderer unavailable")?;
+            let gl = self.gl.as_mut().ok_or("OpenGL backend unavailable")?;
             for (rect, range) in rects.iter().zip(damage.ranges.iter()) {
                 if rect.h == 0 {
                     continue;
@@ -1931,8 +2023,196 @@ impl State {
         if let Some(surface) = &self.surface {
             surface.frame(qh, ());
         }
+        let gl = self.gl.as_mut().ok_or("OpenGL backend unavailable")?;
         gl.present(&rects, full)
     }
+
+    fn platform_active(&self) -> bool {
+        self.widgets.as_ref().is_some_and(|w| w.is_enabled())
+            || self
+                .background
+                .as_ref()
+                .is_some_and(|b| b.is_active(self.keyboard_focus, self.in_tui_mode()))
+            || self.xray.as_ref().is_some_and(|x| x.config.enabled)
+    }
+
+    fn in_tui_mode(&self) -> bool {
+        self.terminal
+            .as_ref()
+            .is_some_and(|t| t.screen().is_alternate_screen())
+    }
+
+    fn init_platform_subsystems(&mut self, child_pid: libc::pid_t, pty_master_fd: i32) {
+        let cfg = load_platform_config();
+        let theme = self
+            .terminal
+            .as_ref()
+            .map_or_else(crate::theme::Theme::default, |t| t.screen().theme().clone());
+        if cfg.media.enabled {
+            let mut media = crate::media::MediaManager::new(cfg.media.clone());
+            media.ensure_started(self.bus.clone());
+            self.media = Some(media);
+        }
+        if cfg.background.enabled {
+            self.background = Some(crate::background::BackgroundEngine::new(
+                cfg.background.clone(),
+            ));
+        }
+        if cfg.xray.enabled {
+            let mut xray = crate::xray::XRayEngine::new(cfg.xray.clone());
+            xray.ensure_started(child_pid, Some(pty_master_fd), self.bus.clone());
+            self.xray = Some(xray);
+        }
+        if cfg.widgets.enabled {
+            let mut widgets = crate::widgets::WidgetManager::new(cfg.widgets.clone());
+            if let Err(e) = widgets.ensure_started(theme, self.bus.clone()) {
+                eprintln!("beyrix widgets: {e}");
+            }
+            self.widgets = Some(widgets);
+        }
+    }
+
+    fn pump_platform(&mut self) {
+        if let Some(widgets) = &self.widgets {
+            for action in widgets.drain_actions() {
+                match action {
+                    crate::widgets::runtime::HostAction::MediaPlayPause => {
+                        if let Some(m) = &self.media {
+                            m.play_pause();
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::MediaNext => {
+                        if let Some(m) = &self.media {
+                            m.next();
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::MediaPrev => {
+                        if let Some(m) = &self.media {
+                            m.prev();
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::MediaSeek(s) => {
+                        if let Some(m) = &self.media {
+                            m.seek(s);
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::MediaSetVolume(v) => {
+                        if let Some(m) = &self.media {
+                            m.set_volume(v);
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::MediaPlayFile(p) => {
+                        if let Some(m) = &self.media {
+                            m.play_file(std::path::PathBuf::from(p));
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::MediaEnqueue(_) => {}
+                    crate::widgets::runtime::HostAction::BackgroundSetPreset(name) => {
+                        if let (Some(bg), Some(preset)) = (
+                            &mut self.background,
+                            crate::config::BackgroundPreset::parse(&name),
+                        ) {
+                            bg.config.preset = preset;
+                        }
+                    }
+                    crate::widgets::runtime::HostAction::BackgroundBind { .. } => {}
+                    crate::widgets::runtime::HostAction::WidgetLog {
+                        extension_id,
+                        level,
+                        message,
+                    } => {
+                        if self.debug_input {
+                            eprintln!("[widget:{extension_id}:{level}] {message}");
+                        }
+                    }
+                }
+            }
+        }
+        let in_tui = self.in_tui_mode();
+        if let Some(bg) = &self.background
+            && bg.is_active(self.keyboard_focus, in_tui)
+            && bg.should_step()
+        {
+            self.dirty = true;
+        }
+    }
+
+    fn emit_platform_layers(
+        &mut self,
+        scene: &mut render::Scene,
+        win_size: (f32, f32),
+        scale: f32,
+        in_tui: bool,
+        pointer_px: (f32, f32),
+        theme: &crate::theme::Theme,
+    ) {
+        let Some(renderer) = &mut self.renderer else {
+            return;
+        };
+        if let Some(bg) = &mut self.background {
+            let mut inputs = crate::background::bindings::BindingInputs::default();
+            if let Some(m) = &self.media {
+                let a = m.audio_snapshot();
+                inputs.audio_bass = a.bass;
+                inputs.audio_mid = a.mid;
+                inputs.audio_treble = a.treble;
+                inputs.audio_rms = a.rms;
+                inputs.audio_peak = a.peak;
+                inputs.audio_beat = if a.beat { 1.0 } else { 0.0 };
+            }
+            if let Some(x) = &self.xray {
+                let s = x.snapshot();
+                inputs.xray_activity = (s.total_cpu_percent / 100.0).clamp(0.0, 1.0);
+            }
+            let mouse_norm = (
+                (pointer_px.0 / win_size.0.max(1.0)).clamp(0.0, 1.0),
+                (pointer_px.1 / win_size.1.max(1.0)).clamp(0.0, 1.0),
+            );
+            bg.render_to_scene(
+                win_size,
+                scale,
+                self.keyboard_focus,
+                in_tui,
+                mouse_norm,
+                &inputs,
+                theme,
+                renderer,
+                scene,
+            );
+        }
+        if let Some(widgets) = &mut self.widgets {
+            let g = renderer.geometry(scale);
+            widgets.emit_to_scene(
+                win_size,
+                scale,
+                (g.cell_width as f32, g.cell_height as f32),
+                in_tui,
+                pointer_px,
+                theme,
+                renderer,
+                scene,
+            );
+        }
+        if let Some(xray) = &self.xray {
+            self.xray_hits.clear();
+            xray.emit_to_scene(win_size, scale, theme, renderer, scene, &mut self.xray_hits);
+        }
+    }
+}
+
+fn load_platform_config() -> crate::config::PlatformConfig {
+    let path = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|p| !p.is_empty() && std::path::Path::new(p).is_absolute())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|p| std::path::PathBuf::from(p).join(".config")))
+        .map(|p| p.join("beyrix/platform.toml"));
+    if let Some(path) = path
+        && let Ok(text) = std::fs::read_to_string(path)
+        && let Ok(cfg) = crate::config::PlatformConfig::parse_toml(&text)
+    {
+        return cfg;
+    }
+    crate::config::PlatformConfig::default()
 }
 
 #[derive(PartialEq, Eq)]
@@ -2357,6 +2637,11 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                         if state.debug_input {
                             eprintln!("[input] keymap loaded");
                         }
+                        if let Some(ev) = x.layout_event() {
+                            state
+                                .bus
+                                .publish(crate::events::AppEvent::KeyboardLayout(ev));
+                        }
                         state.xkb = Some(x)
                     }
                     Err(e) => state.input_error = Some(format!("load keyboard keymap: {e}")),
@@ -2389,7 +2674,18 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                     );
                 }
                 if let Some(x) = &mut state.xkb {
+                    let prev_group = x.active_layout_index();
                     x.modifiers(mods_depressed, mods_latched, mods_locked, group);
+                    if x.active_layout_index() != prev_group
+                        && let Some(ev) = x.layout_event()
+                    {
+                        state
+                            .bus
+                            .publish(crate::events::AppEvent::KeyboardLayout(ev));
+                        if state.widgets.is_some() {
+                            state.dirty = true;
+                        }
+                    }
                 }
             }
             wl_keyboard::Event::Key {
@@ -2423,6 +2719,20 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                                 _ => isize::MIN,
                             };
                             state.dirty |= t.screen_mut().scroll_view(delta);
+                        }
+                        return;
+                    }
+                    if x.control() && x.shift() && key == 18 {
+                        if let Some(w) = &mut state.widgets {
+                            w.editor.toggle();
+                            state.dirty = true;
+                        }
+                        return;
+                    }
+                    if x.control() && x.shift() && key == 45 {
+                        if let Some(xray) = &mut state.xray {
+                            xray.toggle_panel();
+                            state.dirty = true;
                         }
                         return;
                     }

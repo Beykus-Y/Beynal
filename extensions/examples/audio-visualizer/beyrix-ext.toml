@@ -1,0 +1,23 @@
+id = "org.example.audio-visualizer"
+name = "3D Audio Visualizer"
+version = "1.0.0"
+kind = "background"
+sdk_version = "1.0.0"
+entry = "index.js"
+author = "Beyrix Community"
+description = "Activates the audio-reactive 3D background preset and shows live Bass/Mid/Treble meters."
+license = "MPL-2.0"
+official = false
+permissions = ["ui", "audio-analysis", "background-control", "theme"]
+
+[placement]
+mode = "overlay"
+tui_behavior = "hidden"
+anchor = "bottom-left"
+x = 14.0
+y = -48.0
+width = 200.0
+height = 56.0
+z_index = 12
+opacity = 0.88
+border_radius = 8.0
