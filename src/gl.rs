@@ -19,7 +19,7 @@ use std::ffi::{c_int, c_void};
 use glow::HasContext as _;
 use khronos_egl as egl;
 
-use crate::render::{Renderer, Scene, SceneGlyph, SceneRect};
+use crate::render::{Renderer, Scene, SceneGlyph, SceneRect, SceneRoundedRect};
 
 const ATLAS_SIZE: u32 = 1024;
 const ATLAS_ENTRIES: usize = 8192;
@@ -471,10 +471,22 @@ impl GlBackend {
             self.gl.clear(glow::COLOR_BUFFER_BIT);
         }
 
+        if !scene.behind_rects.is_empty() {
+            self.draw_rounded_rects(&scene.behind_rects);
+        }
+        if !scene.behind_glyphs.is_empty() {
+            let _ = self.draw_glyph_slice(renderer, &scene.behind_glyphs);
+        }
         self.draw_rects(&scene.rects);
-        let result = self.draw_glyphs(renderer, scene);
+        let mut result = self.draw_glyphs(renderer, scene);
         if result.is_ok() {
             self.draw_rects(&scene.overlays);
+            if !scene.overlay_rounded.is_empty() {
+                self.draw_rounded_rects(&scene.overlay_rounded);
+            }
+            if !scene.overlay_glyphs.is_empty() {
+                result = self.draw_glyph_slice(renderer, &scene.overlay_glyphs);
+            }
         }
         unsafe { self.gl.disable(glow::SCISSOR_TEST) };
         result?;
@@ -628,8 +640,66 @@ impl GlBackend {
         }
     }
 
+    fn draw_rounded_rects(&mut self, rects: &[SceneRoundedRect]) {
+        if rects.is_empty() {
+            return;
+        }
+        let mut expanded = Vec::with_capacity(rects.len() * 5);
+        for r in rects {
+            if r.color[3] > 0.0 {
+                expanded.push(SceneRect {
+                    x: r.x,
+                    y: r.y,
+                    w: r.w,
+                    h: r.h,
+                    color: r.color,
+                });
+            }
+            if r.border_width > 0.0 && r.border_color[3] > 0.0 {
+                let bw = r.border_width;
+                expanded.push(SceneRect {
+                    x: r.x,
+                    y: r.y,
+                    w: r.w,
+                    h: bw,
+                    color: r.border_color,
+                });
+                expanded.push(SceneRect {
+                    x: r.x,
+                    y: (r.y + r.h - bw).max(r.y),
+                    w: r.w,
+                    h: bw,
+                    color: r.border_color,
+                });
+                expanded.push(SceneRect {
+                    x: r.x,
+                    y: r.y + bw,
+                    w: bw,
+                    h: (r.h - 2.0 * bw).max(0.0),
+                    color: r.border_color,
+                });
+                expanded.push(SceneRect {
+                    x: (r.x + r.w - bw).max(r.x),
+                    y: r.y + bw,
+                    w: bw,
+                    h: (r.h - 2.0 * bw).max(0.0),
+                    color: r.border_color,
+                });
+            }
+        }
+        self.draw_rects(&expanded);
+    }
+
     fn draw_glyphs(&mut self, renderer: &mut Renderer, scene: &Scene) -> Result<(), String> {
-        if scene.glyphs.is_empty() {
+        self.draw_glyph_slice(renderer, &scene.glyphs)
+    }
+
+    fn draw_glyph_slice(
+        &mut self,
+        renderer: &mut Renderer,
+        glyphs: &[SceneGlyph],
+    ) -> Result<(), String> {
+        if glyphs.is_empty() {
             return Ok(());
         }
         unsafe {
@@ -661,8 +731,8 @@ impl GlBackend {
         }
         self.glyph_vertices.clear();
         self.glyph_vertices
-            .reserve(scene.glyphs.len().min(GLYPHS_PER_BATCH) * 6 * 8);
-        for glyph in &scene.glyphs {
+            .reserve(glyphs.len().min(GLYPHS_PER_BATCH) * 6 * 8);
+        for glyph in glyphs {
             let key = (glyph.ch, glyph.px_size.to_bits());
             let slot = match self.atlas.map.get(&key) {
                 Some(&slot) => slot,

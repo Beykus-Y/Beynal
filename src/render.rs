@@ -41,12 +41,46 @@ pub struct SceneGlyph {
     pub color: [f32; 4],
 }
 
+/// A rounded rectangle with optional border in physical pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SceneRoundedRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub radius: f32,
+    pub color: [f32; 4],
+    pub border_width: f32,
+    pub border_color: [f32; 4],
+}
+
+/// An RGBA bitmap image quad in physical pixels.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SceneImage {
+    pub id: u64,
+    pub src_w: u32,
+    pub src_h: u32,
+    pub rgba: std::sync::Arc<Vec<u8>>,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub alpha: f32,
+    pub radius: f32,
+}
+
 /// Drawing instructions shared by the OpenGL and software backends.
 #[derive(Clone, Debug, Default)]
 pub struct Scene {
+    pub behind_rects: Vec<SceneRoundedRect>,
+    pub behind_images: Vec<SceneImage>,
+    pub behind_glyphs: Vec<SceneGlyph>,
     pub rects: Vec<SceneRect>,
     pub glyphs: Vec<SceneGlyph>,
     pub overlays: Vec<SceneRect>,
+    pub overlay_rounded: Vec<SceneRoundedRect>,
+    pub overlay_images: Vec<SceneImage>,
+    pub overlay_glyphs: Vec<SceneGlyph>,
     pub background: [f32; 4],
 }
 
@@ -869,10 +903,40 @@ impl Renderer {
         let (pixels, _) = pixels.as_chunks_mut::<4>();
         let height = pixels.len() / width;
         pixels.fill(to_bgra(scene.background));
+        if !scene.behind_rects.is_empty() {
+            paint_rounded_rects(pixels, width, height, &scene.behind_rects);
+        }
+        if !scene.behind_images.is_empty() {
+            paint_images(pixels, width, height, &scene.behind_images);
+        }
+        if !scene.behind_glyphs.is_empty() {
+            self.paint_glyph_list(pixels, width, height, &scene.behind_glyphs);
+        }
         paint_rects(pixels, width, height, &scene.rects);
-        for glyph in &scene.glyphs {
+        self.paint_glyph_list(pixels, width, height, &scene.glyphs);
+        paint_rects(pixels, width, height, &scene.overlays);
+        if !scene.overlay_rounded.is_empty() {
+            paint_rounded_rects(pixels, width, height, &scene.overlay_rounded);
+        }
+        if !scene.overlay_images.is_empty() {
+            paint_images(pixels, width, height, &scene.overlay_images);
+        }
+        if !scene.overlay_glyphs.is_empty() {
+            self.paint_glyph_list(pixels, width, height, &scene.overlay_glyphs);
+        }
+    }
+
+    fn paint_glyph_list(
+        &mut self,
+        pixels: &mut [[u8; 4]],
+        width: usize,
+        height: usize,
+        glyphs: &[SceneGlyph],
+    ) {
+        for glyph in glyphs {
             let (metrics, bitmap) = self.glyph_bitmap(glyph.ch, glyph.px_size);
             let color = to_bgra(glyph.color);
+            let glyph_alpha = glyph.color[3].clamp(0.0, 1.0);
             let (sx, sy) = glyph.source;
             let right = (glyph.x + glyph.w).min(width);
             let bottom = (glyph.y + glyph.h).min(height);
@@ -887,7 +951,7 @@ impl Renderer {
                     .iter_mut()
                     .zip(&bitmap[start..start + count])
                 {
-                    let alpha = u32::from(alpha);
+                    let alpha = (f32::from(alpha) * glyph_alpha).round() as u32;
                     for channel in 0..3 {
                         pixel[channel] = ((u32::from(color[channel]) * alpha
                             + u32::from(pixel[channel]) * (255 - alpha))
@@ -896,7 +960,89 @@ impl Renderer {
                 }
             }
         }
-        paint_rects(pixels, width, height, &scene.overlays);
+    }
+}
+
+fn paint_rounded_rects(
+    pixels: &mut [[u8; 4]],
+    width: usize,
+    height: usize,
+    rects: &[SceneRoundedRect],
+) {
+    for rect in rects {
+        let x0 = (rect.x.floor().max(0.0) as usize).min(width);
+        let x1 = ((rect.x + rect.w).ceil().max(0.0) as usize).min(width);
+        let y0 = (rect.y.floor().max(0.0) as usize).min(height);
+        let y1 = ((rect.y + rect.h).ceil().max(0.0) as usize).min(height);
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
+        let r = rect.radius.min(rect.w * 0.5).min(rect.h * 0.5).max(0.0);
+        let bw = rect.border_width.max(0.0);
+        let fill = to_bgra(rect.color);
+        let fill_a = rect.color[3].clamp(0.0, 1.0);
+        let border = to_bgra(rect.border_color);
+        let border_a = rect.border_color[3].clamp(0.0, 1.0);
+        for py in y0..y1 {
+            let cy = py as f32 + 0.5 - rect.y;
+            for px in x0..x1 {
+                let cx = px as f32 + 0.5 - rect.x;
+                let dx = (r - cx).max(0.0).max(cx - (rect.w - r));
+                let dy = (r - cy).max(0.0).max(cy - (rect.h - r));
+                let dist = if r > 0.0 && dx > 0.0 && dy > 0.0 {
+                    (dx * dx + dy * dy).sqrt() - r
+                } else {
+                    -cx.min(rect.w - cx).min(cy).min(rect.h - cy)
+                };
+                if dist > 0.5 {
+                    continue;
+                }
+                let aa = (0.5 - dist).clamp(0.0, 1.0);
+                let is_border = bw > 0.0 && dist > -bw && border_a > 0.0;
+                let (src, a) = if is_border {
+                    (border, border_a * aa)
+                } else if fill_a > 0.0 {
+                    (fill, fill_a * aa)
+                } else {
+                    continue;
+                };
+                let dst = &mut pixels[py * width + px];
+                let inv = 1.0 - a;
+                for c in 0..3 {
+                    dst[c] = (src[c] as f32 * a + dst[c] as f32 * inv).round() as u8;
+                }
+            }
+        }
+    }
+}
+
+fn paint_images(pixels: &mut [[u8; 4]], width: usize, height: usize, images: &[SceneImage]) {
+    for img in images {
+        if img.src_w == 0 || img.src_h == 0 || img.w <= 0.0 || img.h <= 0.0 {
+            continue;
+        }
+        let x0 = (img.x.floor().max(0.0) as usize).min(width);
+        let x1 = ((img.x + img.w).ceil().max(0.0) as usize).min(width);
+        let y0 = (img.y.floor().max(0.0) as usize).min(height);
+        let y1 = ((img.y + img.h).ceil().max(0.0) as usize).min(height);
+        for py in y0..y1 {
+            let v = ((py as f32 - img.y) / img.h).clamp(0.0, 0.9999);
+            let sy = (v * img.src_h as f32) as usize;
+            for px in x0..x1 {
+                let u = ((px as f32 - img.x) / img.w).clamp(0.0, 0.9999);
+                let sx = (u * img.src_w as f32) as usize;
+                let off = (sy * img.src_w as usize + sx) * 4;
+                if off + 3 >= img.rgba.len() {
+                    continue;
+                }
+                let a = (img.rgba[off + 3] as f32 / 255.0) * img.alpha.clamp(0.0, 1.0);
+                let inv = 1.0 - a;
+                let dst = &mut pixels[py * width + px];
+                dst[0] = (img.rgba[off + 2] as f32 * a + dst[0] as f32 * inv).round() as u8;
+                dst[1] = (img.rgba[off + 1] as f32 * a + dst[1] as f32 * inv).round() as u8;
+                dst[2] = (img.rgba[off] as f32 * a + dst[2] as f32 * inv).round() as u8;
+            }
+        }
     }
 }
 
