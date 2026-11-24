@@ -278,7 +278,14 @@ impl GlBackend {
                 glow::PixelUnpackData::Slice(None),
             );
             gl.enable(glow::BLEND);
-            gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            // Keep the EGL buffer opaque when compositing grayscale masks
+            // over the opaque background. Color still uses straight alpha.
+            gl.blend_func_separate(
+                glow::SRC_ALPHA,
+                glow::ONE_MINUS_SRC_ALPHA,
+                glow::ONE,
+                glow::ONE_MINUS_SRC_ALPHA,
+            );
             gl.disable(glow::DEPTH_TEST);
             gl.viewport(0, 0, width, height);
         }
